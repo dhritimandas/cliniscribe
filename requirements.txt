@@ -6,8 +6,11 @@ soundfile
 librosa
 datasets
 huggingface_hub
+transformers
+torch
 reportlab
 python-dotenv
 jiwer
 pandas
 pytest
+numpy

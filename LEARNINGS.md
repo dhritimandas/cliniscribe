@@ -311,6 +311,57 @@ the bridge from Part 2 into Phase B.
 
 ---
 
+## Phase B — L3.5 Normalize + L4 Extract (2026-06-26)
+
+### (a) What this phase does
+L3.5 loads the parrotlet-e embedding model (a multilingual medical encoder,
+567 MB, running on MPS), embeds candidate word spans (1–3 words) from each
+transcript turn, and compares them against embeddings of canonical clinical
+terms; spans above cosine 0.65 are glossed non-destructively in parentheses
+(e.g., `फीवर (Fever)`). L4 sends the glossed transcript to qwen2.5:3b-instruct
+via Ollama, extracts the `ClinicalNote` JSON schema at temperature=0, and runs
+every drug name through a CDSCO-approved-drug lookup, setting `validated=false`
+and adding a `low_confidence_fields` entry for any unrecognised drug or missing
+dose. The two stages hand off through the same `list[Turn]` → `ClinicalNote`
+contract established in Phase A.
+
+### (b) Hardest bugs
+
+1. **`ModuleNotFoundError: No module named 'transformers'` at runtime, not at
+   install time** — root cause: pyannote.audio pulls PyTorch as a dependency,
+   and PyTorch coexists with the system miniforge install which has
+   `transformers` in its own site-packages. When running inside the project
+   venv, the system packages are not visible, so `import transformers` silently
+   worked during early prototyping (outside the venv) but failed on the first
+   in-venv L3.5 call. Adding `transformers` and `torch` explicitly to
+   `requirements.txt` is the fix; implicit transitive dependencies cannot be
+   relied on.
+
+2. **L3.5 gloss fires on `फीवर` but not on `infection`** — root cause: both
+   are in the model's embedding space, but `infection` does not appear in our
+   18-concept table. The concept table is symptom-oriented (fever, cough, pain);
+   generic diagnoses like "infection" have no canonical entry to map to. The
+   embedding model is working correctly — it correctly maps `फीवर` (Devanagari
+   "fever") to `Fever` (sim=0.865) across script boundaries. The failure for
+   `infection` is concept-coverage, not model quality. Adding an "Infection"
+   concept (SNOMED 40733004) to `src/concepts.py` would catch it.
+
+### (c) Fine-tuning hook
+The cosine threshold (0.65) is a fixed constant that controls the precision/
+recall trade-off of concept matching. A threshold that is too low causes false
+positives (common words like "cold" in "feeling cold" gloss to "Common Cold");
+too high means genuine lay terms get missed. Fine-tuning the threshold requires
+the **concept-match accuracy metric** from the KARMA framework (Phase D), which
+scores whether each matched span truly belongs to the glossed concept. During
+fine-tuning, the right move is not to tune the model weights but to tune the
+threshold per language (English, Hindi romanized, Devanagari) by running the
+metric on a frozen hold-out set of annotated transcript–concept pairs. An
+alternative — and potentially more powerful — approach is to add known-hard
+negatives (common words near but below the clinical boundary) as explicit
+contrast examples when expanding `src/concepts.py`.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no
