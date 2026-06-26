@@ -4,7 +4,7 @@ import json
 import logging
 
 from src.cdsco import validate_drug
-from src.types import ClinicalNote, Diagnosis, Medication, Turn
+from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,17 @@ Output ONLY valid JSON matching this exact schema — no extra text, no markdown
 {
   "chief_complaint": "string or null",
   "history": "string or null",
-  "diagnosis": [{"term": "string", "snomed_id": "string or null"}],
+  "symptoms": [{"name": "string", "finding_status": "Present | Absent", \
+"severity": "Mild | Moderate | Severe or null", "since": "string or null"}],
+  "vitals": [{"name": "string", "value": "string with unit"}],
+  "examination": "string or null",
+  "diagnosis": [{"term": "string", "snomed_id": "string or null", \
+"status": "Confirmed | Suspected | Ruled out or null"}],
   "medications": [{"drug": "string", "dose": "string or null", \
-"frequency": "string or null", "duration": "string or null"}],
+"frequency": "string or null", "timing": "string or null", \
+"duration": "string or null"}],
   "investigations": ["string"],
+  "diagnostic_results": ["string"],
   "advice": "string or null",
   "follow_up": "string or null",
   "low_confidence_fields": ["string"]
@@ -38,7 +45,18 @@ a value or the value is absent but clinically expected.
 in parentheses.
 5. Extract only what is spoken. Do not add clinical knowledge not present \
 in the transcript.
-6. Use the language of the transcript for text fields. Do not translate.\
+6. Use the language of the transcript for text fields. Do not translate.
+7. SYMPTOMS are complaints the patient reports (pain, fever, nausea). \
+finding_status is "Present" by default, "Absent" only when a symptom is \
+explicitly denied (e.g. "no vomiting"). severity and since are null unless stated.
+8. VITALS are measured signs with a number and unit (BP, pulse, SpO2, \
+temperature, weight). Only include a vital when a measured value is spoken. \
+Never invent a measurement.
+9. INVESTIGATIONS are tests the doctor ORDERS for later (e.g. "get a CBC"). \
+DIAGNOSTIC_RESULTS are results already available in the consultation \
+(e.g. "Hb is 9.2"). Do not put an ordered test in diagnostic_results.
+10. examination is free text describing physical-exam findings \
+(e.g. "abdomen soft, mild tenderness"). null if no exam is described.\
 """
 
 
@@ -63,8 +81,29 @@ def _parse(raw: str) -> dict:
 
 
 def _build_note(data: dict) -> ClinicalNote:
+    symptoms = [
+        Symptom(
+            name=s.get("name", "").strip(),
+            finding_status=(s.get("finding_status") or "Present").strip() or "Present",
+            severity=s.get("severity") or None,
+            since=s.get("since") or None,
+        )
+        for s in data.get("symptoms", [])
+        if s.get("name", "").strip()
+    ]
+
+    vitals = [
+        Vital(name=v.get("name", "").strip(), value=str(v.get("value") or "").strip())
+        for v in data.get("vitals", [])
+        if v.get("name", "").strip() and str(v.get("value") or "").strip()
+    ]
+
     diagnosis = [
-        Diagnosis(term=d.get("term", "").strip(), snomed_id=d.get("snomed_id"))
+        Diagnosis(
+            term=d.get("term", "").strip(),
+            snomed_id=d.get("snomed_id"),
+            status=d.get("status") or None,
+        )
         for d in data.get("diagnosis", [])
         if d.get("term", "").strip()
     ]
@@ -79,6 +118,7 @@ def _build_note(data: dict) -> ClinicalNote:
                 drug=drug,
                 dose=m.get("dose") or None,
                 frequency=m.get("frequency") or None,
+                timing=m.get("timing") or None,
                 duration=m.get("duration") or None,
                 validated=validate_drug(drug),
             )
@@ -99,9 +139,13 @@ def _build_note(data: dict) -> ClinicalNote:
     return ClinicalNote(
         chief_complaint=data.get("chief_complaint") or None,
         history=data.get("history") or None,
+        symptoms=symptoms,
+        vitals=vitals,
+        examination=data.get("examination") or None,
         diagnosis=diagnosis,
         medications=medications,
         investigations=list(data.get("investigations") or []),
+        diagnostic_results=list(data.get("diagnostic_results") or []),
         advice=data.get("advice") or None,
         follow_up=data.get("follow_up") or None,
         low_confidence_fields=low_conf,
@@ -162,8 +206,11 @@ def extract(turns: list[Turn]) -> ClinicalNote:
             data = _parse(raw)
             note = _build_note(data)
             logger.info(
-                "L4: extracted note (attempt %d): %d diagnosis, %d meds, %d low_conf",
+                "L4: extracted note (attempt %d): %d symptoms, %d vitals, "
+                "%d diagnosis, %d meds, %d low_conf",
                 attempt,
+                len(note.symptoms),
+                len(note.vitals),
                 len(note.diagnosis),
                 len(note.medications),
                 len(note.low_confidence_fields),

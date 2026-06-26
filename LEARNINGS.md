@@ -412,6 +412,84 @@ correction layers.
 
 ---
 
+## Phase B Enhancement — ClinicalNote Schema Coverage (2026-06-27)
+
+### Why this exists: the contract, not the model, was the ceiling
+Before fixing anything in the LLM, we measured what fraction of the EkaCare
+ground-truth rubrics target a field our `ClinicalNote` schema could not even
+*hold*. A **rubric** here is one scored success criterion attached to a transcript
+(e.g. "a symptom matching 'nausea' is present in the symptoms array"). The dataset
+ships 2469 such criteria across 156 transcripts. We grouped each by the field it
+targets and asked a model-independent question: *if our extractor were perfect,
+could the schema even represent the answer?*
+
+**The finding: 64% (1585/2469) of all rubric criteria target a field the old schema
+could not represent.** 153 of 156 transcripts had at least one structurally
+unsatisfiable rubric. This is a **contract decision, not a model failure** — no
+amount of prompt tuning or fine-tuning can emit a field that does not exist in the
+output schema. The breakdown:
+
+| Missing field group | Criteria | % of all rubrics |
+|---|---|---|
+| Symptoms (name / severity / laterality) | 580 | 23.5% |
+| Vitals (BP, SpO2, pulse, ...) | 205 | 8.3% |
+| Structured medical history | 197 | 8.0% |
+| Diagnostic results (labs in hand) | 193 | 7.8% |
+| Examination findings | 163 | 6.6% |
+| Medication timing (before/after food) | 111 | 4.5% |
+| Diagnosis status / laterality | 74 | 3.0% |
+| Lifestyle / family / allergy / travel | 62 | 2.5% |
+
+### What we changed and what we deliberately left out
+We extended the schema to cover the **clinically high-value SOAP fields**: a
+`symptoms` array (name, finding_status, severity, since), a `vitals` array
+(name + value-with-unit), free-text `examination`, structured `diagnosis.status`,
+`medication.timing`, and a `diagnostic_results` list **separate from**
+`investigations`. The split matters: *investigations* are tests the doctor **orders
+for later**; *diagnostic_results* are values **already available** in the room
+("Hb is 9.2"). These six additions cover ~1326 of the 1585 missing criteria (84%).
+
+We **intentionally did not** structure past/family/social/lifestyle history into the
+8 sub-arrays the EkaCare schema offers (~10% of criteria). Two reasons: (1) Indian
+tier-2/3 clinic transcripts are 3-8 minutes and rarely take a systematic social or
+family history on tape, so those fields would be empty almost always; (2) empty
+structured fields are an *invitation* for the LLM to fabricate — the same
+next-token-plausibility hazard that makes "never invent a dose" hard (see Part 3).
+Free-text `history` absorbs what little of it appears. **Adding a field has a cost,
+not just a benefit: every optional structured field is a fabrication surface.**
+
+### The honest result: schema is sufficient, model precision now becomes measurable
+A live smoke test through qwen2.5:3b on a transcript exercising every new field
+confirmed each field is reachable and populates. But it also exposed the *next*
+problem, which is now a **measurable** model-quality issue rather than a hidden
+structural one:
+- **Field-classification ambiguity**: "Hb 9.2" landed in **both** `vitals` and
+  `diagnostic_results`. The model does not reliably distinguish a measured vital sign
+  from a lab result, even with explicit prompt rules. (Hb is a lab result.)
+- **Recall misses**: medication timing "before food" leaked into the free-text
+  `advice` field instead of `medications[].timing`; a reported symptom (nausea) and a
+  *denied* one ("no vomiting" → finding_status Absent) were both dropped; palpation
+  findings never reached `examination`.
+
+The point of the schema fix is exactly this: these are now **scorable against the
+rubrics**. Before, "nausea missing" and "schema has no symptoms array" were
+indistinguishable in the final score; now the first is a recall number we can move
+with prompting or fine-tuning, and the second no longer exists.
+
+### Fine-tuning hook
+With the contract widened, the next gains are **field-routing precision**, not
+coverage. The dataset's own rubric guidance is lenient here ("INFORMATION PRESENCE
+OVER FIELD LOCATION" — frequency stated inside `instruction` still scores as a
+match), so the scoring tolerates the timing-in-advice leak. But for a clean EMR
+hand-off the physician needs fields in their right slots. The fine-tuning signal is
+the per-category rubric score (symptom_name vs vital vs diagnostic_result), which
+isolates *recall* (did we extract it at all?) from *routing* (did it go in the right
+field?). The vital-vs-result confusion in particular wants either few-shot examples
+contrasting the two, or a post-extraction reclassifier keyed on whether a number has
+a reference range.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no

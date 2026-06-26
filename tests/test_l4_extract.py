@@ -24,9 +24,13 @@ def _mock_ollama(content: dict):
 _EMPTY_RESPONSE = {
     "chief_complaint": None,
     "history": None,
+    "symptoms": [],
+    "vitals": [],
+    "examination": None,
     "diagnosis": [],
     "medications": [],
     "investigations": [],
+    "diagnostic_results": [],
     "advice": None,
     "follow_up": None,
     "low_confidence_fields": [],
@@ -174,6 +178,163 @@ def test_malformed_json_returns_minimal_note() -> None:
     assert note.chief_complaint is None
     assert len(note.medications) == 0
     assert "chief_complaint" in note.low_confidence_fields
+
+
+# ── Extended schema: symptoms, vitals, exam, diagnostic results, timing ──────
+
+
+def test_symptoms_extracted_with_qualifiers() -> None:
+    """Symptoms array must populate name, severity, and finding_status."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "symptoms": [
+            {"name": "abdominal pain", "finding_status": "Present",
+             "severity": "Moderate", "since": "2 days"},
+            {"name": "nausea", "finding_status": "Present",
+             "severity": None, "since": None},
+        ],
+    }
+    turns = [_turn("PATIENT", "pet dard 2 din se, ji machal raha")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert len(note.symptoms) == 2
+    assert note.symptoms[0].name == "abdominal pain"
+    assert note.symptoms[0].severity == "Moderate"
+    assert note.symptoms[0].since == "2 days"
+    assert note.symptoms[1].severity is None
+
+
+def test_symptom_finding_status_absent_preserved() -> None:
+    """A denied symptom must keep finding_status 'Absent'."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "symptoms": [{"name": "vomiting", "finding_status": "Absent"}],
+    }
+    turns = [_turn("PATIENT", "no vomiting")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.symptoms[0].finding_status == "Absent"
+
+
+def test_symptom_finding_status_defaults_present() -> None:
+    """When finding_status is omitted, it must default to 'Present'."""
+    from src.l4_extract import extract
+
+    response_data = {**_EMPTY_RESPONSE, "symptoms": [{"name": "fever"}]}
+    turns = [_turn("PATIENT", "bukhar hai")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.symptoms[0].finding_status == "Present"
+
+
+def test_vitals_extracted() -> None:
+    """Vitals must populate name and value-with-unit; valueless vitals dropped."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "vitals": [
+            {"name": "BP", "value": "130/90 mmHg"},
+            {"name": "SpO2", "value": "97 %"},
+            {"name": "Pulse", "value": ""},  # no measurement → dropped
+        ],
+    }
+    turns = [_turn("DOCTOR", "BP 130 by 90, oxygen 97 percent")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert len(note.vitals) == 2
+    assert note.vitals[0].name == "BP"
+    assert note.vitals[0].value == "130/90 mmHg"
+
+
+def test_medication_timing_extracted() -> None:
+    """Medication timing (before/after food) must be preserved."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "medications": [
+            {"drug": "pan d", "dose": None, "frequency": "three times a day",
+             "timing": "before food", "duration": None}
+        ],
+    }
+    turns = [_turn("DOCTOR", "pan d before food three times a day")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.medications[0].timing == "before food"
+
+
+def test_diagnosis_status_extracted() -> None:
+    """Diagnosis status must be preserved when stated."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "diagnosis": [
+            {"term": "Acute Gastritis", "snomed_id": None, "status": "Suspected"}
+        ],
+    }
+    turns = [_turn("DOCTOR", "looks like gastritis, suspected")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.diagnosis[0].status == "Suspected"
+
+
+def test_diagnostic_results_distinct_from_investigations() -> None:
+    """Ordered tests and in-hand results must land in separate fields."""
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "investigations": ["CBC", "LFT"],
+        "diagnostic_results": ["Hb 9.2 g/dL", "fasting glucose 142 mg/dL"],
+    }
+    turns = [_turn("DOCTOR", "Hb is 9.2, get a CBC and LFT done")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.investigations == ["CBC", "LFT"]
+    assert note.diagnostic_results == ["Hb 9.2 g/dL", "fasting glucose 142 mg/dL"]
+
+
+def test_examination_free_text_preserved() -> None:
+    from src.l4_extract import extract
+
+    response_data = {
+        **_EMPTY_RESPONSE,
+        "examination": "abdomen soft, mild epigastric tenderness",
+    }
+    turns = [_turn("DOCTOR", "abdomen soft, tender in epigastrium")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.examination == "abdomen soft, mild epigastric tenderness"
+
+
+def test_new_fields_default_empty_when_omitted() -> None:
+    """Back-compat: a response omitting the new keys must yield empty collections."""
+    from src.l4_extract import extract
+
+    # Minimal response without any of the new keys
+    response_data = {"chief_complaint": "fever", "medications": []}
+    turns = [_turn("PATIENT", "fever")]
+    with patch("ollama.chat", return_value=_mock_ollama(response_data)):
+        note = extract(turns)
+
+    assert note.symptoms == []
+    assert note.vitals == []
+    assert note.examination is None
+    assert note.diagnostic_results == []
 
 
 # ── Live Ollama (slow) ────────────────────────────────────────────────────────
