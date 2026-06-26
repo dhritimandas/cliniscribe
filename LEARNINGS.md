@@ -362,6 +362,56 @@ contrast examples when expanding `src/concepts.py`.
 
 ---
 
+## Phase B Enhancement — Concept Table v2: Hard Negatives + Coverage Expansion (2026-06-27)
+
+### (a) What this enhancement does
+Two problems surfaced after running Phase B on real EkaCare data. First, common English
+words like "cold", "gas", and "tension" are exact surface-form matches to concept
+variants, so they gloss correctly in clinical context ("I have a cold") but would also
+fire on non-clinical text ("it's cold outside", "gas cylinder"). Second, the 18-concept
+table had no entries for Abdominal Pain, Nausea, Asthma, Anxiety, Migraine, Back Pain,
+Fungal Infection, Allergic Rhinitis, URTI, or Loss of Appetite — all high-frequency
+conditions in the EkaCare 156-transcript dataset. This enhancement adds a hard-negative
+rejection gate (the margin test) and expands the table from 18 to 28 concepts with
+SNOMED CT identifiers for all entries.
+
+### (b) Hardest design decisions
+
+1. **Canonical-term-only reference fails for colloquial abbreviations** — root cause:
+   parrotlet-e (the medical embedding model) cannot bridge the gap between a colloquial
+   abbreviation and its canonical expansion. "sugar" → "Type 2 Diabetes Mellitus" scores
+   cosine=0.33 (below the 0.65 threshold), because the model was trained on medical text
+   where "sugar" rarely co-occurs with T2DM in a way that builds a direct bridge. By
+   contrast, formal Hindi ("madhumeh" → T2DM) scores 0.75 and cross-language paraphrase
+   ("high blood pressure" → "Hypertension") scores 0.76 — both well above threshold. The
+   fix is to include all variant texts alongside canonical terms in the reference matrix.
+   "sugar" then matches variant "sugar" at sim~1.0, which maps to T2DM. The hard-negative
+   gate (see below) is what prevents this exact-match-to-anything behavior from causing
+   false positives.
+
+2. **Hard-negative gate is necessary but insufficient for unigram ambiguity** — the
+   margin test (`concept_sim > hn_sim + HARDNEG_MARGIN`) correctly rejects context-heavy
+   spans: "cold outside" scores 0.428 to Common Cold but 0.919 to hard-negative "it's
+   cold outside", so margin = −0.49 → **rejected**. But the unigram "cold" scores 1.0 to
+   the variant and only 0.630 to hard-negative "cold weather" — margin = 0.37, which
+   passes easily. The model, trained on medical text, treats the bare word "cold" as
+   intrinsically clinical; a 5% margin cannot distinguish "I have a cold" from "it is
+   cold outside" at the unigram level. Sentence-level encoding (encoding the whole
+   sentence context, not just the span) would fix this but requires a different inference
+   architecture. This is a known limitation tracked for Phase D.
+
+### (c) Fine-tuning hook
+`HARDNEG_MARGIN` (0.05) and `COSINE_THRESHOLD` (0.65) are both hand-tuned constants.
+The diagnostic above shows that "cold" disambiguation alone would require a margin of
+~0.37 — 7× the global setting — while valid clinical matches like "pait mein" →
+Abdominal Pain pass with margin=0.09. This spread makes a single global margin
+incoherent. Per-concept thresholds, calibrated against Phase D's concept-match accuracy
+metric on a frozen hold-out set, are the right answer. Until then, err on the side of a
+lower threshold (higher recall) since L4 and the physician review step are downstream
+correction layers.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no

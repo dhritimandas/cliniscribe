@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "ekacare/parrotlet-e"
 COSINE_THRESHOLD = 0.65
-MAX_NGRAM = 3  # unigrams through trigrams
+HARDNEG_MARGIN = 0.05   # span must score ≥ this much higher than its hardest hard-negative
+MAX_NGRAM = 3           # unigrams through trigrams
 
 
 @dataclass
@@ -109,6 +110,21 @@ class _EmbeddingBackend:
             torch.mps.empty_cache()
 
 
+def _passes_hardneg_gate(sim: float, max_hn_sim: float) -> bool:
+    """Return True if the span is far enough above its closest hard negative.
+
+    A match is accepted only when the concept similarity exceeds the best
+    hard-negative similarity by more than HARDNEG_MARGIN. Boundary (equal)
+    is treated as rejection.
+
+    Args:
+        sim: Cosine similarity of the candidate span to the matched concept.
+        max_hn_sim: Maximum cosine similarity of the span to any hard negative
+            of that concept.
+    """
+    return max_hn_sim < sim - HARDNEG_MARGIN
+
+
 def _ngrams(words: list[str], max_n: int) -> list[tuple[str, int, int]]:
     """Return (span_text, start_idx, end_idx_exclusive) for n=1..max_n."""
     spans = []
@@ -173,9 +189,10 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     """Map lay medical terms in transcript turns to canonical clinical concepts.
 
     Uses parrotlet-e (fine-tuned bge-m3) embeddings. Candidate spans (1–3
-    words) from each turn are compared against canonical concept embeddings;
-    matches above COSINE_THRESHOLD are glossed non-destructively in
-    parentheses, e.g. ``sugar (Type 2 Diabetes Mellitus)``.
+    words) are compared against a combined reference of canonical terms +
+    variants; matches above COSINE_THRESHOLD pass a hard-negative rejection
+    gate before being glossed non-destructively, e.g.
+    ``sugar (Type 2 Diabetes Mellitus)``.
 
     Model is loaded, used, and released in one call — memory discipline.
 
@@ -190,10 +207,36 @@ def normalize(turns: list[Turn]) -> list[Turn]:
 
     backend = _EmbeddingBackend()
 
-    # Reference: canonical concept terms are the embedding targets.
-    # parrotlet-e is trained such that lay synonyms map close to canonical terms.
-    concept_texts = [c.term for c in CONCEPTS]
-    concept_matrix = backend.encode(concept_texts)  # (C, D)
+    # Reference matrix: canonical term + all variants per concept.
+    # Using only canonical terms (e.g. "Type 2 Diabetes Mellitus") fails for
+    # colloquial abbreviations like "sugar" (sim=0.33) and "bp" (sim=0.45),
+    # which are well below COSINE_THRESHOLD. Including variants covers these
+    # exact/near-exact matches while canonical terms remain the anchors for
+    # paraphrases and cross-lingual forms the model generalises well.
+    ref_texts: list[str] = []
+    ref_ci: list[int] = []
+    for ci, concept in enumerate(CONCEPTS):
+        ref_texts.append(concept.term)
+        ref_ci.append(ci)
+        for v in concept.variants:
+            ref_texts.append(v)
+            ref_ci.append(ci)
+    ref_matrix = backend.encode(ref_texts)       # (R, D)
+    ref_ci_arr = np.array(ref_ci)                # (R,)
+
+    # Hard-negative matrix: one row per hard-negative text; parallel array
+    # records which concept index each hard-negative belongs to.
+    hardneg_texts: list[str] = []
+    hardneg_concept_idx: list[int] = []
+    for ci, concept in enumerate(CONCEPTS):
+        for hn in concept.hard_negatives:
+            hardneg_texts.append(hn)
+            hardneg_concept_idx.append(ci)
+    hardneg_matrix: np.ndarray | None = None
+    hardneg_idx_arr: np.ndarray | None = None
+    if hardneg_texts:
+        hardneg_matrix = backend.encode(hardneg_texts)          # (H, D)
+        hardneg_idx_arr = np.array(hardneg_concept_idx)         # (H,)
 
     # Collect all candidate spans across all turns in one batch for efficiency
     all_spans: list[tuple[str, int, int]] = []   # (span, start_w, end_w)
@@ -216,9 +259,10 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     if all_spans:
         span_texts = [s[0] for s in all_spans]
         span_matrix = backend.encode(span_texts)  # (S, D)
-        sims = span_matrix @ concept_matrix.T      # (S, C)
-        max_sims = sims.max(axis=1)                # (S,)
-        best_concepts = sims.argmax(axis=1)        # (S,)
+        sims = span_matrix @ ref_matrix.T          # (S, R) spans vs all references
+        max_sims = sims.max(axis=1)                # (S,) - best ref similarity per span
+        best_refs = sims.argmax(axis=1)            # (S,) - which reference matched best
+        best_concepts = ref_ci_arr[best_refs]      # (S,) - concept index for best ref
 
         for turn, words, (off_start, off_end) in zip(turns, turn_words, turn_span_offsets):
             if off_start == off_end:
@@ -228,19 +272,37 @@ def normalize(turns: list[Turn]) -> list[Turn]:
             matches: list[_Match] = []
             for j in range(off_start, off_end):
                 sim = float(max_sims[j])
-                if sim >= COSINE_THRESHOLD:
-                    span, start_w, end_w = all_spans[j]
-                    concept = CONCEPTS[best_concepts[j]]
-                    matches.append(
-                        _Match(
-                            span=span,
-                            start_word=start_w,
-                            end_word=end_w,
-                            concept_term=concept.term,
-                            snomed_id=concept.snomed_id,
-                            similarity=sim,
-                        )
+                if sim < COSINE_THRESHOLD:
+                    continue
+                ci = int(best_concepts[j])
+                concept = CONCEPTS[ci]
+
+                # Hard-negative rejection gate: accept only if the span is
+                # at least HARDNEG_MARGIN more similar to the concept than
+                # to any of its hard negatives.
+                if hardneg_matrix is not None and concept.hard_negatives:
+                    hn_mask = hardneg_idx_arr == ci          # (H,) bool
+                    max_hn_sim = float(
+                        (span_matrix[j] @ hardneg_matrix[hn_mask].T).max()
                     )
+                    if not _passes_hardneg_gate(sim, max_hn_sim):
+                        logger.debug(
+                            "L3.5 rejected '%s': concept_sim=%.3f hardneg_sim=%.3f",
+                            all_spans[j][0], sim, max_hn_sim,
+                        )
+                        continue
+
+                span, start_w, end_w = all_spans[j]
+                matches.append(
+                    _Match(
+                        span=span,
+                        start_word=start_w,
+                        end_word=end_w,
+                        concept_term=concept.term,
+                        snomed_id=concept.snomed_id,
+                        similarity=sim,
+                    )
+                )
 
             glossed = _gloss_turn(turn, _best_non_overlapping(matches), words)
             normalized.append(glossed)

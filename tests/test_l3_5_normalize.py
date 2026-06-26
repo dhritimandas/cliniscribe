@@ -5,10 +5,12 @@ import pytest
 
 from src.l3_5_normalize import (
     COSINE_THRESHOLD,
+    HARDNEG_MARGIN,
     _Match,
     _best_non_overlapping,
     _gloss_turn,
     _ngrams,
+    _passes_hardneg_gate,
 )
 from src.types import Turn
 
@@ -125,6 +127,83 @@ def test_gloss_preserves_metadata() -> None:
     assert result.end == 3.0
 
 
+# ── Hard-negative gate (fast, no model) ──────────────────────────────────────
+
+
+def test_hardneg_gate_rejects_when_hardneg_within_margin() -> None:
+    # concept_sim=0.70, hardneg_sim=0.68 → margin=0.02 < HARDNEG_MARGIN(0.05) → rejected
+    assert not _passes_hardneg_gate(sim=0.70, max_hn_sim=0.68)
+
+
+def test_hardneg_gate_accepts_when_hardneg_far() -> None:
+    # concept_sim=0.85, hardneg_sim=0.60 → margin=0.25 > HARDNEG_MARGIN → accepted
+    assert _passes_hardneg_gate(sim=0.85, max_hn_sim=0.60)
+
+
+def test_hardneg_gate_rejects_at_exact_boundary() -> None:
+    # Exactly at margin boundary (equal) is rejected (>=, not >)
+    boundary = 0.70 - HARDNEG_MARGIN  # = 0.65
+    assert not _passes_hardneg_gate(sim=0.70, max_hn_sim=boundary)
+
+
+def test_hardneg_gate_accepts_just_past_boundary() -> None:
+    # One epsilon below boundary → accepted
+    boundary = 0.70 - HARDNEG_MARGIN  # = 0.65
+    assert _passes_hardneg_gate(sim=0.70, max_hn_sim=boundary - 0.001)
+
+
+def test_hardneg_margin_constant_value() -> None:
+    # Verify the constant hasn't drifted from the documented value
+    assert HARDNEG_MARGIN == 0.05
+
+
+# ── New concepts exist in the table ──────────────────────────────────────────
+
+
+def test_new_concepts_present() -> None:
+    """All newly added concepts must be present in the CONCEPTS list."""
+    from src.concepts import CONCEPTS
+
+    terms = {c.term for c in CONCEPTS}
+    expected_new = {
+        "Abdominal Pain",
+        "Back Pain",
+        "Asthma",
+        "Nausea",
+        "Upper Respiratory Tract Infection",
+        "Allergic Rhinitis",
+        "Migraine",
+        "Anxiety",
+        "Loss of Appetite",
+        "Fungal Infection",
+    }
+    assert expected_new <= terms, f"Missing concepts: {expected_new - terms}"
+
+
+def test_all_concepts_have_snomed_id() -> None:
+    """Every concept must have a SNOMED CT identifier (no silent omissions)."""
+    from src.concepts import CONCEPTS
+
+    missing = [c.term for c in CONCEPTS if c.snomed_id is None]
+    assert not missing, f"Concepts without SNOMED ID: {missing}"
+
+
+def test_hard_negatives_populated_for_key_concepts() -> None:
+    """Concepts with known confusable everyday words must have hard negatives."""
+    from src.concepts import CONCEPTS
+
+    must_have_hardnegs = {
+        "Common Cold",     # "cold weather"
+        "Hypertension",    # "work stress"
+        "Acid Reflux",     # "gas cylinder"
+        "Type 2 Diabetes Mellitus",  # "sugar in tea"
+    }
+    concept_map = {c.term: c for c in CONCEPTS}
+    for term in must_have_hardnegs:
+        assert term in concept_map, f"Concept not found: {term}"
+        assert concept_map[term].hard_negatives, f"No hard negatives for: {term}"
+
+
 # ── Real model (slow) ─────────────────────────────────────────────────────────
 
 
@@ -172,3 +251,52 @@ def test_empty_turns_returns_empty() -> None:
     from src.l3_5_normalize import normalize
 
     assert normalize([]) == []
+
+
+@pytest.mark.slow
+def test_sardi_maps_to_common_cold() -> None:
+    """'sardi' (Hindi: cold/flu) must still gloss to Common Cold despite hard negatives."""
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("mujhe sardi ho gayi hai")]
+    result = normalize(turns)
+    assert "Common Cold" in result[0].text
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Unigram 'cold' matches variant 'cold' at sim=1.0 with hardneg margin=0.37 — "
+        "well above HARDNEG_MARGIN=0.05. The model treats 'cold' as intrinsically "
+        "clinical; single-word context disambiguation requires sentence-level encoding "
+        "(Phase D). Per-concept threshold tuning would address this."
+    ),
+)
+def test_cold_weather_not_glossed_as_common_cold() -> None:
+    """'cold' in a temperature/weather context should be blocked by hard negatives."""
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("it is very cold outside today")]
+    result = normalize(turns)
+    assert "(Common Cold)" not in result[0].text
+
+
+@pytest.mark.slow
+def test_pait_dard_maps_to_abdominal_pain() -> None:
+    """New concept: 'pait mein dard' must gloss to Abdominal Pain."""
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("mujhe pait mein dard hai")]
+    result = normalize(turns)
+    assert "Abdominal Pain" in result[0].text
+
+
+@pytest.mark.slow
+def test_ghabrahat_maps_to_anxiety() -> None:
+    """New concept: 'ghabrahat' (nervousness/anxiety) must gloss to Anxiety."""
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("bahut ghabrahat ho rahi hai")]
+    result = normalize(turns)
+    assert "Anxiety" in result[0].text
