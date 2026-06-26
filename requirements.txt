@@ -1,0 +1,12 @@
+faster-whisper
+pyannote.audio
+ollama
+noisereduce
+soundfile
+librosa
+datasets
+huggingface_hub
+reportlab
+python-dotenv
+jiwer
+pandas

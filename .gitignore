@@ -1,0 +1,32 @@
+# Environment
+.venv/
+.env
+
+# Data and outputs (sensitive / large)
+data/
+outputs/
+eka-clinical-note-generation-dataset/
+eka-medical-asr-dataset/
+
+# Local working docs
+*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest
+.pytest_cache/
+
+# Logs
+*.log
