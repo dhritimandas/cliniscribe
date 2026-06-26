@@ -1,0 +1,15 @@
+{
+  "dataset": "eka-medical-asr-dataset/hi/test-00000.parquet",
+  "md5_text": [
+    "d3da2c3442029925e945c5415b3ba93c",
+    "ce76bfddd71d1b37c391dd001d4d07fa",
+    "431d272cfaf2c3c240e3bbac0893d137",
+    "9ea0bcced555494f3e186f70fbd37af5",
+    "f2096fbd33010dc7d81344b4ad2477e3",
+    "87165ee7c9a8f668a8ed73eb0caf7a02",
+    "1ae62262f1e93e81ff73e92bd9305f21",
+    "b26524ae7ce95ec211bfb803c1a34f0a",
+    "ca1f961c94ee0a516af340b33725fdda",
+    "71f497603e56ee141187d7ab3b4b302c"
+  ]
+}
