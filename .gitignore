@@ -8,8 +8,9 @@ outputs/
 eka-clinical-note-generation-dataset/
 eka-medical-asr-dataset/
 
-# Local working docs
+# Local working docs (internal use, never committed)
 *.docx
+*.pages
 
 # Python
 __pycache__/
