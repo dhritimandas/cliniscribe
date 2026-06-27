@@ -81,6 +81,9 @@ def _parse(raw: str) -> dict:
 
 
 def _build_note(data: dict) -> ClinicalNote:
+    # Guard with `or []`: model may emit null for list fields (e.g. "symptoms": null).
+    # data.get("symptoms", []) returns None when the key is present with value null,
+    # and None is not iterable — the `or []` converts None → [].
     symptoms = [
         Symptom(
             name=s.get("name", "").strip(),
@@ -88,13 +91,13 @@ def _build_note(data: dict) -> ClinicalNote:
             severity=s.get("severity") or None,
             since=s.get("since") or None,
         )
-        for s in data.get("symptoms", [])
+        for s in (data.get("symptoms") or [])
         if s.get("name", "").strip()
     ]
 
     vitals = [
         Vital(name=v.get("name", "").strip(), value=str(v.get("value") or "").strip())
-        for v in data.get("vitals", [])
+        for v in (data.get("vitals") or [])
         if v.get("name", "").strip() and str(v.get("value") or "").strip()
     ]
 
@@ -104,12 +107,12 @@ def _build_note(data: dict) -> ClinicalNote:
             snomed_id=d.get("snomed_id"),
             status=d.get("status") or None,
         )
-        for d in data.get("diagnosis", [])
+        for d in (data.get("diagnosis") or [])
         if d.get("term", "").strip()
     ]
 
     medications: list[Medication] = []
-    for m in data.get("medications", []):
+    for m in (data.get("medications") or []):
         drug = (m.get("drug") or "").strip()
         if not drug:
             continue
