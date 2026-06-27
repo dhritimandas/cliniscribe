@@ -84,15 +84,10 @@ def _parse(raw: str) -> dict:
 
 
 _TOKEN_RE = re.compile(r"[a-z]+", re.IGNORECASE)
-_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 _MIN_OVERLAP_TOKEN_LEN = 4  # ignore short words (conjunctions, articles, etc.)
-# Speaker-role prefix tokens that appear in every turn and must be excluded.
+# Speaker-role prefix tokens that appear in every turn and must be excluded
+# from the hallucination-overlap check.
 _ROLE_TOKENS: frozenset[str] = frozenset({"doctor", "patient", "unknown"})
-
-
-def _transcript_has_devanagari(transcript: str) -> bool:
-    """Return True if the transcript contains Devanagari characters."""
-    return bool(_DEVANAGARI_RE.search(transcript))
 
 
 def _transcript_tokens(transcript: str) -> set[str]:
