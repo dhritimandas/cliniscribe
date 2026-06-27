@@ -544,6 +544,33 @@ to a reading-comprehension extractive QA model being trained to output "no answe
 when the answer is not in the passage. Until then, the word-overlap check + the
 physician review layer are the safety net.
 
+**Baseline eval results (post-fix, frozen 24-sample set — 12 EN + 12 HI/MR):**
+
+```
+Category                  Total  Rep  Match  Recall
+medication_name             104  104     64   0.615
+diagnosis_name               30   30     13   0.433
+diagnosis_status             23   23      9   0.391
+body_vital_sign_name         41   41     15   0.366
+prescribed_test_name         37   37     14   0.378
+symptom_name                 87   87     31   0.356
+medication_timing            45   45     12   0.267
+symptom_severity             12   12      3   0.250
+examination_name             34   34      7   0.206
+examination_notes            33   33      5   0.152
+medication_frequency         86   86      5   0.058
+diagnostic_result_name       34   34      1   0.029
+medication_dose              24   24      0   0.000   ← dose null rule (see policy)
+AGGREGATE                   726  630    193   0.306
+Unrepresentable criteria: 96/726 = 13.2% (schema gap, not model failure)
+```
+
+Key observations:
+- medication_name recall (0.615) is the strongest — the model extracts drug names well
+- medication_dose recall (0.000) is a known consequence of the dose-null policy (correct)
+- medication_frequency (0.058) and diagnostic_result_name (0.029) are the weakest extractable fields — both require the model to produce structured strings that can fuzzy-match English rubric criteria from a source-language transcript
+- Hindi/Marathi samples: 6 of 12 returned 0 extractions (model capability gap at 3B scale on Devanagari entity segmentation) — this is the primary next-phase investigation target
+
 **Policy decisions documented here (not changed unilaterally):**
 
 *Dose null rule (prompt rule 2):* KEPT. The dataset convention of inferring "1 tablet"
