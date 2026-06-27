@@ -337,6 +337,123 @@ def test_new_fields_default_empty_when_omitted() -> None:
     assert note.diagnostic_results == []
 
 
+# ── Phase-B regression tests (deterministic, no Ollama) ─────────────────────
+
+
+def test_null_crash_regression_i18() -> None:
+    """Regression for i=18: model emitting null for list fields must not crash.
+
+    Root cause: data.get("key", []) returns None when JSON has "key": null;
+    None is not iterable. Fixed by using (data.get("key") or []).
+    Asserts: no exception; returns a valid ClinicalNote with empty lists.
+    """
+    from src.l4_extract import _build_note
+    from src.types import ClinicalNote
+
+    data = {
+        "chief_complaint": None,
+        "history": None,
+        "symptoms": None,
+        "vitals": None,
+        "diagnosis": None,
+        "medications": None,
+        "investigations": None,
+        "diagnostic_results": None,
+        "low_confidence_fields": None,
+    }
+    note = _build_note(data)
+    assert isinstance(note, ClinicalNote)
+    assert note.symptoms == []
+    assert note.vitals == []
+    assert note.diagnosis == []
+    assert note.medications == []
+    assert note.investigations == []
+    assert note.diagnostic_results == []
+    assert isinstance(note.low_confidence_fields, list)
+
+
+def test_cdsco_tablet_paracetamol_validates() -> None:
+    """Regression for i=0: 'Tablet paracetamol' must validate as True.
+
+    Root cause: validate_drug() did exact set-membership; 'tablet paracetamol'
+    was not in the set (only bare 'paracetamol'). Fixed by stripping dosage-form
+    words before lookup.
+    """
+    from src.cdsco import validate_drug
+
+    assert validate_drug("Tablet paracetamol") is True
+    assert validate_drug("Tab paracetamol") is True
+    assert validate_drug("Capsule amoxicillin") is True
+    assert validate_drug("Syrup paracetamol") is True
+
+
+def test_calibration_flags_hallucinated_diagnosis_i23() -> None:
+    """Regression for i=23: diagnosis term with no transcript word overlap must be flagged.
+
+    Root cause: model hallucinated 'Pulmonary Embolism' on an acne/skin consult
+    transcript with full confidence; low_confidence_fields was empty.
+    Fixed by post-extraction word-token overlap check.
+    """
+    from src.l4_extract import _build_note
+
+    # Simulated acne consult transcript (face cream, pimples, redness, dizziness)
+    transcript = (
+        "[UNKNOWN]: face cream pimples redness dizziness low blood pressure"
+    )
+    data = {
+        "chief_complaint": "pimples and redness on face",
+        "history": None,
+        "symptoms": [{"name": "redness", "finding_status": "Present"}],
+        "vitals": [],
+        "examination": None,
+        "diagnosis": [
+            {"term": "Pulmonary Embolism", "snomed_id": None, "status": "Confirmed"}
+        ],
+        "medications": [],
+        "investigations": [],
+        "diagnostic_results": [],
+        "advice": None,
+        "follow_up": None,
+        "low_confidence_fields": [],
+    }
+    note = _build_note(data, transcript=transcript)
+    assert any(
+        "no_transcript_overlap" in f and "Pulmonary Embolism" in f
+        for f in note.low_confidence_fields
+    ), f"Expected 'Pulmonary Embolism' flagged; got: {note.low_confidence_fields}"
+
+
+def test_calibration_does_not_flag_devanagari_transcript() -> None:
+    """Devanagari transcripts must not trigger false hallucination flags.
+
+    Cross-lingual: Hindi/Marathi transcript → English diagnosis term. We cannot
+    compare scripts, so we skip the check entirely for Devanagari transcripts.
+    """
+    from src.l4_extract import _build_note
+
+    devanagari_transcript = (
+        "[UNKNOWN]: चेहरे पर मुंहासे हैं, लालिमा है, चक्कर आ रहे हैं"
+    )
+    data = {
+        "chief_complaint": None,
+        "history": None,
+        "symptoms": [],
+        "vitals": [],
+        "examination": None,
+        "diagnosis": [{"term": "Acne Vulgaris", "snomed_id": None, "status": None}],
+        "medications": [],
+        "investigations": [],
+        "diagnostic_results": [],
+        "advice": None,
+        "follow_up": None,
+        "low_confidence_fields": [],
+    }
+    note = _build_note(data, transcript=devanagari_transcript)
+    assert not any(
+        "no_transcript_overlap" in f for f in note.low_confidence_fields
+    ), f"Should not flag Devanagari transcript; got: {note.low_confidence_fields}"
+
+
 # ── Live Ollama (slow) ────────────────────────────────────────────────────────
 
 
