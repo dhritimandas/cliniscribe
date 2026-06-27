@@ -174,7 +174,13 @@ def run_extraction_eval() -> None:
     import pathlib
 
     _script_dir = pathlib.Path(__file__).resolve().parent
-    _search_roots = [pathlib.Path.cwd(), _script_dir.parent]
+    # Walk up from script location to catch both worktree layout
+    # (.claude/worktrees/<name>/eval/run_eval.py → project root 4 levels up)
+    # and direct checkout layout (eval/run_eval.py → project root 1 level up).
+    _ancestors = [_script_dir]
+    for _ in range(5):
+        _ancestors.append(_ancestors[-1].parent)
+    _search_roots = [pathlib.Path.cwd()] + _ancestors
     _project_root: pathlib.Path | None = None
     for candidate in _search_roots:
         if (candidate / "eka-clinical-note-generation-dataset").exists():
