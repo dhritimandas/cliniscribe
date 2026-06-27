@@ -303,8 +303,15 @@ def run_extraction_eval() -> None:
             results.append((rid, cat, crit))
         return results
 
-    def _normalise(s: str) -> str:
-        return _PUNCT_RE.sub("", s.lower().strip())
+    def _normalise(s: object) -> str:
+        """Normalise to lowercase, stripped, punctuation-free string.
+
+        Accepts non-str inputs (e.g. dicts that a model may have returned in a
+        list field) by converting to string first. This is defensive: the model
+        should return plain strings in list fields, but occasionally returns
+        JSON objects.
+        """
+        return _PUNCT_RE.sub("", str(s).lower().strip())
 
     def _token_overlap(a: str, b: str) -> float:
         """Token overlap Jaccard coefficient."""
