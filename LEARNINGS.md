@@ -490,6 +490,78 @@ a reference range.
 
 ---
 
+## Phase B Error Analysis — Defect Fixes and Repeatable L4 Scorer (2026-06-27)
+
+### (a) What this phase does
+Running L4 directly on the EkaCare 156-transcript dataset surfaced four confirmed
+defects — two code bugs and two design gaps — plus a missing evaluation harness.
+This phase fixes the two code bugs (a silent null-crash and a CDSCO false-rejection
+cascade), narrows a prompt instruction that was encouraging fabrication, adds a
+post-extraction hallucination calibration check, and builds the repeatable L4
+evaluation that was previously `raise NotImplementedError`. After the fixes a
+frozen 24-sample eval set (12 English, 12 Hindi/Marathi) can be run to produce
+a before/after per-category recall comparison.
+
+### (b) Hardest bugs
+
+1. **`_build_note` crashes on null list fields, silently swallowing an entire note**
+   — root cause: `data.get("symptoms", [])` returns `None` (not `[]`) when the
+   JSON key is present with value `null` (e.g., `"symptoms": null`). Python's
+   `dict.get(key, default)` only substitutes the default when the key is **absent**;
+   a key with an explicit `null` value is present and returns `None`. `None` is not
+   iterable, so the list comprehension raises `TypeError`. This was caught by the
+   bare `except Exception` in `extract()`, which returned `_empty_note()` — losing
+   all extracted data with no visible error. The symptom was observed on transcript
+   i=18 (Dolo 650 fever case): medications and symptoms were fully absent from the
+   returned note. The fix is `(data.get("key") or [])` — the `or` converts `None`
+   to `[]` regardless of whether the key was absent or explicitly null.
+   Note: `investigations`, `diagnostic_results`, and `low_confidence_fields` already
+   had `or []` guards — that asymmetry in the old code was the diagnostic signal.
+
+2. **CDSCO validation rejects the majority of real Indian prescriptions**
+   — root cause: three compounding issues, all arising from a too-narrow design:
+   (a) the lookup was exact set-membership on bare generic names, but the model
+   frequently prepends the dosage form ("Tablet paracetamol") which is not in the
+   set even though "paracetamol" is; (b) common Indian branded drugs (Dolo, Moxclav,
+   Bifilac, Meftal Spas, Grenil, Ultracet, Pantop, Shelcal, Foracort, Limcee,
+   Pan D, Asthalin, etc.) were absent from the seed set entirely — every brand-name
+   prescription was flagged unvalidated; (c) the false-unvalidated chain then
+   triggered `medications.<drug>.unvalidated` entries in `low_confidence_fields`
+   for every medication, burying the signal that flag was supposed to provide. The
+   fix adds dosage-form stripping before lookup, bidirectional substring and
+   token-overlap matching, and ~50 common Indian brand names to the seed set.
+
+### (c) Fine-tuning hook
+The diagnosis hallucination calibration added here (word-token overlap between
+the diagnosis term and the transcript) is a necessary floor but not sufficient.
+It catches "Pulmonary Embolism" on an acne transcript because no word overlaps.
+It does **not** catch a model that confidently adds "Hypertension" to a transcript
+where "BP" or "blood pressure" were mentioned in passing without any diagnosis being
+stated — because the words do overlap. The correct fine-tuning signal is a
+**calibration loss**: train the model to assign low probability to diagnosis tokens
+when no supporting evidence phrase appears in the context window. This is analogous
+to a reading-comprehension extractive QA model being trained to output "no answer"
+when the answer is not in the passage. Until then, the word-overlap check + the
+physician review layer are the safety net.
+
+**Policy decisions documented here (not changed unilaterally):**
+
+*Dose null rule (prompt rule 2):* KEPT. The dataset convention of inferring "1 tablet"
+from the word "Tablet" is a scoring artefact for LLM judges, not a clinical
+instruction. Fabricating a dose that was not stated risks a 2× or 5× overdose if
+the physician rubber-stamps the auto-fill. Rubric-match gain here is at the cost
+of patient safety. Recommendation: keep `dose=null` as the explicit default; the
+physician review step exists precisely to fill gaps like this from their clinical
+judgment.
+
+*Do-not-translate rule (prompt rule 6):* KEPT. Pre-translating Hindi/Marathi to
+English before extraction consistently degrades accuracy and loses code-switch
+nuance. The cross-lingual recall gap in the evaluation (rubric in English, note
+extracted in source language) is a **measurement limitation**, not a model failure
+— addressed in the scorer by a presence check for Devanagari rows.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no

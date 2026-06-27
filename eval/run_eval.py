@@ -513,5 +513,21 @@ def run_extraction_eval() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s — %(message)s")
-    run_asr_eval()
+
+    parser = argparse.ArgumentParser(description="Run KARMA evaluation for a pipeline stage.")
+    parser.add_argument(
+        "stage",
+        choices=["asr", "extraction"],
+        nargs="?",
+        default="asr",
+        help="Which stage to evaluate (default: asr)",
+    )
+    args = parser.parse_args()
+
+    if args.stage == "asr":
+        run_asr_eval()
+    else:
+        run_extraction_eval()
