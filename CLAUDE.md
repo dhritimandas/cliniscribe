@@ -54,10 +54,23 @@ class Turn:
     end: float
 
 @dataclass
+class Symptom:
+    name: str
+    finding_status: str = "Present"  # "Present" | "Absent" | "Unknown"
+    severity: str | None = None      # "Mild" | "Moderate" | "Severe" | None
+    since: str | None = None         # free-text onset, e.g. "3 days"
+
+@dataclass
+class Vital:
+    name: str           # "BP", "Temperature", "SpO2", "Pulse", "Weight", ...
+    value: str          # value with unit, e.g. "120/80 mmHg", "98 %"
+
+@dataclass
 class Medication:
     drug: str
     dose: str | None
     frequency: str | None
+    timing: str | None      # "before food" | "after food" | "at bedtime" | None
     duration: str | None
     validated: bool     # True only if matched to CDSCO drug list
 
@@ -65,14 +78,19 @@ class Medication:
 class Diagnosis:
     term: str
     snomed_id: str | None
+    status: str | None = None  # "Confirmed" | "Suspected" | "Ruled out" | None
 
 @dataclass
 class ClinicalNote:
     chief_complaint: str | None
     history: str | None
+    symptoms: list[Symptom]
+    vitals: list[Vital]
+    examination: str | None          # free-text physical exam findings
     diagnosis: list[Diagnosis]
     medications: list[Medication]
-    investigations: list[str]
+    investigations: list[str]        # tests ordered for later
+    diagnostic_results: list[str]    # results already in hand (with values)
     advice: str | None
     follow_up: str | None
     low_confidence_fields: list[str]  # surfaced to reviewing physician
@@ -93,15 +111,29 @@ def render(note: ClinicalNote) -> str           # L5  → pdf path
 {
   "chief_complaint": "string | null",
   "history": "string | null",
-  "diagnosis": [{ "term": "string", "snomed_id": "string | null" }],
+  "symptoms": [{
+    "name": "string",
+    "finding_status": "Present | Absent | Unknown",
+    "severity": "Mild | Moderate | Severe | null",
+    "since": "string | null"
+  }],
+  "vitals": [{ "name": "string", "value": "string (with unit)" }],
+  "examination": "string | null",
+  "diagnosis": [{
+    "term": "string",
+    "snomed_id": "string | null",
+    "status": "Confirmed | Suspected | Ruled out | null"
+  }],
   "medications": [{
     "drug": "string",
     "dose": "string | null",
     "frequency": "string | null",
+    "timing": "string | null",
     "duration": "string | null",
     "validated": "boolean"
   }],
   "investigations": ["string"],
+  "diagnostic_results": ["string"],
   "advice": "string | null",
   "follow_up": "string | null",
   "low_confidence_fields": ["string"]
@@ -109,6 +141,8 @@ def render(note: ClinicalNote) -> str           # L5  → pdf path
 ```
 
 Drug names and doses MUST be validated against the CDSCO list. Unvalidated entries get `"validated": false` and are flagged in `low_confidence_fields`.
+
+**Schema scope:** field set is aligned to the EkaCare clinical-note rubric targets so the note can hold what consultations actually contain (symptoms ≈ 23% of rubric criteria, vitals ≈ 8%, exam ≈ 7%, diagnostic results ≈ 8%, medication timing ≈ 5%, diagnosis status ≈ 3%). Structured past/family/social/lifestyle history is intentionally left as free-text `history` — Indian tier-2/3 clinic transcripts rarely capture it on tape (≈ 10% of rubric criteria), and structuring empty fields invites LLM fabrication. `investigations` = tests ORDERED; `diagnostic_results` = results already AVAILABLE.
 
 ## Development Rules
 
