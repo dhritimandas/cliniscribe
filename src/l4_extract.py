@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 from src.cdsco import validate_drug
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
@@ -40,9 +41,11 @@ RULES — follow every rule exactly:
 Do not supply a standard or typical dose. null means unknown.
 3. Add the field name to low_confidence_fields whenever you are uncertain about \
 a value or the value is absent but clinically expected.
-4. When a clinical term appears in parentheses after a lay term \
-(e.g. "sugar (Type 2 Diabetes Mellitus)"), extract the clinical term \
-in parentheses.
+4. If the transcript already contains a clinical synonym in parentheses \
+(e.g. "sugar (Type 2 Diabetes Mellitus)"), extract that parenthetical term. \
+Do NOT add parenthetical clinical terms yourself — only use what is explicitly \
+written in the transcript. This rule exists for L3.5-normalised transcripts; \
+if no parenthetical is present, extract only what is said.
 5. Extract only what is spoken. Do not add clinical knowledge not present \
 in the transcript.
 6. Use the language of the transcript for text fields. Do not translate.
@@ -80,7 +83,43 @@ def _parse(raw: str) -> dict:
     return json.loads(_strip_fences(raw))
 
 
-def _build_note(data: dict) -> ClinicalNote:
+_TOKEN_RE = re.compile(r"[a-z]+", re.IGNORECASE)
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+_MIN_OVERLAP_TOKEN_LEN = 4  # ignore short words (conjunctions, articles, etc.)
+# Speaker-role prefix tokens that appear in every turn and must be excluded.
+_ROLE_TOKENS: frozenset[str] = frozenset({"doctor", "patient", "unknown"})
+
+
+def _transcript_has_devanagari(transcript: str) -> bool:
+    """Return True if the transcript contains Devanagari characters."""
+    return bool(_DEVANAGARI_RE.search(transcript))
+
+
+def _transcript_tokens(transcript: str) -> set[str]:
+    """Return lowercase alpha tokens ≥ _MIN_OVERLAP_TOKEN_LEN, excluding role prefixes."""
+    return (
+        {t.lower() for t in _TOKEN_RE.findall(transcript) if len(t) >= _MIN_OVERLAP_TOKEN_LEN}
+        - _ROLE_TOKENS
+    )
+
+
+def _diagnosis_has_overlap(term: str, transcript_tokens: set[str]) -> bool:
+    """Return True if ≥1 token of the diagnosis term appears in the transcript.
+
+    When transcript_tokens is empty (which happens for Devanagari-only transcripts
+    after stripping role tokens), returns True — conservative, no false flagging.
+    Limitation: cross-lingual mapping (Hindi term → English diagnosis) is not
+    assessed; Devanagari transcripts are skipped entirely.
+    """
+    if not transcript_tokens:
+        return True  # no Latin content to compare against; skip flagging
+    term_tokens = {t.lower() for t in _TOKEN_RE.findall(term) if len(t) >= _MIN_OVERLAP_TOKEN_LEN}
+    if not term_tokens:
+        return True  # diagnosis term has no long tokens; can't assess
+    return bool(term_tokens & transcript_tokens)
+
+
+def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     # Guard with `or []`: model may emit null for list fields (e.g. "symptoms": null).
     # data.get("symptoms", []) returns None when the key is present with value null,
     # and None is not iterable — the `or []` converts None → [].
@@ -128,6 +167,28 @@ def _build_note(data: dict) -> ClinicalNote:
         )
 
     low_conf: list[str] = list(data.get("low_confidence_fields") or [])
+
+    # Hallucination calibration: flag any diagnosis whose term shares no word
+    # with the transcript. This catches the most egregious fabrications (e.g.
+    # "Pulmonary Embolism" on an acne consult) without requiring a domain model.
+    # Limitation 1: token comparison is Latin-script only. For Devanagari/Hindi/
+    # Marathi transcripts the check is SKIPPED (transcript_tokens is empty after
+    # stripping role tags) — the model correctly maps Hindi→English clinical terms,
+    # and penalising those would create false positives we cannot distinguish from
+    # real hallucinations at this layer. Per CLAUDE.md: do not pre-translate.
+    # Limitation 2: a 3B model can confidently hallucinate a term that happens to
+    # share a word with the transcript (e.g. "Diabetes" in a non-diabetes consult
+    # where the word was spoken in context). Treat this as a floor, not a ceiling.
+    transcript_tokens = _transcript_tokens(transcript)
+    for diag in diagnosis:
+        if not _diagnosis_has_overlap(diag.term, transcript_tokens):
+            flag = f"diagnosis.{diag.term}.no_transcript_overlap"
+            if flag not in low_conf:
+                low_conf.append(flag)
+                logger.warning(
+                    "L4 calibration: diagnosis %r has no token overlap with transcript — flagged low-confidence",
+                    diag.term,
+                )
 
     for med in medications:
         if not med.validated:
@@ -207,7 +268,7 @@ def extract(turns: list[Turn]) -> ClinicalNote:
                 else response["message"]["content"]
             )
             data = _parse(raw)
-            note = _build_note(data)
+            note = _build_note(data, transcript=transcript_text)
             logger.info(
                 "L4: extracted note (attempt %d): %d symptoms, %d vitals, "
                 "%d diagnosis, %d meds, %d low_conf",
