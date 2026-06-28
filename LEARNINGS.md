@@ -589,6 +589,71 @@ extracted in source language) is a **measurement limitation**, not a model failu
 
 ---
 
+## Phase B Enhancement — ASR Drug Keyword WER: Normalization Shippable Path + Decoder Biasing (2026-06-28)
+
+### (a) What this phase does
+The ASR stage (faster-whisper large-v3) misses most drug names because Indian clinical
+speech is heavily code-switched: doctors say drug names in English inside Hindi sentences.
+Whisper writes those English names in Devanagari script ("Augmentin" → `ऑर्ग्यूमेंटिंग`),
+so an exact Latin-script match fails even though the *pronunciation* was captured. This
+phase measures the miss precisely, builds a three-tier normalization pipeline that
+recovers what can be recovered by text post-processing alone, and characterizes what
+cannot — classifying the residual acoustic misses into two kinds and testing whether
+seeding the decoder with a drug-name vocabulary (`initial_prompt`) closes any of the gap.
+
+**Goal 2 — shippable normalization path.** A three-tier pipeline on the faster-whisper
+hypothesis: (1) a hand-curated Devanagari→Latin table (111 entries) for English-phonetic
+loanwords Whisper renders in Devanagari, (2) ITRANS romanization + exact CDSCO lookup for
+standard Devanagari spellings, (3) length-guarded fuzzy matching (≥8-char CDSCO candidate,
+threshold 0.82) for near-misses. Measured on the frozen Hindi-15 set (33 drug terms
+across 15 clips): Latin WER = 0.818 → 0.576 after normalization, closing 87.5% of the
+recoverable gap between the model's acoustic output and the Latin-surface label.
+
+**Goal 3 — acoustic miss decomposition + initial_prompt biasing.** Not every miss is the
+same. *DISTORTED-but-present* misses have a phonetically similar token in the hypothesis
+at that position (the decoder heard something, just spelled it wrong or distorted it) —
+these are decoder-biasable. *TRUE DROP* misses leave no phonetic trace at all (the audio
+never triggered a token near the drug name) — these are audio-quality or coverage-bounded
+regardless of post-processing or prompt tricks. Seeding faster-whisper with ~50 common
+Indian clinic drug names via `initial_prompt` shifts the decoder's token priors before
+the beam search runs; the idea is that a distorted drug has a higher probability of
+resolving to the correct token when that token appears in the context window.
+
+### (b) Hardest bugs
+
+1. **Normalization scoring produced negative recovery counts** — root cause: the original
+   `score(ref, hyp, kws)` function checked only `norm_hyp` for the "after" count. When
+   a Devanagari gold label (e.g. `एंटीबायोटिक्स`) was substituted to Latin (`antibiotics`)
+   in `norm_hyp` by the normalization pipeline, the Devanagari form was no longer found
+   → counted as a new miss → recovery went negative on clips where Devanagari drugs were
+   in the reference. Fix: `missed_after ⊆ missed_before` invariant enforced by checking
+   both the raw hypothesis and the normalized hypothesis for each miss:
+   `missed_after = [k for k in missed_before if k not in nhyp_norm]`. Recovery can now
+   only improve or stay the same, never regress.
+
+2. **faster-whisper large-v3 hangs for 10+ minutes after loading a 43 MB parquet
+   file** — root cause: CTranslate2 (the C++ inference engine behind faster-whisper)
+   initializes its thread pool and memory allocator at `WhisperModel(...)` time. When
+   a 43 MB parquet containing audio byte-arrays has already been loaded by pandas
+   (which invokes pyarrow and allocates large native memory blocks), CTranslate2 sees
+   a fragmented allocator state and spends >10 minutes on the tensor buffer setup.
+   On a clean process, the same model loads in ~60s. Fix: model-first loading — call
+   `WhisperModel(...)` before any `import pandas` or parquet read. The rule: never
+   hold a large native-memory allocation when initializing CTranslate2.
+
+### (c) Fine-tuning hook
+The `initial_prompt` experiment establishes what fraction of acoustic misses are
+*distorted-but-present* vs *true drop*. **DISPLACE-M** (domain-adaptive fine-tuning on
+a larger corpus of Indian clinic audio — not the current ~15-clip set, which would
+overfit) is the correct next lever for the distorted class: fine-tuning teaches the
+ASR model which phoneme confusions matter clinically (e.g. the Devanagari /ṭ/-initial
+form of "Augmentin" should produce "augmentin"). For the true-drop class, the ceiling
+is audio quality and mic placement — no model fine-tuning can recover a drug name that
+was never acoustically present. The partition between the two classes determines the
+ROI of any fine-tuning effort before investing in data collection.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no
