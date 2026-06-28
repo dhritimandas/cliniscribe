@@ -619,6 +619,29 @@ Indian clinic drug names via `initial_prompt` shifts the decoder's token priors 
 the beam search runs; the idea is that a distorted drug has a higher probability of
 resolving to the correct token when that token appears in the context window.
 
+**Results (7-clip intersection, beam_size=1, DISTORT_FUZZ=0.42):**
+
+- Baseline acoustic WER on 7 clips: **0.5714** (8/14 drug terms missed).
+- Decomposition of the 8 baseline acoustic misses:
+  - **(a) DISTORTED-but-present: 3** — clip3 "medicine" (ratio 0.421), clip18 "cough syrup"
+    (0.421), clip18 "Paracetamol 625 mg tablet" (0.486).
+  - **(b) TRUE DROP: 5** — clip1 "sunscreen" (0.353), clip3 "medicines" (0.400),
+    clip3 "Fluconazole" (0.400), clip18 "Benadryl cough syrup" (0.400), clip18 "10 ml" (0.333).
+- initial_prompt recovery on 7 clips: **1/3 distorted recovered** (Paracetamol 625mg tablet),
+  **0/5 true drops recovered** (expected — no token proximity means prompt context cannot help).
+- **Regressions: 3 new misses** introduced by the biased pass —
+  clip5 "वैद ऋषि का अशकल्प", clip13 "एंटीबायोटिक्स", clip16 "एंटीबायोटिक".
+  All three are native Hindi/Devanagari terms that the baseline transcribed correctly;
+  the English-heavy prompt biased the decoder toward Latin-script output and suppressed them.
+- **Net verdict: initial_prompt is counterproductive.** Biased acoustic WER = 0.714 vs
+  baseline 0.571 on the same 7 clips. Run terminated early at 7/15 by design (kill condition:
+  WER worse at 7/15). Do not ship `initial_prompt` with an English drug list into a
+  Hindi-dominant transcript — it trades 3 Hindi drug recoveries for 3 Hindi regressions and
+  only 1 distorted-class recovery.
+- **Irreducible residual (after best attempt):** 2 still-distorted misses → addressable only
+  by ASR fine-tuning (DISPLACE-M on a larger domain corpus, not this 15-clip set);
+  8 true-drop misses → addressable only by better audio capture (mic placement, SNR).
+
 ### (b) Hardest bugs
 
 1. **Normalization scoring produced negative recovery counts** — root cause: the original
@@ -642,15 +665,17 @@ resolving to the correct token when that token appears in the context window.
    hold a large native-memory allocation when initializing CTranslate2.
 
 ### (c) Fine-tuning hook
-The `initial_prompt` experiment establishes what fraction of acoustic misses are
-*distorted-but-present* vs *true drop*. **DISPLACE-M** (domain-adaptive fine-tuning on
-a larger corpus of Indian clinic audio — not the current ~15-clip set, which would
-overfit) is the correct next lever for the distorted class: fine-tuning teaches the
-ASR model which phoneme confusions matter clinically (e.g. the Devanagari /ṭ/-initial
-form of "Augmentin" should produce "augmentin"). For the true-drop class, the ceiling
-is audio quality and mic placement — no model fine-tuning can recover a drug name that
-was never acoustically present. The partition between the two classes determines the
-ROI of any fine-tuning effort before investing in data collection.
+On the 7-clip intersection, the acoustic miss partition is **3 distorted : 5 true drop**
+(37.5% : 62.5%). **DISPLACE-M** (domain-adaptive fine-tuning on a larger corpus of Indian
+clinic audio — not the current ~15-clip bench, which is too small to fine-tune on without
+overfitting) is the correct next lever for the distorted class: it teaches the ASR model
+which phoneme confusions matter clinically (e.g. the Devanagari /ṭ/-initial form of
+"Augmentin" should produce "augmentin"). For the true-drop class (62.5% of residual
+misses), the ceiling is audio quality and mic placement — no model change can recover a
+drug name that was never acoustically present. The `initial_prompt` result adds a
+constraint: any decoder-biasing technique using a Latin-script drug list must be applied
+selectively only when the hypothesis is already in Latin/English, or it will suppress
+correctly-transcribed Devanagari terms in mixed-language consultations.
 
 ---
 
