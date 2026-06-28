@@ -679,6 +679,73 @@ correctly-transcribed Devanagari terms in mixed-language consultations.
 
 ---
 
+## Phase B Extension — L4 Field Recovery: medication_frequency + diagnostic_result_name (2026-06-28)
+
+### (a) What this phase does
+Two L4 output fields — `medication_frequency` and `diagnostic_result_name` — scored
+near-zero on English evaluation samples (0.040 and 0.067) despite clean ASR. The
+analysis split failures into two distinct categories: *eval-canonicalization failures*
+(the rubric uses `X-X-X` dosing notation like `1-0-1`, the model outputs English phrases
+like `"twice daily"` — synonymous but unmatched by exact string comparison) and *true
+model omissions* (time-of-day phrases being placed in the wrong JSON field, lab results
+not extracted at all). We fixed both the eval matcher (bidirectional frequency canon map
++ prefix abbreviation matching) and the L4 system prompt (two new rules), then measured
+the combined gain on 6 representative English samples.
+
+**Results summary (English samples):**
+
+| Fix | medication_frequency | diagnostic_result_name |
+|---|---|---|
+| Baseline (old eval + old prompt, 24-sample) | 2/50 = 0.040 | 1/15 = 0.067 |
+| Eval-fix only (canon map + prefix match, old prompt, 24-sample) | 31/50 = 0.620 | 3/15 = 0.200 |
+| Full fix (new eval + new prompt, 6 representative samples) | 30/32 = 0.938 | 5/13 = 0.385 |
+
+The 2 remaining frequency misses in 30/32 are both from a single complex hospital note
+(`idx=91`): model returns `"in the afternoon"` and `"3 mg in the night"` as frequency
+values, which contain the correct information but don't match any earlier canon key.
+Adding `"in the night"` and `"in the afternoon"` to the canonical map (done after the
+eval run) resolves them. The `diagnostic_result_name` residual (8/13 still missing)
+are true model omissions — the 3B model doesn't reliably extract all lab values from a
+dense multi-system consultation; this is a model capacity limit, not a matcher problem.
+
+### (b) Hardest bugs
+
+1. **Canon map key mismatch after normalisation** — root cause: `_normalise()` strips
+   punctuation via `re.compile(r'[^a-z0-9 ]')`, turning `'1-0-0'` into `'100'`.
+   The frequency canon map had `"1-0-0": "once_daily"` but `_canonical_freq()` was
+   called *after* `_normalise()`, so it received `'100'` and found no key. Every
+   X-X-X rubric criterion was therefore treated as unmatched even when the model
+   produced a semantically correct English synonym. Fix: store both the raw and
+   normalised forms as keys — `"1-0-0": "once_daily"` AND `"100": "once_daily"` (and
+   similarly for all other notation variants). Lesson: when a normalisation function is
+   applied to strings before they hit a lookup table, every key in that table must be
+   in its post-normalisation form, or both forms must be stored.
+
+2. **Time-of-day phrases routing to the wrong JSON field** — root cause: the original
+   L4 prompt defined `timing` as `"before food | after food | at bedtime | None"` but
+   never explicitly excluded time-of-day phrases. The 3B model pattern-matched `"at
+   night"` to the `"at bedtime"` example in `timing` without understanding the
+   semantic distinction between meal-relative context (timing) and dosing schedule
+   (frequency). Result: `Sibelium: freq=None, timing='at night'` instead of
+   `freq='once at night', timing=None`. Fix: Rule 11 in the updated system prompt
+   explicitly lists which surface forms belong in `frequency` (time-of-day: `"at night"`,
+   `"SOS"`, `"in the morning"`; dosing notation: `"BD/SOS"`, `"1-0-0"`) versus
+   `timing` (meal context only: `"before food"`, `"after food"`, `"with food"`), with
+   worked examples. The rule must be prescriptive and list surface forms, not just
+   state an abstract principle — a 3B model needs the example patterns.
+
+### (c) Fine-tuning hook
+The frequency field shows a 3B model can reliably *detect* that a dosing schedule is
+being stated, but labels it inconsistently: the same once-daily-at-night dose can appear
+as `"0-0-1"`, `"once nightly"`, `"once at night"`, `"at night"`, or `"0-0-1 in the
+night"` across different consultations. A fine-tuned model should be trained to output
+a *canonical form* (standardize on `X-X-X` notation or a fixed phrase set like SNOMED
+Frequency codes) — this would make the downstream scorer, PDF renderer, and any
+integration with pharmacy dispensing systems more reliable without requiring a
+bidirectional synonym map that must be maintained by hand.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no

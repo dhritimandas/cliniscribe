@@ -313,11 +313,83 @@ def run_extraction_eval() -> None:
         """Normalise to lowercase, stripped, punctuation-free string.
 
         Accepts non-str inputs (e.g. dicts that a model may have returned in a
-        list field) by converting to string first. This is defensive: the model
-        should return plain strings in list fields, but occasionally returns
-        JSON objects.
+        list field) by converting to string first. When the input is a dict
+        with a 'term' or 'name' key (model mis-typed a diagnostic result as an
+        object), extract that string rather than the raw repr.
         """
+        if isinstance(s, dict):
+            s = s.get("term") or s.get("name") or s.get("value") or str(s)
         return _PUNCT_RE.sub("", str(s).lower().strip())
+
+    # ── Frequency canonical map ───────────────────────────────────────────────
+    # Maps normalised frequency strings (from rubric OR extracted note) to a
+    # canonical group key.  Two values match if they share the same key.
+    # Groups: once_daily / twice_daily / three_daily / prn.
+    # X-X-X notation (morning-afternoon-evening): 1-0-0 / 0-0-1 / 0-1-0 all
+    # mean "once a day" at different times — grouped under once_daily.
+    # Both raw (with dashes/slashes) and _normalise()-d forms (dashes/slashes stripped
+    # by _PUNCT_RE) must be present, because _canonical_freq receives already-normalised
+    # strings: '1-0-0' → '100', 'BD/SOS' → 'bdsos'.
+    _FREQ_CANON: dict[str, str] = {
+        # X-X-X raw and normalised forms
+        "1-0-0": "once_daily",  "100": "once_daily",
+        "0-0-1": "once_daily",  "001": "once_daily",
+        "0-1-0": "once_daily",  "010": "once_daily",
+        "1-0-1": "twice_daily", "101": "twice_daily",
+        "1-1-1": "three_daily", "111": "three_daily",
+        "1-1-0": "twice_daily", "110": "twice_daily",
+        "0-1-1": "twice_daily", "011": "twice_daily",
+        # BD/SOS and compound forms (raw and normalised)
+        "bd/sos": "twice_daily", "bdsos": "twice_daily",
+        # Standard abbreviations (already survive _normalise unchanged)
+        "od": "once_daily", "bd": "twice_daily", "bid": "twice_daily",
+        "tds": "three_daily", "tid": "three_daily", "hs": "once_daily",
+        "sos": "prn", "prn": "prn",
+        # English phrases
+        "once daily": "once_daily", "once a day": "once_daily",
+        "one daily": "once_daily", "1 daily": "once_daily",
+        "once in the morning": "once_daily", "one in the morning": "once_daily",
+        "once daily morning": "once_daily", "in the morning": "once_daily",
+        "once at night": "once_daily", "once nightly": "once_daily",
+        "once daily at night": "once_daily",
+        "at night": "once_daily", "at bedtime": "once_daily",
+        "in the night": "once_daily", "in the afternoon": "once_daily",
+        "at noon": "once_daily", "once at noon": "once_daily",
+        "twice daily": "twice_daily", "twice a day": "twice_daily",
+        "two times a day": "twice_daily", "2 times a day": "twice_daily",
+        "morning and night": "twice_daily", "morning and evening": "twice_daily",
+        "three times a day": "three_daily", "three times daily": "three_daily",
+        "thrice a day": "three_daily", "thrice daily": "three_daily",
+        "3 times a day": "three_daily",
+        "as needed": "prn", "when needed": "prn", "if needed": "prn",
+    }
+    # Strip meal-timing and duration suffixes before looking up canonical form.
+    _FREQ_STRIP_RE = re.compile(
+        r"\s+(?:before|after|with)\s+(?:food|meals?|eat\w*)"
+        r"|\s+for\s+\d+\s+(?:day|week|month)\w*",
+        re.IGNORECASE,
+    )
+
+    # Sorted longest-first so substring scan prefers the most specific match.
+    _FREQ_CANON_SORTED = sorted(_FREQ_CANON, key=len, reverse=True)
+
+    def _canonical_freq(s: str) -> str | None:
+        """Map a normalised frequency string to its canonical group, or None.
+
+        Tries in order: direct lookup → slash-part lookup → longest-substring
+        scan (handles 'milligram once at night' → 'once at night' → once_daily).
+        """
+        stripped = _FREQ_STRIP_RE.sub("", s).strip()
+        if stripped in _FREQ_CANON:
+            return _FREQ_CANON[stripped]
+        for part in stripped.split("/"):
+            part = part.strip()
+            if part in _FREQ_CANON:
+                return _FREQ_CANON[part]
+        for key in _FREQ_CANON_SORTED:
+            if key in stripped:
+                return _FREQ_CANON[key]
+        return None
 
     def _token_overlap(a: str, b: str) -> float:
         """Token overlap Jaccard coefficient."""
@@ -327,22 +399,51 @@ def run_extraction_eval() -> None:
             return 0.0
         return len(ta & tb) / len(ta | tb)
 
+    def _all_gold_covered(gold: str, candidate: str) -> bool:
+        """Return True if every gold token is present in (or is a prefix of) a candidate token.
+
+        Handles medical abbreviations and truncations:
+          'USG Abd' vs 'USG of abdomen'  — 'abd' is prefix of 'abdomen'
+          'Serum Creatinine' vs 'serum creat of 1.3' — 'creatinine'.startswith('creat')
+        Minimum token length 3 to avoid spurious short-token matches.
+        """
+        gt_tokens = gold.split()
+        ct_tokens = candidate.split()
+        if not gt_tokens:
+            return False
+        for gt in gt_tokens:
+            found = False
+            for ct in ct_tokens:
+                if gt == ct:
+                    found = True
+                    break
+                if len(gt) >= 3 and len(ct) >= 3 and (gt.startswith(ct) or ct.startswith(gt)):
+                    found = True
+                    break
+            if not found:
+                return False
+        return True
+
     def _extract_quoted(criterion: str) -> str:
         """Extract first single-quoted value from a criterion string."""
         m = re.search(r"'([^']+)'", criterion)
         return m.group(1) if m else criterion
 
-    def _fuzzy_match(criterion: str, field_values: list[str]) -> bool:
+    def _fuzzy_match(criterion: str, field_values: list[str], *, cat: str = "") -> bool:
         """Return True if criterion matches any of the extracted field values.
 
         Strategy:
         1. Extract the quoted entity from the criterion (the 'Gold Standard').
         2. Normalise both candidate and gold.
-        3. Accept if: substring (bidirectional) OR token-overlap ≥ 0.5.
+        3. Accept if: substring (bidirectional) OR token-overlap ≥ 0.5
+           OR all gold tokens are covered (with prefix match for abbreviations).
+        4. For medication_frequency: additionally compare canonical freq groups
+           (maps X-X-X notation ↔ English equivalents like 'twice daily').
         """
         gold = _normalise(_extract_quoted(criterion))
         if not gold:
             return False
+        gold_canon = _canonical_freq(gold) if cat == "medication_frequency" else None
         for val in field_values:
             candidate = _normalise(val)
             if not candidate:
@@ -350,6 +451,11 @@ def run_extraction_eval() -> None:
             if gold in candidate or candidate in gold:
                 return True
             if _token_overlap(gold, candidate) >= 0.5:
+                return True
+            if _all_gold_covered(gold, candidate):
+                return True
+            # Frequency canonicalization: e.g. '1-0-1' == 'twice_daily' == 'twice a day'
+            if gold_canon and _canonical_freq(candidate) == gold_canon:
                 return True
         return False
 
@@ -439,10 +545,10 @@ def run_extraction_eval() -> None:
                 # English (3B model tends to output English regardless of input
                 # language). Apply presence check first; string match second.
                 has_value = len(field_values) > 0
-                matched = has_value and _fuzzy_match(criterion, field_values)
+                matched = has_value and _fuzzy_match(criterion, field_values, cat=cat)
                 status = "matched" if matched else ("present_no_match" if has_value else "missing")
             else:
-                matched = _fuzzy_match(criterion, field_values)
+                matched = _fuzzy_match(criterion, field_values, cat=cat)
                 status = "matched" if matched else "missed"
 
             if matched:

@@ -57,9 +57,17 @@ temperature, weight). Only include a vital when a measured value is spoken. \
 Never invent a measurement.
 9. INVESTIGATIONS are tests the doctor ORDERS for later (e.g. "get a CBC"). \
 DIAGNOSTIC_RESULTS are results already available in the consultation \
-(e.g. "Hb is 9.2"). Do not put an ordered test in diagnostic_results.
+(e.g. "Hb is 9.2", "raised cholesterol", "HbA1c 9.1", "Vitamin D low", \
+"Total IGE 2107"). Extract each as a separate string. \
+Do not put ordered tests in diagnostic_results; do not put lab results in history.
 10. examination is free text describing physical-exam findings \
-(e.g. "abdomen soft, mild tenderness"). null if no exam is described.\
+(e.g. "abdomen soft, mild tenderness"). null if no exam is described.
+11. FREQUENCY is the dosing schedule — how often and when during the day: \
+"once daily", "twice daily", "BD", "TDS", "SOS", "once at night", \
+"once in the morning", "1-0-1". Extract it whenever a dosing schedule is stated. \
+TIMING is ONLY for meal-relative context: "before food", "after food", "with food". \
+Time-of-day phrases ("at night", "SOS", "in the morning") and dosing notation \
+("1-0-0", "BD/SOS") belong in frequency, not timing.\
 """
 
 
@@ -195,6 +203,17 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             if flag not in low_conf:
                 low_conf.append(flag)
 
+    def _coerce_str(item: object) -> str:
+        """Coerce a diagnostic_results or investigations item to plain string.
+
+        The model occasionally returns dicts (e.g. {"term": "..."}) in list
+        fields that should contain strings.  Extract the most informative key
+        rather than repr the dict.
+        """
+        if isinstance(item, dict):
+            return str(item.get("term") or item.get("name") or item.get("value") or item)
+        return str(item)
+
     return ClinicalNote(
         chief_complaint=data.get("chief_complaint") or None,
         history=data.get("history") or None,
@@ -203,8 +222,8 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
         examination=data.get("examination") or None,
         diagnosis=diagnosis,
         medications=medications,
-        investigations=list(data.get("investigations") or []),
-        diagnostic_results=list(data.get("diagnostic_results") or []),
+        investigations=[_coerce_str(x) for x in (data.get("investigations") or [])],
+        diagnostic_results=[_coerce_str(x) for x in (data.get("diagnostic_results") or [])],
         advice=data.get("advice") or None,
         follow_up=data.get("follow_up") or None,
         low_confidence_fields=low_conf,
