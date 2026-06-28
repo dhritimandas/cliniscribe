@@ -1,550 +1,562 @@
-# CliniScribe — Phase Learnings
+# CliniScribe — Engineering & Research Learnings
 
-A running, teach-a-newcomer record of the build. Each part covers one stretch of
-work in the order it happened: **build a stage → measure it → learn the concepts
-needed for the next stage.** Plain language; any jargon is defined inline the
-first time it appears. The required per-phase checkpoint format (what / hardest
-bugs / fine-tuning hook) is preserved in the Appendix and used in Part 1.
+A teaching-grade record of how this clinical-scribe MVP was built, measured, and
+reasoned about. It is written so that a domain newcomer — or you, three months from
+now, or a reviewer at a frontier lab — can read it end-to-end, understand every
+decision, and reproduce the results.
 
-Contents:
-- **Part 1 — Phase A: audio → attributed transcript** (L1 preprocess, L2 diarize, L3 ASR)
-- **Part 2 — Evaluation: measure before you tune** (the WER harness and the first baseline)
-- **Part 3 — Concept layer: preparing for Phase B** (embeddings, normalization, LLM extraction)
+## How to read this document
 
----
+The old version of this file was a single chronological stream that mixed *what the
+code does*, *how we run experiments*, and *what we decided to ship*. It was complete
+but hard to navigate. This version separates those three concerns into layers, so you
+can enter at the layer you need:
 
-# Part 1 — Phase A: Audio → Attributed Transcript (2026-06-26)
+| If you want to… | Read |
+|---|---|
+| Understand the project in one minute | **Part I — The Project in 60 Seconds** |
+| Learn *how we think* (the research discipline + the transferable principles) | **Part II — Methodology & Principles** |
+| Know *where the code stands* right now, stage by stage | **Part III — Engineering Status** |
+| Follow *what was actually tried*, in order, as a lab notebook | **Part IV — Experiment Log** |
+| See *what we chose to build and deliberately not build*, and why | **Part V — Product & Schema Decisions** |
+| Look up a term, or reproduce a result | **Appendix** (glossary + repro + checkpoint format) |
 
-Stages L1→L2→L3 turn a raw audio file into a speaker-labelled, multilingual
-transcript. *Diarization* = "who spoke when" (segmenting audio by speaker).
-*ASR* = automatic speech recognition (audio → text). *Code-switching* = mixing
-languages mid-sentence, e.g. Hindi and English, which Indian clinics do
-constantly.
-
-## (a) What this phase does
-L1 resamples any input audio to 16 kHz mono WAV using librosa (Core Audio backend
-on macOS — no ffmpeg needed) and trims leading/trailing silence via energy-threshold
-VAD (voice-activity detection); denoising is a keyword-only toggle defaulting to OFF
-because stationary noise reduction can *increase* word errors on clean clinic
-recordings. L2 runs `pyannote/speaker-diarization-community-1` on the Mac GPU (MPS),
-passing audio as a preloaded `{'waveform': tensor, 'sample_rate': int}` dict because
-torchcodec (pyannote's preferred audio reader) fails to link against the installed
-ffmpeg. L3 uses faster-whisper large-v3 on CPU (int8 quantization, ~3.6 GB peak RAM)
-and transcribes each diarized segment with `language=None` so Hindi, English, and
-Marathi are detected independently per segment rather than forcing one global language.
-
-## (b) The two hardest bugs
-1. **`Pipeline.from_pretrained()` rejected `use_auth_token=`** — root cause:
-   pyannote.audio ≥ 3.x switched to the standard HuggingFace `token=` parameter and
-   removed `use_auth_token` with no deprecation cycle, so it failed as a hard
-   `TypeError`, not a warning.
-2. **`DiarizeOutput has no attribute 'itertracks'`** — root cause: the community-1
-   model wraps its result in a `DiarizeOutput` dataclass instead of returning a bare
-   `pyannote.core.Annotation`; the annotation lives at
-   `DiarizeOutput.speaker_diarization`. The public docs only describe the 3.x family,
-   so the community model diverges silently.
-
-## (c) Fine-tuning hook
-The doctor/patient role heuristic (a bag-of-words score over question-forms and
-clinical terms) only fires when ≥2 speakers are present. Every EkaCare ASR-eval clip
-is a single-doctor utterance, so all turns came out `UNKNOWN`. A real role classifier
-will need full consultations where doctor and patient turns alternate — the
-clinical-note-generation dataset (156 transcripts with JSON ground truth), not the
-ASR-eval set.
-
-## How L3 works, for a newcomer
-faster-whisper is a reimplementation of OpenAI's Whisper running on **CTranslate2**,
-a C++ inference engine — *not* PyTorch. That one fact explains most of the design:
-
-- `WhisperModel("large-v3", device="cpu", compute_type="int8")` — CPU, **not** the
-  GPU, because CTranslate2 has no Metal backend; on M-series it falls back to Apple's
-  AMX matrix units via BLAS. `compute_type="int8"` *quantizes* the weights to 8-bit
-  integers (storing each number in 1 byte instead of 4), cutting RAM from ~10 GB to
-  ~3.6 GB — the trade the 24 GB hardware budget forces.
-- `model.transcribe(...)` returns `(segments_generator, info)`. The generator is
-  **lazy** — no transcription runs until you iterate it.
-- `language=None` runs **language identification (LID)** per clip — each diarized
-  slice gets its own language verdict. This is the whole code-switching strategy.
-- `task="transcribe"` pins same-language output, so a Hindi segment is never silently
-  translated to English (a hard project rule).
-- `beam_size=5` keeps the 5 best running hypotheses instead of greedily taking the
-  single most likely next word — slower, more accurate.
-- Cleanup is `del model; gc.collect()` so the next stage never shares RAM with this one.
-
-## Three speech-pipeline lessons
-The two bugs in (b) were generic library churn. These three are the real
-speech-pipeline lessons:
-1. **Audio decoding is a native-dependency minefield, and it breaks first.**
-   torchcodec couldn't link ffmpeg, so we decode audio ourselves once
-   (librosa/soundfile) and hand models an in-memory array, never a file path —
-   decoupling decoding from inference.
-2. **"I have a GPU" ≠ "this model uses it."** The inference *runtime* matters more
-   than the chip: in one pipeline L2 (PyTorch) runs on the GPU while L3 (CTranslate2)
-   runs on CPU.
-3. **Whisper's language ID degrades on short audio — and diarization hands it exactly
-   that.** A sub-second slice gives LID almost no signal, so the language verdict is
-   shakiest at the short turns where code-switching happens. (A sample segment was
-   tagged English at 0.67 confidence when the audio was Hindi.)
-
-## What actually cost the most time
-The spec predicted **code-switch ASR accuracy** would be the hard part. That's
-probably right about the *product* — but it was **not** what consumed Phase A, and we
-couldn't even measure it yet. What fought back was **plumbing**: native audio
-decoding, CPU-vs-GPU runtime mismatch, and the pyannote API surface. None of that is
-machine learning. This is the signature of **on-device, local-first pipelines** —
-with no cloud API hiding decoding, device placement, and quantization, those
-concerns front-load the schedule and the ML risk waits until the eval harness exists.
-
-## A worked failure: "daily three times" — and how we'll fix it
-The clearest code-switch error, from sample 2:
-
-- **Reference (truth):** "daily three times."
-- **ASR output:** `और डाइली फ्री टाइम्स`
-
-Two failures stacked at one switch point:
-1. **Script** — the English words were transliterated into Devanagari
-   (`डाइली`="daily", `टाइम्स`="times") instead of written in Latin letters.
-2. **Lexical** — **"three" → "फ्री" ("free")**: the "th" sound heard as "f".
-
-**Why it breaks exactly there.** Every segment of this clip was LID'd as Hindi at
-0.92–0.98 confidence. Once Whisper commits a segment to the `hi` language token, its
-decoder runs in "Hindi mode" — biased toward Devanagari spelling and Hindi sound
-patterns. Standard Hindi has **no /θ/** (the "th" in "three"), so a Hindi-conditioned
-decoder assigns near-zero probability to a /θ/-initial word and emits the nearest
-sound it *can* produce: /f/ → `फ्री`. The model fails at the precise phoneme that
-doesn't exist in the language it committed to. Tellingly, later English terms in the
-*same* recording ("lab test", "CBC", "chest x-ray", "after 8 days") survived — they
-sit inside a long Hindi-context segment with strong medical-English priors, whereas
-"daily three times" was its own isolated 1.45-second slice with no context to anchor
-the language.
-
-**The root cause is the slicing, not the model.** We feed Whisper one tiny segment at
-a time, starving it of the ~30-second context window it needs for reliable language
-ID and decoding. The fix, in priority order:
-1. **Stop slicing — transcribe the whole file once, then assign words to speakers by
-   overlapping word-level timestamps with the diarization** (the whisperX pattern).
-   Whisper regains full context, and it also removes the wasteful re-decode-per-segment.
-2. **Bias the decoder toward keywords** via `initial_prompt`/`hotwords` seeded with a
-   clinical-English lexicon (drug names, "daily/twice/three times", OD/BD/TDS).
-3. **Add a downstream safety net** in L3.5/L4: normalize garbled frequency terms, and
-   flag any dose/frequency that can't be validated rather than guessing.
-
-This fix is deferred until after the eval harness (Part 2) so it can be **measured**,
-not guessed — see Part 2 for why that ordering is deliberate.
+Cross-references use `[E#]` for experiments (Part IV) and `[P2.#]` for principles
+(Part II). Jargon is defined inline on first use and collected in the glossary.
 
 ---
 
-# Part 2 — Evaluation: Measure Before You Tune (2026-06-26)
+# Part I — The Project in 60 Seconds
 
-## Why we built the eval harness before fixing the ASR error
-You cannot responsibly fix "daily three times" without a number to move. Two unknowns
-made a blind fix reckless: (1) *how bad is it, really?* — one eyeballed error is not a
-WER number; and (2) *does the error even reach the final note?* — the product output
-is the structured note, not the raw transcript, and L4 (the LLM) may recover or flag
-it. The project rule is explicit: wire metrics in from the start and score every
-change on a frozen set. So the harness came first; the ASR fix becomes a measured
-experiment.
+**What.** CliniScribe is an on-device clinical scribe for Indian tier-2/tier-3 clinics.
+A doctor records a 3–8 minute consultation (Hindi/English/Marathi, code-switched);
+the system returns a structured clinical note and a prescription PDF that the
+physician reviews and signs.
 
-## The metrics, explained
-**WER (Word Error Rate)** is edit distance at the word level, normalized by reference
-length — the same edit distance used on strings, but counting whole words. Align the
-reference against the hypothesis and count the minimum edits: **S**ubstitutions (wrong
-word), **D**eletions (missing word), **I**nsertions (extra word).
+**Two constraints shape everything.**
+1. **On-device, 24 GB.** Everything runs locally on a MacBook Air (M-series, 24 GB
+   unified RAM). No cloud APIs in the production path — patient privacy, cost, and
+   unreliable rural connectivity rule them out.
+2. **Patient safety.** A wrong drug name or dose can harm someone. So the metric that
+   matters most is not overall transcription quality — it is accuracy on the
+   *safety-critical tokens*: drug names, doses, vitals.
 
-    WER = (S + D + I) / N      where N = number of words in the reference
+**The pipeline** is a sequential, end-of-consultation batch (not streaming):
 
-Worked example on the Augmentin case:
+```
+audio → L1 preprocess → L2 diarize → L3 ASR → L3.5 normalize → L4 extract → L5 render → [PHYSICIAN REVIEW]
+```
 
-    REF:  give  augmentin   twice  daily        (N = 4)
-    HYP:  give  augmenting  twice  —
-                └ substitution      └ deletion
-    S=1, D=1, I=0  →  WER = 2/4 = 0.50
+| Stage | Job | Component |
+|---|---|---|
+| L1 | resample → 16 kHz mono, trim silence, optional denoise | librosa / soundfile / noisereduce |
+| L2 | diarization — "who spoke when" | pyannote speaker-diarization-community-1 |
+| L3 | ASR — speech → text, in the source language | faster-whisper large-v3 (CTranslate2) |
+| L3.5 | normalize lay→clinical terms; fix drug spellings | parrotlet-e embeddings + curated tables |
+| L4 | extract structured `ClinicalNote` JSON | qwen2.5:3b-instruct via Ollama |
+| L5 | render prescription PDF | reportlab |
 
-Scale: 0.0 = perfect; 1.0 = as many errors as words; it can exceed 1.0 with many
-insertions. Lower is better; clean English dictation is ~0.05–0.10.
+**Memory discipline (non-negotiable).** Load one model, run it, release it
+(`del model; gc.collect()`). Never hold the ASR model and the LLM resident at once —
+they do not both fit in 24 GB. The batch design exists precisely to make this clean.
 
-**Keyword WER** = `1 − recall` over clinically critical terms (drugs, doses,
-diagnostics) taken from the dataset's gold `medical_entities`. It asks: *of the terms
-that matter, how many did we lose?* "**micro**" averaging pools across all clips
-(total missed ÷ total present), so a clip with more keywords counts more; "macro"
-would average each clip's rate equally. We report micro — it's the honest
-patient-safety view.
-
-**Drug Keyword WER** = the same, restricted to drug-category terms.
-
-## Phase A ASR baseline (frozen Hindi 10-clip set)
-
-| Metric              | Value | Notes                         |
-|---------------------|-------|-------------------------------|
-| Corpus WER          | 0.52  | edit errors over all words    |
-| Keyword WER (micro) | 0.62  | over 42 clinical keywords     |
-| Drug Keyword WER    | 1.00  | over 7 drug terms             |
-
-**The key insight is the *correlation*, not any single number:**
-
-    0.52 (all words)  <  0.62 (keywords)  <  1.00 (drug terms)
-
-The error rate **climbs as the words get more clinically important.** The model is
-*least* accurate on exactly the tokens that matter most — drug names, doses, clinical
-terms — because those are the rare, English-origin, code-switched words it
-transliterates or garbles, while it handles common Hindi filler fine. For a clinical
-scribe that is the worst possible error distribution: **accurate where it's harmless,
-wrong where it's dangerous.** A single global WER would have hidden this — which is
-exactly why we split out keyword and drug metrics.
-
-**Honest caveats (so the numbers are read correctly):**
-- **N = 10** is small.
-- The scorer is **strict on script**: it heard "daily" but wrote `डाइली` (Devanagari)
-  → counted as an error even though it's phonetically right. So 0.52 mixes real errors
-  with script-form mismatches and is *pessimistic*.
-- **Drug WER 1.00 is partly a metric artifact**: it exact-matches the compound gold
-  span "Augmentin 650 mg", and since the drug *name* garbled (`Augmentin → augmenting`)
-  the whole span scores as missed — even though the **dose number 650 survived**. The
-  real signal is "drug *names* garble," not "doses fail."
-
-These are a **baseline to beat, not a verdict**. Planned refinements: script-folding
-before scoring, and separating drug-name / dose / frequency into their own buckets so
-we can attribute errors precisely (see Part 3's open question).
+**The prime directive.** *Measure before you tune.* Every model swap or prompt change
+is scored on a **frozen evaluation set** before it is accepted. This single rule
+generated most of the insights in this document — see Part II.
 
 ---
 
-# Part 3 — Concept Layer: Preparing for Phase B (2026-06-26)
+# Part II — Methodology & Principles
 
-Phase B is L3.5 (normalize lay terms → clinical terms) and L4 (extract a structured
-note). Two model types do the work — an **embedding model** and an **LLM** — and the
-choice of which goes where is the crux. These notes build the concepts from scratch.
+This is the "how we think" layer. The engineering details live in Parts III–IV; here
+is the reasoning discipline that produced them, plus the transferable principles
+worth carrying to the next project.
 
-## What an embedding is
-An **embedding** turns a piece of text into a list of numbers — a vector — that
-represents its *meaning* as a **point in space**. The model is trained so texts with
-similar meaning land near each other and unrelated texts land far apart. A typical
-embedding has hundreds of dimensions (parrotlet-e: ~1024), but the intuition holds in 2-D.
+## 2.1 The prime directive — measure before you tune
 
-**The "meaning map" analogy.** On a geographic map, *position* encodes *location* —
-Mumbai and Pune are close, Mumbai and Delhi far. An embedding is the same idea with
-the axes encoding *meaning* instead of geography. On this meaning-map, "sugar" (the
-everyday word for diabetes), "diabetes", "high blood sugar", and "मधुमेह" all sit in
-one neighborhood, while "fracture" sits in a distant district. Closeness is measured
-by **cosine similarity** — the angle between two vectors; small angle = similar meaning.
+You cannot responsibly change a system you cannot measure. Two questions make any
+blind fix reckless: *how bad is it, really?* (one eyeballed error is not a number) and
+*does the error even reach the product?* (the output is the structured note, not the
+raw transcript — a later stage may recover or flag it). So the evaluation harness is
+built **before** the first optimization, and every change becomes a *measured
+experiment*, not a guess.
 
-**How the positions get there — learned, not hand-placed.** Nobody types in
-coordinates, and there's no closed-form formula. It's **metric learning**, the same
-recipe as face recognition: a network is trained with a **contrastive/triplet loss**
-that pulls *positive pairs* together and pushes *negative pairs* apart, by gradient
-descent over millions of examples. For text, ("sugar", "diabetes") is a positive pair
-→ pulled together; ("sugar", "fracture") is negative → pushed apart. Humans curate
-*which pairs should be close* (often from medical ontologies like UMLS/SNOMED); the
-network learns *where the points go*. A generic model would put "sugar" near
-"sucrose/dessert" — the food sense — so **parrotlet-e** (bge-m3 fine-tuned on medical
-pairs) re-draws the neighborhood so the clinical sense wins, exactly like fine-tuning
-an ImageNet backbone on medical images.
+**Frozen eval set.** We lock a fixed set of test examples and never change it between
+experiments. Analogy: to track weight loss you weigh yourself on the *same scale* each
+morning — swap scales daily and any change might be the instrument, not you. A frozen
+set is the same scale every time, so a moved number means the *change* moved it, not an
+easier batch of examples. Our frozen sets: a 10-clip Hindi ASR set, a 15-clip / 33-drug
+ASR set, and a 24-sample L4 set (12 English + 12 Hindi/Marathi).
 
-**Normalization then = nearest-neighbor lookup on the meaning-map:** pre-place the
-canonical clinical vocabulary, embed the patient's phrase, return the nearest
-canonical concept. This beats string-matching, where "sugar" and "diabetes" share no
-letters but are meaning-neighbors.
+## 2.2 The metrics — KARMA
 
-## "Normalization" — three different meanings, disambiguated
-The word is overloaded. Only the third is the pipeline stage:
-1. **Image normalization** — rescaling signal values (pixels to [0,1], z-scoring,
-   histogram equalization). A numeric operation on intensities.
-2. **Vector normalization** — scaling a vector to unit length (÷ its L2 norm) so you
-   can compare directions via cosine similarity. Happens *inside* the embedding math.
-3. **Lexical / concept normalization (our L3.5 stage)** — mapping many *surface forms*
-   of a concept to one **canonical form** ("sugar", "मधुमेह", "high blood sugar" →
-   `Type 2 Diabetes Mellitus`). The NLP/database sense: collapse variants to a
-   canonical key. The closest vision analogy is **canonicalization/registration** —
-   mapping many variant inputs (lighting, angle, label) to one reference representation.
+| Metric | Plain meaning | Why it exists |
+|---|---|---|
+| **WER** | Word Error Rate = (Substitutions + Deletions + Insertions) ÷ reference words | baseline transcript quality |
+| **Keyword WER** | `1 − recall` over clinically critical terms (drugs, doses, diagnostics) | the safety view |
+| **Drug Keyword WER** | same, restricted to drug names | the sharpest safety view |
+| **DER** | Diarization Error Rate — how often "who spoke" is wrong | L2 quality |
+| **Concept-match** | did "sugar" correctly map to "diabetes"? | L3.5 quality |
 
-## Why embeddings for normalization but an LLM for extraction
-They are good at opposite things, and each is dangerous in the other's job.
-- **Embedding model = closed-world matcher.** Answers "*which known thing is this most
-  like?*" Its output is always one of the N entries you pre-placed — it *cannot* return
-  a concept outside the vocabulary, which is exactly what you want for normalization
-  (a guaranteed-valid clinical term). But it can't read a sentence, handle negation, or
-  build structured output.
-- **LLM = open-world reasoner/generator.** Answers "*what is the structured meaning of
-  all this?*" It reads a messy code-switched transcript and fills a schema (complaint,
-  history, meds, follow-up), handling context and negation. That generative power is
-  irreplaceable for extraction — and is also the hazard: it can produce things that
-  were never in the input.
+WER scale: `0.0` = perfect, `1.0` = as many errors as words (can exceed 1.0 with many
+insertions); clean English dictation is ~0.05–0.10. Worked example:
+
+```
+REF:  give  augmentin   twice  daily      (N = 4 reference words)
+HYP:  give  augmenting  twice  —
+            └ substitution      └ deletion
+S=1, D=1, I=0  →  WER = 2/4 = 0.50
+```
+
+We report **micro** averaging for keyword WER (total missed ÷ total present, so a clip
+with more keywords counts more) — the honest patient-safety pooling.
+
+## 2.3 One change → one experiment → one measurement → one attribution
+
+The core experimental loop:
+
+```
+1. FREEZE the eval set.
+2. MEASURE a baseline — write the number down.
+3. CHANGE exactly ONE thing.
+4. RE-MEASURE on the SAME frozen set.
+5. ATTRIBUTE the delta to that one change. Keep if better, revert if worse.
+```
+
+The discipline is in step 3: change *one* thing. When two fixes ship together, their
+deltas are entangled forever. The cleanest example in this project is the
+`medication_frequency` recovery [E9]: we measured a baseline (0.040), then the
+**eval-matcher fix alone** (0.620), then the eval+prompt fix (0.938) — *as three
+separate measurements*. That ordering is the only reason we can say "78% of the
+apparent failure was a broken scorer, 22% was a real model gain." Had we changed both
+at once, that attribution would be permanently lost.
+
+## 2.4 The recurring lesson — suspect the ruler before the model
+
+When a metric looks bad, the first question is **not** "how do I fix the model." It is:
+*is the failure in the model, or in the measuring instrument (the schema, the scorer,
+the eval set)?* This project hit that fork three times, and each time a large fraction
+of the "model failure" was actually a measurement failure:
+
+- **Schema coverage [E6]:** 64% of ground-truth rubric criteria targeted a field our
+  output schema could not even hold. No prompt or fine-tune can emit a field that does
+  not exist. *Fix the contract, not the model.*
+- **Devanagari drug names [E8]:** Whisper heard "Augmentin" correctly but wrote it in
+  Devanagari script; an exact Latin-script comparison scored it wrong. *Fix the
+  normalizer/scorer, not the acoustic model.*
+- **Dosing frequency notation [E9]:** the rubric used `1-0-1`, the model said "twice
+  daily" — synonyms the exact-match scorer rejected. *Fix the matcher, not the model.*
+
+If you skip this question you can spend weeks prompt-engineering a model that was
+already correct, because your ruler was bent.
+
+## 2.5 Principle — loanword-in-foreign-script is not transliteration (a lookup table is the only fix)
+
+This is why the curated Devanagari→Latin **table** [E8, Tier 1] beats a
+romanization-only ("transliterate then match") upper bound. The example: Whisper writes
+the English word *sunscreen* phonetically in Devanagari as `सनस्क्रीन` (reads roughly
+"sa-nas-kreen").
+
+There are two categorically different normalization problems hiding under one word:
+
+- **Native-word transliteration is rule-governed.** A Hindi word written in Devanagari
+  has a *canonical* romanization because the Devanagari spelling **is** the word's
+  phonological truth. Script-A → Script-B is a deterministic function (ITRANS, IAST).
+  No table needed beyond the romanization rules; it generalizes to unseen words.
+
+- **Loanword-in-foreign-script is convention-governed, not rule-governed.** `सनस्क्रीन`
+  encodes the *Indian-accented English sound*, but the target label is the *English
+  orthography* — and English spelling is famously non-phonetic and irregular ("sun" not
+  "san", silent letters, "colonel"). There is **no rule** that maps the sound to the
+  spelling. Romanizing `सनस्क्रीन` faithfully yields "sanaskreen" — the sound — which is
+  **not** "sunscreen." Edit-distance fuzzy matching also fails: the surface gap is large,
+  and a wrong drug may sit closer in edit distance than the right one.
+
+Because the mapping is an arbitrary per-word convention, the **only** thing that bridges
+it is *memorized pairs* — a lookup table now (`सनस्क्रीन → sunscreen`), a fine-tuned
+model later. Rule-based methods (romanization) and metric-based methods (edit distance)
+both have a ceiling **below 100%** on this class, structurally. That is why Tier 1 (the
+table) can exceed the transliteration-based upper bound: for loanwords, transliteration
+*cannot* produce the irregular target at all.
+
+**Takeaway:** before choosing a normalization method, classify the problem. Rule-governed
+variation → a rule (transliteration, stemming). Convention-governed variation → memorization
+(a table or a learned mapping). Using a rule on a convention problem caps you below the
+ceiling no matter how much you tune it.
+
+## 2.6 Principle — two places to intervene: before vs after the decode bottleneck
+
+`initial_prompt` biasing [E8, Goal 3] can touch acoustic misses that *post-processing
+cannot*, because it acts **before** transcription, not after. Understanding why is
+worth more than the (negative) result itself.
+
+Whisper's decoder is **autoregressive**: at each step it samples the next token from
+`P(token | audio-encoding, text-context-so-far)` — a blend of *acoustic evidence*
+(cross-attention to the audio encoder) and a learned *language prior* over the running
+text. The running text includes whatever you put in `initial_prompt`.
+
+- **`initial_prompt` edits the prior, before the bottleneck.** Seeding the context with
+  drug names shifts `P(token | context)`, so in an **acoustically ambiguous** region
+  (where the audio underdetermines the word and several tokens are plausible), the
+  posterior tips toward prompt-consistent tokens. A smeared "Augmentin" can resolve
+  correctly *because* "Augmentin" primes the context. This re-weights the search **while
+  the alternatives are still live.**
+
+- **Post-processing edits the output, after the bottleneck.** It only sees the *final*
+  text — after beam search/argmax already collapsed the distribution and discarded the
+  alternatives. If the word was dropped or mangled beyond recognition, the information
+  needed to recover it is simply gone. Post-processing can transform what survived; it
+  cannot add back what the decode threw away.
+
+That is the fundamental difference: one modifies the *generative process before the
+information bottleneck*; the other transforms the *output after it*. It is also why the
+two map cleanly onto the miss taxonomy in [P2.7]: `initial_prompt` can rescue
+*DISTORTED-but-present* misses (ambiguous → tipped correct); nothing downstream can.
+
+**Why it still backfired here.** The prior is **global and indiscriminate** — it raises
+the entire English/Latin-script register *everywhere*, not just in drug regions. So in
+segments where the audio clearly said a Hindi word, the English-biased prior overrode
+correct acoustic evidence and **suppressed correctly-transcribed Devanagari terms**
+(3 regressions for 1 recovery). The lever is real but unaimable on code-switched audio.
+
+## 2.7 Principle — knowing when a lever is EXHAUSTED (distance-to-floor ≤ noise)
+
+After normalization, the Latin drug-keyword WER sits at **0.576**, just **0.030 above
+the acoustic floor of ~0.546** (the misses that are acoustic in nature — distorted or
+absent — which *no text post-processing* can touch). How do you know the
+text-normalization lever is done, rather than worth another weekend?
+
+**The principle:** measure your progress against the **floor of the lever you are
+pulling**, not against perfection (0). Every lever has a floor it cannot cross — text
+post-processing cannot transcribe a word that is not in the audio. A lever is
+**exhausted** when:
+
+```
+(distance to that lever's floor)  ≤  (measurement resolution / noise band)
+```
+
+Here the remaining headroom is 0.030 ≈ **one drug out of 33** (each drug = 3.0% of the
+metric). That is *at* the resolution limit of a 33-sample bench — any "improvement" you
+measure inside it is indistinguishable from which clips happened to land in the set.
+Continuing to optimize is polishing noise. The correct move is to **switch levers** to
+one whose floor is lower: the acoustic floor is crossed only by *better acoustics*
+(domain fine-tuning for the distorted class; better microphones / SNR for the true-drop
+class — see [P2.6], [E8]).
+
+**To avoid over-working a near-solved stage:** compute each lever's floor *before* you
+work it, and define "done for this lever" as reaching floor + noise band — then stop and
+move to the lever with the lower floor.
+
+## 2.8 Principle — anchor targets to demonstrated ceilings, not wishes
+
+A target was once proposed: drive acoustic drug-miss from **54.5% → 10%** in one shot.
+The best *demonstrated* system on comparable Indian medical ASR — Saaras (Sarvam's
+cloud model, proprietary Indian corpus, far more resources than a local 3B-class setup)
+— reaches only **~42%**. A 10% target therefore asks to **beat the best-resourced
+system in the field by ~4×**, using a smaller, local, open stack.
+
+**The principle:** before adopting a performance target, locate the **best demonstrated
+result** in the field on a comparable task — the SOTA ceiling — and check your target
+against it. A target *below* the demonstrated ceiling (i.e., better than anyone has
+shown, especially anyone with more resources) is not "ambitious," it is **ungrounded**,
+unless you can name the *specific new mechanism* (novel method, better data) by which
+you will beat SOTA. Absent that mechanism, the right target is anchored *relative to the
+ceiling*: e.g., "approach Saaras's 42% from our 54.5% floor," or "close X% of the
+floor→ceiling gap." Targets pulled from a desired business outcome rather than a
+demonstrated reference point burn effort chasing the impossible — and tempt you to cheat
+the measurement to hit them (see [P2.10]).
+
+## 2.9 Principle — small samples make aggressive targets meaningless
+
+The 54.5% → 10% target lives on **33 drugs from 15 clips**. Beyond being ungrounded
+[P2.8], it is *unmeasurable* at this sample size, for two compounding reasons.
+
+**1. Resolution.** Each drug is `1/33 = 3.03%` of the metric. The metric can only take
+values in ~3% steps. "10%" is not even cleanly expressible — the nearest reachable
+values are 9.1% (3/33) and 12.1% (4/33). Sub-drug precision is meaningless.
+
+**2. Confidence intervals dwarf the moves.** The 95% CI half-width for a proportion is
+`≈ 1.96·√(p(1−p)/n)`:
+- at the floor (p≈0.545, n=33): `±0.170` → the true rate is somewhere in **[37%, 72%]**.
+- at the target (p≈0.10, n=33): `±0.102` → **[0%, 20%]**.
+
+You do not even know your *starting point* to better than ±17%. Which 15 clips you drew
+dominates the number more than your method does.
+
+**What sample size would you actually need?** It depends on which move you want to
+detect (two-proportion power, α=0.05, power 0.80):
+- To detect the (ungrounded) **54.5% → 10%** move — a *huge* effect — you need only
+  **~14 drugs per arm**. So small sample is *not* what makes the big target hard; the
+  field ceiling [P2.8] is.
+- To detect the **moves actually available** near the floor — roughly one drug, a ~3%
+  change (e.g. 54.5% → 51.5%) — you need **~4,300 drugs per arm**.
+
+That is the real meaninglessness: the *only detectable* target (the big jump) is
+*physically unreachable*, while the *only reachable* targets (small, near-floor moves)
+are *undetectable* at n=33. With 33 drugs you can neither legitimately hit the
+aggressive target nor measure the legitimate progress that remains.
+
+## 2.10 Principle — if only cheating reaches the target, the target is wrong
+
+On this data the *only* paths to "10%" were **overfitting** (tune to the 15 specific
+clips — memorize the test set) or **matcher-loosening** (relax what counts as a
+"correct" drug match until misses become hits). Both were rejected as cheating.
+
+**The principle:** when the only routes to a target corrupt the measurement, treat that
+as *evidence the target is wrong*, not as a cue to be cleverer. This is Goodhart's Law —
+"when a measure becomes a target, it ceases to be a good measure." Each cheat destroys
+exactly the thing the metric protects:
+- *Overfitting* = test-set leakage → the metric no longer predicts generalization.
+- *Matcher-loosening* = the metric no longer means "clinically correct drug," which in a
+  patient-safety tool means it stops protecting the patient.
+
+A cheat does not remove the failure; it *relocates* it — from a visible miss now to an
+invisible miss in production. For a clinical tool that invisible miss is a patient harm
+you can no longer see. The correct response is to **re-anchor** the target to the
+demonstrated frontier (floor [P2.7] + field ceiling [P2.8]), not to find a clever path.
+
+---
+
+# Part III — Engineering Status
+
+Where the code stands, stage by stage. Bug *detail* lives in Part IV; this is the
+scannable status layer.
+
+| Stage | Status | Headline number / state |
+|---|---|---|
+| L1 preprocess | ✅ built | 16 kHz mono + VAD trim; denoise default **OFF** (it raises WER on clean audio) |
+| L2 diarize | ✅ built | pyannote community-1 on MPS; role heuristic fires only with ≥2 speakers |
+| L3 ASR | ✅ built | faster-whisper large-v3, int8, ~3.6 GB; per-segment language ID |
+| L3.5 normalize | ✅ built | parrotlet-e gloss + 3-tier drug normalization; Latin drug-KW WER 0.818 → **0.576** |
+| L4 extract | ✅ built | qwen2.5:3b; 24-sample baseline aggregate recall **0.306**; field recovery in [E9] |
+| L5 render | ✅ built | reportlab PDF; standard vitals rows always shown; red draft banner |
+
+**L1 — preprocess.** Resamples to 16 kHz mono WAV (librosa, Core Audio backend on
+macOS — no ffmpeg). Trims leading/trailing silence via energy-threshold VAD. Denoising
+is a keyword-only toggle, default OFF — stationary noise reduction *increases* WER on
+clean clinic recordings (benchmark per noise profile before enabling).
+
+**L2 — diarize.** `pyannote/speaker-diarization-community-1` on the Mac GPU (MPS). Audio
+is handed in as a preloaded `{'waveform': tensor, 'sample_rate': int}` dict because
+torchcodec (pyannote's preferred reader) fails to link the installed ffmpeg. Doctor/
+patient role assignment is a bag-of-words heuristic that only fires with ≥2 speakers;
+single-utterance ASR-eval clips all come out `UNKNOWN` (a real role classifier needs
+full alternating consultations — the 156-transcript set, not the ASR-eval set).
+
+**L3 — ASR.** faster-whisper large-v3 on **CTranslate2** (a C++ engine, *not* PyTorch —
+this fact explains the design). `device="cpu"` because CTranslate2 has no Metal backend;
+`compute_type="int8"` quantizes weights to 8-bit, cutting RAM ~10 GB → ~3.6 GB.
+`language=None` runs per-segment language ID (the code-switch strategy); `task="transcribe"`
+forbids silent translation; `beam_size=5` for accuracy. Cleanup `del model; gc.collect()`.
+
+**L3.5 — normalize.** Two jobs: (1) gloss lay→clinical terms non-destructively via
+parrotlet-e embeddings (`फीवर (Fever)`), 28-concept table with a hard-negative rejection
+gate; (2) a 3-tier drug-name normalizer (curated table → ITRANS+CDSCO → guarded fuzzy)
+wired into the live pipeline.
+
+**L4 — extract.** qwen2.5:3b-instruct via Ollama at temperature 0, JSON-constrained,
+one retry. Every drug validated against the CDSCO list; unrecognized drugs / missing
+doses flagged in `low_confidence_fields`. Schema widened to the high-value SOAP fields
+[E6]; field-routing precision is the current frontier [E9].
+
+**L5 — render.** reportlab PDF. Standard vitals rows (Height/Weight/BP/Temperature/SpO2/
+Pulse) always rendered, "—" when absent; medications in their own section; a 10 pt red
+draft banner marks it as physician-review-pending.
+
+---
+
+# Part IV — Experiment Log
+
+A chronological lab notebook. Each entry: what it did, the hardest bugs (root cause, not
+just symptom), and the forward-looking hook. Principles extracted from these experiments
+live in Part II and are cross-referenced.
+
+## [E1] Phase A build — audio → attributed transcript (2026-06-26)
+
+**What.** Stood up L1→L2→L3: raw audio to a speaker-labelled, multilingual transcript.
+
+**Hardest bugs.**
+1. `Pipeline.from_pretrained()` rejected `use_auth_token=` — pyannote.audio ≥ 3.x
+   switched to HuggingFace's `token=` and removed the old arg with no deprecation cycle
+   (hard `TypeError`, not a warning).
+2. `DiarizeOutput has no attribute 'itertracks'` — the community-1 model wraps its
+   result in a `DiarizeOutput` dataclass; the annotation lives at
+   `DiarizeOutput.speaker_diarization`. Public docs describe only the 3.x family.
+
+**What actually cost the most time.** Not ML — **plumbing**: native audio decoding
+(torchcodec/ffmpeg linkage), CPU-vs-GPU runtime mismatch (L2 on GPU via PyTorch, L3 on
+CPU via CTranslate2), and the pyannote API surface. This is the signature of on-device,
+local-first pipelines: with no cloud API hiding decoding, device placement, and
+quantization, those concerns front-load the schedule and the ML risk waits for the eval
+harness. Three durable lessons: (a) audio decoding is a native-dependency minefield —
+decode once ourselves and hand models an in-memory array, never a file path; (b) "I have
+a GPU" ≠ "this model uses it" — the runtime decides; (c) Whisper's language ID degrades
+on short audio, and diarization hands it exactly that.
+
+**A worked failure ("daily three times").** Reference "daily three times" → ASR
+`और डाइली फ्री टाइम्स`. Two failures stacked: the English words were transliterated into
+Devanagari, and "three" became `फ्री` ("free") — the "th" /θ/ sound heard as /f/. Root
+cause: Standard Hindi has no /θ/, so once Whisper committed the 1.45 s slice to the `hi`
+language token, its decoder assigned near-zero probability to a /θ/-initial word and
+emitted the nearest sound it *could* produce. Tellingly, English terms inside long
+Hindi-context segments ("CBC", "chest x-ray") survived — the isolated short slice had no
+context to anchor language ID. **The root cause is the slicing, not the model**: feeding
+Whisper one tiny segment starves it of the ~30 s context window it needs. Deferred fix
+(measured, not guessed): transcribe the whole file once and assign words to speakers by
+timestamp overlap (the whisperX pattern).
+
+**Hook.** The role heuristic needs full consultations to train a real doctor/patient
+classifier — the 156-transcript clinical-note set, not the single-utterance ASR-eval set.
+
+## [E2] ASR baseline — the climbing error rate (2026-06-26)
+
+**What.** Built the WER harness *first* [P2.1] and took a baseline on the frozen Hindi
+10-clip set.
+
+**Result.**
+
+| Metric | Value | Over |
+|---|---|---|
+| Corpus WER | 0.52 | all words |
+| Keyword WER (micro) | 0.62 | 42 clinical keywords |
+| Drug Keyword WER | 1.00 | 7 drug terms |
+
+**The insight is the correlation, not any single number:** `0.52 < 0.62 < 1.00`. The
+error rate **climbs as the words get more clinically important** — the model is *least*
+accurate on exactly the tokens that matter most, because those are the rare,
+English-origin, code-switched words it transliterates or garbles, while it handles common
+Hindi filler fine. For a clinical scribe that is the worst possible error distribution:
+**accurate where it's harmless, wrong where it's dangerous.** A single global WER would
+have hidden this — which is why we split keyword and drug metrics out.
+
+**Honest caveats.** N=10 is small; the scorer is strict on script (Devanagari "daily"
+counts as an error though phonetically right), so 0.52 is *pessimistic*; Drug WER 1.00 is
+partly a metric artifact (the compound span "Augmentin 650 mg" scores as fully missed
+because the *name* garbled, even though the dose number 650 survived). A baseline to
+beat, not a verdict.
+
+## [E3] Concept layer — embeddings vs LLM (2026-06-26)
+
+**What.** Designed the division of labor for Phase B before building it. The crux: which
+model does which job.
+
+**The reasoning.** An **embedding** turns text into a vector whose *position* encodes
+*meaning* — a "meaning map" where "sugar", "diabetes", "madhumeh", and "मधुमेह" cluster
+and "fracture" sits far away (cosine similarity = closeness). Positions are *learned* by
+metric learning (contrastive/triplet loss pulling positive pairs together), not
+hand-placed; parrotlet-e is bge-m3 fine-tuned on medical pairs so the *clinical* sense of
+"sugar" wins over the *food* sense. So:
+
+- **Embedding model = closed-world matcher.** Answers "which known thing is this most
+  like?" Output is always one of the N pre-placed entries — *cannot* return a concept
+  outside the vocabulary, which is exactly what normalization wants (a guaranteed-valid
+  clinical term). Cannot read a sentence, handle negation, or build structure.
+- **LLM = open-world reasoner.** Answers "what is the structured meaning of all this?"
+  Reads a messy transcript and fills a schema, handling context and negation. That
+  generative power is irreplaceable for extraction — and is also the hazard: it can emit
+  things never in the input.
 
 Rule of thumb: **"pick from a list" → embeddings; "compose structured output" → LLM.**
 
-## Why "never invent a dose" is hard for an LLM specifically
-An LLM is a **next-token predictor** trained to produce the most *plausible-sounding*
-continuation — not the most *source-faithful* one. Fabrication isn't a defect bolted
-on; it's the default behavior of a fluency engine asked to be complete. If the
-transcript says "Augmentin de raha hoon" but never states a dose, the model has seen
-"Augmentin" followed by "625 mg" thousands of times, so the statistically likely
-continuation *is* a dose — and it fills the gap with its prior. Three compounding reasons:
-1. **Objective = plausibility, not faithfulness.** Nothing in pretraining rewards
-   silence when the source is silent.
-2. **No native "I didn't see this."** By default the model doesn't separate *observed*
-   from *guessed*; both come out as equally fluent, confident text.
-3. **Priors are strongest where stakes are highest** — the most common drugs have the
-   most entrenched drug→dose associations, so the model invents most confidently on the
-   most standard medications.
+**Why "never invent a dose" is hard for an LLM specifically.** An LLM is a next-token
+predictor trained for *plausibility*, not *source-faithfulness*. It has seen "Augmentin"
+→ "625 mg" thousands of times, so when the transcript states no dose, the statistically
+likely continuation *is* a dose. Fabrication is the default behavior of a fluency engine
+asked to be complete; priors are strongest on the most common drugs (highest stakes).
+You cannot make the mechanism *want* to abstain, so the mitigation is structural:
+constrain the schema, validate every drug/dose against CDSCO, force `validated:false` /
+`low_confidence_fields` when the source is silent.
 
-Because you can't make the mechanism *want* to abstain, the mitigation is structural:
-constrain the output schema, **validate every drug/dose against the CDSCO list**, and
-force `validated:false` / `low_confidence_fields` when the source is silent.
+## [E4] Phase B build — L3.5 + L4 (2026-06-26)
 
-## Open question, to be settled with data: where will extraction fail most?
-Candidates: drug names, doses, frequencies, diagnoses. Current reasoning:
-- **Doses and frequencies are the dangerous pair** because fabrication risk meets the
-  *absence of an external validator* — there is no list to check "650 mg" or "twice
-  daily" against, so an invented value goes uncaught. Frequencies may be worst:
-  ASR already mangles them ("three" → `फ्री`, OD/BD/TDS) *and* they're trivially
-  plausible to invent.
-- **Drug names are frequently wrong too** (the ASR baseline shows `Augmentin →
-  augmenting`), but a garbled drug **fails the CDSCO check** and gets flagged — it's
-  *catchable*.
-- The ASR baseline hints that drug **names** garble while dose **numbers** sometimes
-  survive — but that's the ASR layer; dose **fabrication** is an L4 phenomenon the ASR
-  metric structurally cannot see.
+**What.** L3.5 embeds 1–3-word spans, glosses those above cosine 0.65 in parentheses
+(`फीवर (Fever)`, sim 0.865 across scripts). L4 sends the glossed transcript to qwen2.5:3b,
+extracts the `ClinicalNote` schema at temperature 0, runs CDSCO validation.
 
-This is settled once L4 runs with metrics that **separate drug-name / dose / frequency
-/ diagnosis** and, for doses/frequencies, measure **fabrication** (precision: did L4
-emit a value the transcript never contained?), not just recall. That metric work is
-the bridge from Part 2 into Phase B.
+**Hardest bugs.**
+1. `ModuleNotFoundError: transformers` at *runtime, not install time* — root cause:
+   `transformers` was an implicit transitive dependency that happened to be visible
+   outside the venv but not inside it. Fix: pin `transformers` and `torch` explicitly in
+   `requirements.txt`; never rely on transitive deps.
+2. Gloss fires on `फीवर` but not on `infection` — root cause: concept-*coverage*, not
+   model quality. The embedding correctly places both; "infection" simply had no entry in
+   the 18-concept table to map to. Adding the concept fixes it.
 
----
+**Hook.** The cosine threshold (0.65) is a fixed precision/recall knob; tuning it needs
+the concept-match metric and a per-language calibration on a frozen hold-out — or, better,
+explicit hard-negative contrast examples (which [E5] added).
 
-## Phase B — L3.5 Normalize + L4 Extract (2026-06-26)
+## [E5] Concept table v2 — hard negatives + coverage (2026-06-27)
 
-### (a) What this phase does
-L3.5 loads the parrotlet-e embedding model (a multilingual medical encoder,
-567 MB, running on MPS), embeds candidate word spans (1–3 words) from each
-transcript turn, and compares them against embeddings of canonical clinical
-terms; spans above cosine 0.65 are glossed non-destructively in parentheses
-(e.g., `फीवर (Fever)`). L4 sends the glossed transcript to qwen2.5:3b-instruct
-via Ollama, extracts the `ClinicalNote` JSON schema at temperature=0, and runs
-every drug name through a CDSCO-approved-drug lookup, setting `validated=false`
-and adding a `low_confidence_fields` entry for any unrecognised drug or missing
-dose. The two stages hand off through the same `list[Turn]` → `ClinicalNote`
-contract established in Phase A.
+**What.** Added a hard-negative rejection gate (the *margin test*) and expanded the table
+18 → 28 concepts with SNOMED CT IDs.
 
-### (b) Hardest bugs
+**Hardest findings.**
+1. **Canonical-term-only reference fails for colloquialisms** — "sugar" → "Type 2
+   Diabetes Mellitus" scores only cosine 0.33 (the model rarely saw that bridge), while
+   formal "madhumeh" → T2DM scores 0.75. Fix: put *variant* texts (including "sugar")
+   directly in the reference matrix so "sugar" matches variant "sugar" at ~1.0.
+2. **The margin gate is necessary but insufficient for unigrams** — "cold outside" is
+   correctly rejected (margin −0.49), but the bare unigram "cold" passes (margin 0.37):
+   the model treats "cold" as intrinsically clinical. A 5% global margin cannot separate
+   "I have a cold" from "it is cold outside" at the unigram level; sentence-level encoding
+   would, but needs a different inference architecture. Tracked for Phase D.
 
-1. **`ModuleNotFoundError: No module named 'transformers'` at runtime, not at
-   install time** — root cause: pyannote.audio pulls PyTorch as a dependency,
-   and PyTorch coexists with the system miniforge install which has
-   `transformers` in its own site-packages. When running inside the project
-   venv, the system packages are not visible, so `import transformers` silently
-   worked during early prototyping (outside the venv) but failed on the first
-   in-venv L3.5 call. Adding `transformers` and `torch` explicitly to
-   `requirements.txt` is the fix; implicit transitive dependencies cannot be
-   relied on.
+**Hook.** `HARDNEG_MARGIN` (0.05) and `COSINE_THRESHOLD` (0.65) are hand-tuned globals;
+the "cold" case wants ~0.37 while valid matches pass at 0.09 — a single global margin is
+incoherent. Per-concept thresholds calibrated on Phase D's concept-match metric are the
+answer. Until then, favor higher recall (L4 + physician review are downstream catches).
 
-2. **L3.5 gloss fires on `फीवर` but not on `infection`** — root cause: both
-   are in the model's embedding space, but `infection` does not appear in our
-   18-concept table. The concept table is symptom-oriented (fever, cough, pain);
-   generic diagnoses like "infection" have no canonical entry to map to. The
-   embedding model is working correctly — it correctly maps `फीवर` (Devanagari
-   "fever") to `Fever` (sim=0.865) across script boundaries. The failure for
-   `infection` is concept-coverage, not model quality. Adding an "Infection"
-   concept (SNOMED 40733004) to `src/concepts.py` would catch it.
+## [E6] Schema coverage reality check — the contract was the ceiling (2026-06-27)
 
-### (c) Fine-tuning hook
-The cosine threshold (0.65) is a fixed constant that controls the precision/
-recall trade-off of concept matching. A threshold that is too low causes false
-positives (common words like "cold" in "feeling cold" gloss to "Common Cold");
-too high means genuine lay terms get missed. Fine-tuning the threshold requires
-the **concept-match accuracy metric** from the KARMA framework (Phase D), which
-scores whether each matched span truly belongs to the glossed concept. During
-fine-tuning, the right move is not to tune the model weights but to tune the
-threshold per language (English, Hindi romanized, Devanagari) by running the
-metric on a frozen hold-out set of annotated transcript–concept pairs. An
-alternative — and potentially more powerful — approach is to add known-hard
-negatives (common words near but below the clinical boundary) as explicit
-contrast examples when expanding `src/concepts.py`.
+**What.** *Before* touching the model, measured what fraction of EkaCare ground-truth
+rubric criteria target a field our `ClinicalNote` schema could not even *hold*. (A
+*rubric* = one scored success criterion attached to a transcript; the dataset ships 2469
+across 156 transcripts.)
 
----
+**The finding: 64% (1585/2469) of all rubric criteria targeted a field the old schema
+could not represent.** 153/156 transcripts had ≥1 structurally unsatisfiable rubric. This
+is a **contract decision, not a model failure** [P2.4] — no prompt or fine-tune emits a
+field that does not exist.
 
-## Phase B Enhancement — Concept Table v2: Hard Negatives + Coverage Expansion (2026-06-27)
-
-### (a) What this enhancement does
-Two problems surfaced after running Phase B on real EkaCare data. First, common English
-words like "cold", "gas", and "tension" are exact surface-form matches to concept
-variants, so they gloss correctly in clinical context ("I have a cold") but would also
-fire on non-clinical text ("it's cold outside", "gas cylinder"). Second, the 18-concept
-table had no entries for Abdominal Pain, Nausea, Asthma, Anxiety, Migraine, Back Pain,
-Fungal Infection, Allergic Rhinitis, URTI, or Loss of Appetite — all high-frequency
-conditions in the EkaCare 156-transcript dataset. This enhancement adds a hard-negative
-rejection gate (the margin test) and expands the table from 18 to 28 concepts with
-SNOMED CT identifiers for all entries.
-
-### (b) Hardest design decisions
-
-1. **Canonical-term-only reference fails for colloquial abbreviations** — root cause:
-   parrotlet-e (the medical embedding model) cannot bridge the gap between a colloquial
-   abbreviation and its canonical expansion. "sugar" → "Type 2 Diabetes Mellitus" scores
-   cosine=0.33 (below the 0.65 threshold), because the model was trained on medical text
-   where "sugar" rarely co-occurs with T2DM in a way that builds a direct bridge. By
-   contrast, formal Hindi ("madhumeh" → T2DM) scores 0.75 and cross-language paraphrase
-   ("high blood pressure" → "Hypertension") scores 0.76 — both well above threshold. The
-   fix is to include all variant texts alongside canonical terms in the reference matrix.
-   "sugar" then matches variant "sugar" at sim~1.0, which maps to T2DM. The hard-negative
-   gate (see below) is what prevents this exact-match-to-anything behavior from causing
-   false positives.
-
-2. **Hard-negative gate is necessary but insufficient for unigram ambiguity** — the
-   margin test (`concept_sim > hn_sim + HARDNEG_MARGIN`) correctly rejects context-heavy
-   spans: "cold outside" scores 0.428 to Common Cold but 0.919 to hard-negative "it's
-   cold outside", so margin = −0.49 → **rejected**. But the unigram "cold" scores 1.0 to
-   the variant and only 0.630 to hard-negative "cold weather" — margin = 0.37, which
-   passes easily. The model, trained on medical text, treats the bare word "cold" as
-   intrinsically clinical; a 5% margin cannot distinguish "I have a cold" from "it is
-   cold outside" at the unigram level. Sentence-level encoding (encoding the whole
-   sentence context, not just the span) would fix this but requires a different inference
-   architecture. This is a known limitation tracked for Phase D.
-
-### (c) Fine-tuning hook
-`HARDNEG_MARGIN` (0.05) and `COSINE_THRESHOLD` (0.65) are both hand-tuned constants.
-The diagnostic above shows that "cold" disambiguation alone would require a margin of
-~0.37 — 7× the global setting — while valid clinical matches like "pait mein" →
-Abdominal Pain pass with margin=0.09. This spread makes a single global margin
-incoherent. Per-concept thresholds, calibrated against Phase D's concept-match accuracy
-metric on a frozen hold-out set, are the right answer. Until then, err on the side of a
-lower threshold (higher recall) since L4 and the physician review step are downstream
-correction layers.
-
----
-
-## Phase B Enhancement — ClinicalNote Schema Coverage (2026-06-27)
-
-### Why this exists: the contract, not the model, was the ceiling
-Before fixing anything in the LLM, we measured what fraction of the EkaCare
-ground-truth rubrics target a field our `ClinicalNote` schema could not even
-*hold*. A **rubric** here is one scored success criterion attached to a transcript
-(e.g. "a symptom matching 'nausea' is present in the symptoms array"). The dataset
-ships 2469 such criteria across 156 transcripts. We grouped each by the field it
-targets and asked a model-independent question: *if our extractor were perfect,
-could the schema even represent the answer?*
-
-**The finding: 64% (1585/2469) of all rubric criteria target a field the old schema
-could not represent.** 153 of 156 transcripts had at least one structurally
-unsatisfiable rubric. This is a **contract decision, not a model failure** — no
-amount of prompt tuning or fine-tuning can emit a field that does not exist in the
-output schema. The breakdown:
-
-| Missing field group | Criteria | % of all rubrics |
+| Missing field group | Criteria | % |
 |---|---|---|
-| Symptoms (name / severity / laterality) | 580 | 23.5% |
-| Vitals (BP, SpO2, pulse, ...) | 205 | 8.3% |
+| Symptoms (name/severity/laterality) | 580 | 23.5% |
+| Vitals | 205 | 8.3% |
 | Structured medical history | 197 | 8.0% |
 | Diagnostic results (labs in hand) | 193 | 7.8% |
 | Examination findings | 163 | 6.6% |
-| Medication timing (before/after food) | 111 | 4.5% |
-| Diagnosis status / laterality | 74 | 3.0% |
-| Lifestyle / family / allergy / travel | 62 | 2.5% |
+| Medication timing | 111 | 4.5% |
+| Diagnosis status/laterality | 74 | 3.0% |
+| Lifestyle/family/allergy/travel | 62 | 2.5% |
 
-### What we changed and what we deliberately left out
-We extended the schema to cover the **clinically high-value SOAP fields**: a
-`symptoms` array (name, finding_status, severity, since), a `vitals` array
-(name + value-with-unit), free-text `examination`, structured `diagnosis.status`,
-`medication.timing`, and a `diagnostic_results` list **separate from**
-`investigations`. The split matters: *investigations* are tests the doctor **orders
-for later**; *diagnostic_results* are values **already available** in the room
-("Hb is 9.2"). These six additions cover ~1326 of the 1585 missing criteria (84%).
+**What changed.** Extended the schema to the high-value SOAP fields (symptoms, vitals,
+free-text examination, diagnosis.status, medication.timing, and `diagnostic_results`
+*separate from* `investigations`) — covering ~84% of the missing criteria. Deliberately
+left history unstructured — see [P5] for the fabrication-surface rationale. **The result
+is that field-routing is now a *measurable* model-quality problem rather than a hidden
+structural one** (e.g. "Hb 9.2" landing in both `vitals` and `diagnostic_results`).
 
-We **intentionally did not** structure past/family/social/lifestyle history into the
-8 sub-arrays the EkaCare schema offers (~10% of criteria). Two reasons: (1) Indian
-tier-2/3 clinic transcripts are 3-8 minutes and rarely take a systematic social or
-family history on tape, so those fields would be empty almost always; (2) empty
-structured fields are an *invitation* for the LLM to fabricate — the same
-next-token-plausibility hazard that makes "never invent a dose" hard (see Part 3).
-Free-text `history` absorbs what little of it appears. **Adding a field has a cost,
-not just a benefit: every optional structured field is a fabrication surface.**
+## [E7] L4 defect fixes + repeatable scorer + baseline (2026-06-27)
 
-### The honest result: schema is sufficient, model precision now becomes measurable
-A live smoke test through qwen2.5:3b on a transcript exercising every new field
-confirmed each field is reachable and populates. But it also exposed the *next*
-problem, which is now a **measurable** model-quality issue rather than a hidden
-structural one:
-- **Field-classification ambiguity**: "Hb 9.2" landed in **both** `vitals` and
-  `diagnostic_results`. The model does not reliably distinguish a measured vital sign
-  from a lab result, even with explicit prompt rules. (Hb is a lab result.)
-- **Recall misses**: medication timing "before food" leaked into the free-text
-  `advice` field instead of `medications[].timing`; a reported symptom (nausea) and a
-  *denied* one ("no vomiting" → finding_status Absent) were both dropped; palpation
-  findings never reached `examination`.
+**What.** Fixed two code bugs and two design gaps, narrowed a fabrication-encouraging
+prompt rule, added a hallucination-calibration check, and built the repeatable L4 eval
+(previously `raise NotImplementedError`). Produced the first 24-sample baseline.
 
-The point of the schema fix is exactly this: these are now **scorable against the
-rubrics**. Before, "nausea missing" and "schema has no symptoms array" were
-indistinguishable in the final score; now the first is a recall number we can move
-with prompting or fine-tuning, and the second no longer exists.
+**Hardest bugs.**
+1. **`_build_note` crashes on null list fields, silently swallowing the whole note** —
+   `data.get("symptoms", [])` returns `None` (not `[]`) when the key is present with value
+   `null`; `dict.get(key, default)` only substitutes the default when the key is *absent*.
+   `None` is not iterable → `TypeError`, swallowed by a bare `except` that returned an
+   empty note. Fix: `(data.get("key") or [])`. (The asymmetry — some fields already had
+   `or []` — was the diagnostic signal.)
+2. **CDSCO validation rejects most real Indian prescriptions** — three compounding causes:
+   exact-match on bare generics missed "Tablet paracetamol"; common Indian brands (Dolo,
+   Meftal Spas, Pantop, Shelcal…) were absent from the seed set; and the false-unvalidated
+   chain buried the `low_confidence_fields` signal it was meant to provide. Fix:
+   dosage-form stripping, bidirectional substring/token matching, ~50 brand names added.
 
-### Fine-tuning hook
-With the contract widened, the next gains are **field-routing precision**, not
-coverage. The dataset's own rubric guidance is lenient here ("INFORMATION PRESENCE
-OVER FIELD LOCATION" — frequency stated inside `instruction` still scores as a
-match), so the scoring tolerates the timing-in-advice leak. But for a clean EMR
-hand-off the physician needs fields in their right slots. The fine-tuning signal is
-the per-category rubric score (symptom_name vs vital vs diagnostic_result), which
-isolates *recall* (did we extract it at all?) from *routing* (did it go in the right
-field?). The vital-vs-result confusion in particular wants either few-shot examples
-contrasting the two, or a post-extraction reclassifier keyed on whether a number has
-a reference range.
-
----
-
-## Phase B Error Analysis — Defect Fixes and Repeatable L4 Scorer (2026-06-27)
-
-### (a) What this phase does
-Running L4 directly on the EkaCare 156-transcript dataset surfaced four confirmed
-defects — two code bugs and two design gaps — plus a missing evaluation harness.
-This phase fixes the two code bugs (a silent null-crash and a CDSCO false-rejection
-cascade), narrows a prompt instruction that was encouraging fabrication, adds a
-post-extraction hallucination calibration check, and builds the repeatable L4
-evaluation that was previously `raise NotImplementedError`. After the fixes a
-frozen 24-sample eval set (12 English, 12 Hindi/Marathi) can be run to produce
-a before/after per-category recall comparison.
-
-### (b) Hardest bugs
-
-1. **`_build_note` crashes on null list fields, silently swallowing an entire note**
-   — root cause: `data.get("symptoms", [])` returns `None` (not `[]`) when the
-   JSON key is present with value `null` (e.g., `"symptoms": null`). Python's
-   `dict.get(key, default)` only substitutes the default when the key is **absent**;
-   a key with an explicit `null` value is present and returns `None`. `None` is not
-   iterable, so the list comprehension raises `TypeError`. This was caught by the
-   bare `except Exception` in `extract()`, which returned `_empty_note()` — losing
-   all extracted data with no visible error. The symptom was observed on transcript
-   i=18 (Dolo 650 fever case): medications and symptoms were fully absent from the
-   returned note. The fix is `(data.get("key") or [])` — the `or` converts `None`
-   to `[]` regardless of whether the key was absent or explicitly null.
-   Note: `investigations`, `diagnostic_results`, and `low_confidence_fields` already
-   had `or []` guards — that asymmetry in the old code was the diagnostic signal.
-
-2. **CDSCO validation rejects the majority of real Indian prescriptions**
-   — root cause: three compounding issues, all arising from a too-narrow design:
-   (a) the lookup was exact set-membership on bare generic names, but the model
-   frequently prepends the dosage form ("Tablet paracetamol") which is not in the
-   set even though "paracetamol" is; (b) common Indian branded drugs (Dolo, Moxclav,
-   Bifilac, Meftal Spas, Grenil, Ultracet, Pantop, Shelcal, Foracort, Limcee,
-   Pan D, Asthalin, etc.) were absent from the seed set entirely — every brand-name
-   prescription was flagged unvalidated; (c) the false-unvalidated chain then
-   triggered `medications.<drug>.unvalidated` entries in `low_confidence_fields`
-   for every medication, burying the signal that flag was supposed to provide. The
-   fix adds dosage-form stripping before lookup, bidirectional substring and
-   token-overlap matching, and ~50 common Indian brand names to the seed set.
-
-### (c) Fine-tuning hook
-The diagnosis hallucination calibration added here (word-token overlap between
-the diagnosis term and the transcript) is a necessary floor but not sufficient.
-It catches "Pulmonary Embolism" on an acne transcript because no word overlaps.
-It does **not** catch a model that confidently adds "Hypertension" to a transcript
-where "BP" or "blood pressure" were mentioned in passing without any diagnosis being
-stated — because the words do overlap. The correct fine-tuning signal is a
-**calibration loss**: train the model to assign low probability to diagnosis tokens
-when no supporting evidence phrase appears in the context window. This is analogous
-to a reading-comprehension extractive QA model being trained to output "no answer"
-when the answer is not in the passage. Until then, the word-overlap check + the
-physician review layer are the safety net.
-
-**Baseline eval results (post-fix, frozen 24-sample set — 12 EN + 12 HI/MR):**
+**Baseline (post-fix, frozen 24-sample set):**
 
 ```
 Category                  Total  Rep  Match  Recall
@@ -558,209 +570,207 @@ medication_timing            45   45     12   0.267
 symptom_severity             12   12      3   0.250
 examination_name             34   34      7   0.206
 examination_notes            33   33      5   0.152
-medication_frequency         86   86      5   0.058
-diagnostic_result_name       34   34      1   0.029
-medication_dose              24   24      0   0.000   ← dose null rule (see policy)
+medication_frequency         86   86      5   0.058   ← attacked in [E9]
+diagnostic_result_name       34   34      1   0.029   ← attacked in [E9]
+medication_dose              24   24      0   0.000   ← dose-null policy [P5]
 AGGREGATE                   726  630    193   0.306
-Unrepresentable criteria: 96/726 = 13.2% (schema gap, not model failure)
 ```
 
-Key observations:
-- medication_name recall (0.615) is the strongest — the model extracts drug names well
-- medication_dose recall (0.000) is a known consequence of the dose-null policy (correct)
-- medication_frequency (0.058) and diagnostic_result_name (0.029) are the weakest extractable fields — both require the model to produce structured strings that can fuzzy-match English rubric criteria from a source-language transcript
-- Hindi/Marathi samples: 6 of 12 returned 0 extractions (model capability gap at 3B scale on Devanagari entity segmentation) — this is the primary next-phase investigation target
+Observations: medication_name (0.615) is strongest; `medication_frequency` and
+`diagnostic_result_name` are the weakest extractable fields; 6/12 Hindi/Marathi samples
+returned 0 extractions (a 3B Devanagari-segmentation capability gap — a future target).
 
-**Policy decisions documented here (not changed unilaterally):**
+**Hook.** The hallucination calibration (word overlap between diagnosis term and
+transcript) is a floor, not a ceiling: it catches "Pulmonary Embolism" on an acne
+transcript (no overlap) but not a confident "Hypertension" where "BP" was mentioned in
+passing. The real signal is a *calibration loss* — train the model to assign low
+probability to diagnosis tokens absent a supporting evidence phrase (extractive-QA
+"no answer" analogue).
 
-*Dose null rule (prompt rule 2):* KEPT. The dataset convention of inferring "1 tablet"
-from the word "Tablet" is a scoring artefact for LLM judges, not a clinical
-instruction. Fabricating a dose that was not stated risks a 2× or 5× overdose if
-the physician rubber-stamps the auto-fill. Rubric-match gain here is at the cost
-of patient safety. Recommendation: keep `dose=null` as the explicit default; the
-physician review step exists precisely to fill gaps like this from their clinical
-judgment.
+## [E8] ASR Drug Keyword WER — normalization + decoder biasing (2026-06-28)
 
-*Do-not-translate rule (prompt rule 6):* KEPT. Pre-translating Hindi/Marathi to
-English before extraction consistently degrades accuracy and loses code-switch
-nuance. The cross-lingual recall gap in the evaluation (rubric in English, note
-extracted in source language) is a **measurement limitation**, not a model failure
-— addressed in the scorer by a presence check for Devanagari rows.
+**What.** Whisper writes English drug names in Devanagari script (`Augmentin` →
+`ऑर्ग्यूमेंटिंग`), so a Latin-script match fails though the *sound* was captured. This
+experiment measured the miss, built a normalizer to recover what text-processing can,
+and characterized what it cannot.
 
----
+**Goal 2 — shippable normalization (3 tiers).** (1) hand-curated Devanagari→Latin table
+(111 entries) for English-phonetic loanwords [P2.5]; (2) ITRANS romanization + exact CDSCO
+lookup for standard Devanagari spellings; (3) length-guarded fuzzy match (≥8-char CDSCO
+candidate, threshold 0.82). On the frozen 15-clip / 33-drug set: **Latin WER 0.818 →
+0.576**, closing **87.5% of the recoverable gap**.
 
-## Phase B Enhancement — ASR Drug Keyword WER: Normalization Shippable Path + Decoder Biasing (2026-06-28)
+**Goal 3 — acoustic miss decomposition + `initial_prompt`.** The residual misses split
+into two kinds [P2.6]:
+- **DISTORTED-but-present** — a phonetically similar token exists at that position (the
+  decoder heard something, spelled it wrong). *Decoder-biasable.*
+- **TRUE DROP** — no phonetic trace at all (the audio never triggered a nearby token).
+  *Audio-quality bounded; unrecoverable by any text or prompt trick.*
 
-### (a) What this phase does
-The ASR stage (faster-whisper large-v3) misses most drug names because Indian clinical
-speech is heavily code-switched: doctors say drug names in English inside Hindi sentences.
-Whisper writes those English names in Devanagari script ("Augmentin" → `ऑर्ग्यूमेंटिंग`),
-so an exact Latin-script match fails even though the *pronunciation* was captured. This
-phase measures the miss precisely, builds a three-tier normalization pipeline that
-recovers what can be recovered by text post-processing alone, and characterizes what
-cannot — classifying the residual acoustic misses into two kinds and testing whether
-seeding the decoder with a drug-name vocabulary (`initial_prompt`) closes any of the gap.
+Results (7-clip intersection, beam_size=1):
+- Baseline acoustic WER 0.5714 (8/14 missed); decomposition **3 distorted : 5 true drop**.
+- `initial_prompt` (~50 drug names): recovered **1/3 distorted, 0/5 true drop**.
+- **Regressions: 3** — native Devanagari terms (`एंटीबायोटिक्स`, …) the baseline got right
+  were suppressed by the English-biased prior [P2.6].
+- **Net verdict: counterproductive** — biased WER 0.714 vs baseline 0.571. Killed early at
+  7/15 by a pre-set kill condition. Do not ship an English-list `initial_prompt` into
+  Hindi-dominant audio.
+- **Irreducible residual:** 2 still-distorted (→ ASR fine-tuning) + 8 true-drop (→ better
+  audio capture).
 
-**Goal 2 — shippable normalization path.** A three-tier pipeline on the faster-whisper
-hypothesis: (1) a hand-curated Devanagari→Latin table (111 entries) for English-phonetic
-loanwords Whisper renders in Devanagari, (2) ITRANS romanization + exact CDSCO lookup for
-standard Devanagari spellings, (3) length-guarded fuzzy matching (≥8-char CDSCO candidate,
-threshold 0.82) for near-misses. Measured on the frozen Hindi-15 set (33 drug terms
-across 15 clips): Latin WER = 0.818 → 0.576 after normalization, closing 87.5% of the
-recoverable gap between the model's acoustic output and the Latin-surface label.
+**Hardest bugs.**
+1. **Normalization scoring produced negative recovery counts** — the "after" count only
+   checked the normalized hypothesis; when a Devanagari gold label was substituted to
+   Latin, the Devanagari form vanished and counted as a *new* miss → negative recovery.
+   Fix: enforce the invariant `missed_after ⊆ missed_before` by checking both raw and
+   normalized hypotheses. Recovery can now only improve or stay flat.
+2. **faster-whisper hangs 10+ min after loading a 43 MB parquet** — CTranslate2
+   initializes its allocator at `WhisperModel(...)` time; a prior large pandas/pyarrow
+   allocation fragments memory and the buffer setup stalls. Fix: **model-first loading** —
+   construct the model before any parquet read. Never hold a large native allocation when
+   initializing CTranslate2.
 
-**Goal 3 — acoustic miss decomposition + initial_prompt biasing.** Not every miss is the
-same. *DISTORTED-but-present* misses have a phonetically similar token in the hypothesis
-at that position (the decoder heard something, just spelled it wrong or distorted it) —
-these are decoder-biasable. *TRUE DROP* misses leave no phonetic trace at all (the audio
-never triggered a token near the drug name) — these are audio-quality or coverage-bounded
-regardless of post-processing or prompt tricks. Seeding faster-whisper with ~50 common
-Indian clinic drug names via `initial_prompt` shifts the decoder's token priors before
-the beam search runs; the idea is that a distorted drug has a higher probability of
-resolving to the correct token when that token appears in the context window.
+**Hook.** Acoustic partition 3 distorted : 5 true drop. Domain-adaptive ASR fine-tuning
+(on a larger Indian-clinic corpus — a *DISPLACE-style* domain set; "DISPLACE-M" here is
+shorthand for that *category* of corpus, not a confirmed off-the-shelf dataset, so verify
+availability before planning around it — and **not** the 15-clip bench, far too small
+without overfitting [P2.9]) is the correct lever for the *distorted* class; the *true-drop*
+class is bounded by microphone and SNR. Any future decoder biasing must be applied *selectively*
+(only when the hypothesis is already Latin/English) to avoid the Devanagari-suppression
+regression [P2.6].
 
-**Results (7-clip intersection, beam_size=1, DISTORT_FUZZ=0.42):**
+## [E9] L4 field recovery — frequency + diagnostic results (2026-06-28)
 
-- Baseline acoustic WER on 7 clips: **0.5714** (8/14 drug terms missed).
-- Decomposition of the 8 baseline acoustic misses:
-  - **(a) DISTORTED-but-present: 3** — clip3 "medicine" (ratio 0.421), clip18 "cough syrup"
-    (0.421), clip18 "Paracetamol 625 mg tablet" (0.486).
-  - **(b) TRUE DROP: 5** — clip1 "sunscreen" (0.353), clip3 "medicines" (0.400),
-    clip3 "Fluconazole" (0.400), clip18 "Benadryl cough syrup" (0.400), clip18 "10 ml" (0.333).
-- initial_prompt recovery on 7 clips: **1/3 distorted recovered** (Paracetamol 625mg tablet),
-  **0/5 true drops recovered** (expected — no token proximity means prompt context cannot help).
-- **Regressions: 3 new misses** introduced by the biased pass —
-  clip5 "वैद ऋषि का अशकल्प", clip13 "एंटीबायोटिक्स", clip16 "एंटीबायोटिक".
-  All three are native Hindi/Devanagari terms that the baseline transcribed correctly;
-  the English-heavy prompt biased the decoder toward Latin-script output and suppressed them.
-- **Net verdict: initial_prompt is counterproductive.** Biased acoustic WER = 0.714 vs
-  baseline 0.571 on the same 7 clips. Run terminated early at 7/15 by design (kill condition:
-  WER worse at 7/15). Do not ship `initial_prompt` with an English drug list into a
-  Hindi-dominant transcript — it trades 3 Hindi drug recoveries for 3 Hindi regressions and
-  only 1 distorted-class recovery.
-- **Irreducible residual (after best attempt):** 2 still-distorted misses → addressable only
-  by ASR fine-tuning (DISPLACE-M on a larger domain corpus, not this 15-clip set);
-  8 true-drop misses → addressable only by better audio capture (mic placement, SNR).
+**What.** The two weakest extractable fields — `medication_frequency` (0.040) and
+`diagnostic_result_name` (0.067) — failed even on *clean English* samples, so the cause
+was not ASR. Split the failure into *eval-canonicalization* vs *true model omission*
+[P2.4], fixed both the scorer and the prompt, and measured the gains **separately** [P2.3].
 
-### (b) Hardest bugs
-
-1. **Normalization scoring produced negative recovery counts** — root cause: the original
-   `score(ref, hyp, kws)` function checked only `norm_hyp` for the "after" count. When
-   a Devanagari gold label (e.g. `एंटीबायोटिक्स`) was substituted to Latin (`antibiotics`)
-   in `norm_hyp` by the normalization pipeline, the Devanagari form was no longer found
-   → counted as a new miss → recovery went negative on clips where Devanagari drugs were
-   in the reference. Fix: `missed_after ⊆ missed_before` invariant enforced by checking
-   both the raw hypothesis and the normalized hypothesis for each miss:
-   `missed_after = [k for k in missed_before if k not in nhyp_norm]`. Recovery can now
-   only improve or stay the same, never regress.
-
-2. **faster-whisper large-v3 hangs for 10+ minutes after loading a 43 MB parquet
-   file** — root cause: CTranslate2 (the C++ inference engine behind faster-whisper)
-   initializes its thread pool and memory allocator at `WhisperModel(...)` time. When
-   a 43 MB parquet containing audio byte-arrays has already been loaded by pandas
-   (which invokes pyarrow and allocates large native memory blocks), CTranslate2 sees
-   a fragmented allocator state and spends >10 minutes on the tensor buffer setup.
-   On a clean process, the same model loads in ~60s. Fix: model-first loading — call
-   `WhisperModel(...)` before any `import pandas` or parquet read. The rule: never
-   hold a large native-memory allocation when initializing CTranslate2.
-
-### (c) Fine-tuning hook
-On the 7-clip intersection, the acoustic miss partition is **3 distorted : 5 true drop**
-(37.5% : 62.5%). **DISPLACE-M** (domain-adaptive fine-tuning on a larger corpus of Indian
-clinic audio — not the current ~15-clip bench, which is too small to fine-tune on without
-overfitting) is the correct next lever for the distorted class: it teaches the ASR model
-which phoneme confusions matter clinically (e.g. the Devanagari /ṭ/-initial form of
-"Augmentin" should produce "augmentin"). For the true-drop class (62.5% of residual
-misses), the ceiling is audio quality and mic placement — no model change can recover a
-drug name that was never acoustically present. The `initial_prompt` result adds a
-constraint: any decoder-biasing technique using a Latin-script drug list must be applied
-selectively only when the hypothesis is already in Latin/English, or it will suppress
-correctly-transcribed Devanagari terms in mixed-language consultations.
-
----
-
-## Phase B Extension — L4 Field Recovery: medication_frequency + diagnostic_result_name (2026-06-28)
-
-### (a) What this phase does
-Two L4 output fields — `medication_frequency` and `diagnostic_result_name` — scored
-near-zero on English evaluation samples (0.040 and 0.067) despite clean ASR. The
-analysis split failures into two distinct categories: *eval-canonicalization failures*
-(the rubric uses `X-X-X` dosing notation like `1-0-1`, the model outputs English phrases
-like `"twice daily"` — synonymous but unmatched by exact string comparison) and *true
-model omissions* (time-of-day phrases being placed in the wrong JSON field, lab results
-not extracted at all). We fixed both the eval matcher (bidirectional frequency canon map
-+ prefix abbreviation matching) and the L4 system prompt (two new rules), then measured
-the combined gain on 6 representative English samples.
-
-**Results summary (English samples):**
+**Result (English samples):**
 
 | Fix | medication_frequency | diagnostic_result_name |
 |---|---|---|
 | Baseline (old eval + old prompt, 24-sample) | 2/50 = 0.040 | 1/15 = 0.067 |
-| Eval-fix only (canon map + prefix match, old prompt, 24-sample) | 31/50 = 0.620 | 3/15 = 0.200 |
-| Full fix (new eval + new prompt, 6 representative samples) | 30/32 = 0.938 | 5/13 = 0.385 |
+| **Eval-fix only** (canon map + prefix match) | 31/50 = 0.620 | 3/15 = 0.200 |
+| **Full fix** (eval + prompt, 6 repr. samples) | 30/32 = 0.938 | 5/13 = 0.385 |
 
-The 2 remaining frequency misses in 30/32 are both from a single complex hospital note
-(`idx=91`): model returns `"in the afternoon"` and `"3 mg in the night"` as frequency
-values, which contain the correct information but don't match any earlier canon key.
-Adding `"in the night"` and `"in the afternoon"` to the canonical map (done after the
-eval run) resolves them. The `diagnostic_result_name` residual (8/13 still missing)
-are true model omissions — the 3B model doesn't reliably extract all lab values from a
-dense multi-system consultation; this is a model capacity limit, not a matcher problem.
+**Attribution** [P2.3]: for `medication_frequency`, the dominant failure was a *broken
+ruler* — the rubric uses Indian dosing notation `1-0-1` (morning-noon-night: `1-0-1` =
+twice daily, `1-1-1` = thrice, `0-0-1` = once at night), the model says "twice daily";
+synonyms the exact-match scorer rejected. The scorer fix alone recovered +0.58 of the
++0.90 total (≈78%). The prompt fix recovered the genuine omissions (time-of-day routed to
+the wrong field). For `diagnostic_result_name`, the residual is a *true* 3B capacity limit
+— the model does not reliably extract every lab value from a dense multi-system note.
 
-### (b) Hardest bugs
+**Hardest bugs.**
+1. **Canon map key mismatch after normalization** — `_normalise()` strips punctuation, so
+   `'1-0-0'` becomes `'100'` *before* the canonical lookup; the map had only `"1-0-0"`, so
+   every X-X-X criterion missed. Fix: store **both** raw and post-normalization forms as
+   keys. Lesson: when a normalizer runs before a lookup table, every key must be in its
+   post-normalization form (or both forms stored).
+2. **Time-of-day phrases routed to the wrong field** — the prompt defined `timing` with an
+   "at bedtime" example but never *excluded* time-of-day; the 3B model pattern-matched "at
+   night" → `timing` instead of `frequency`. Fix: a prescriptive rule listing which
+   surface forms belong in `frequency` (`"at night"`, `"SOS"`, `"1-0-0"`) vs `timing`
+   (meal context only), with worked examples. A 3B model needs the patterns, not an
+   abstract principle.
 
-1. **Canon map key mismatch after normalisation** — root cause: `_normalise()` strips
-   punctuation via `re.compile(r'[^a-z0-9 ]')`, turning `'1-0-0'` into `'100'`.
-   The frequency canon map had `"1-0-0": "once_daily"` but `_canonical_freq()` was
-   called *after* `_normalise()`, so it received `'100'` and found no key. Every
-   X-X-X rubric criterion was therefore treated as unmatched even when the model
-   produced a semantically correct English synonym. Fix: store both the raw and
-   normalised forms as keys — `"1-0-0": "once_daily"` AND `"100": "once_daily"` (and
-   similarly for all other notation variants). Lesson: when a normalisation function is
-   applied to strings before they hit a lookup table, every key in that table must be
-   in its post-normalisation form, or both forms must be stored.
-
-2. **Time-of-day phrases routing to the wrong JSON field** — root cause: the original
-   L4 prompt defined `timing` as `"before food | after food | at bedtime | None"` but
-   never explicitly excluded time-of-day phrases. The 3B model pattern-matched `"at
-   night"` to the `"at bedtime"` example in `timing` without understanding the
-   semantic distinction between meal-relative context (timing) and dosing schedule
-   (frequency). Result: `Sibelium: freq=None, timing='at night'` instead of
-   `freq='once at night', timing=None`. Fix: Rule 11 in the updated system prompt
-   explicitly lists which surface forms belong in `frequency` (time-of-day: `"at night"`,
-   `"SOS"`, `"in the morning"`; dosing notation: `"BD/SOS"`, `"1-0-0"`) versus
-   `timing` (meal context only: `"before food"`, `"after food"`, `"with food"`), with
-   worked examples. The rule must be prescriptive and list surface forms, not just
-   state an abstract principle — a 3B model needs the example patterns.
-
-### (c) Fine-tuning hook
-The frequency field shows a 3B model can reliably *detect* that a dosing schedule is
-being stated, but labels it inconsistently: the same once-daily-at-night dose can appear
-as `"0-0-1"`, `"once nightly"`, `"once at night"`, `"at night"`, or `"0-0-1 in the
-night"` across different consultations. A fine-tuned model should be trained to output
-a *canonical form* (standardize on `X-X-X` notation or a fixed phrase set like SNOMED
-Frequency codes) — this would make the downstream scorer, PDF renderer, and any
-integration with pharmacy dispensing systems more reliable without requiring a
-bidirectional synonym map that must be maintained by hand.
+**Hook.** A 3B model can reliably *detect* a dosing schedule but labels it inconsistently
+(`0-0-1`, "once nightly", "at night" all for the same dose). A fine-tuned model should
+emit a *canonical* form (X-X-X or SNOMED frequency codes), removing the need for a
+hand-maintained synonym map and stabilizing the scorer, the PDF, and any pharmacy
+integration.
 
 ---
 
-# Appendix — Per-phase checkpoint format
+# Part V — Product & Schema Decisions
 
-Every phase checkpoint appends a dated section in this structure (plain language, no
-jargon without a one-line definition):
+The "what we chose to build and *not* build, and why" layer. These are deliberate product
+decisions, recorded so they are not silently re-litigated.
+
+**Schema scope = what consultations actually contain.** The `ClinicalNote` field set is
+aligned to the high-value EkaCare rubric targets [E6]: symptoms (≈23% of criteria),
+vitals (≈8%), examination (≈7%), diagnostic results (≈8%), medication timing (≈5%),
+diagnosis status (≈3%). `investigations` = tests *ordered for later*; `diagnostic_results`
+= results *already in hand* — the split matters for the note's clinical meaning.
+
+**Structured history is deliberately free-text.** Past/family/social/lifestyle history
+(≈10% of criteria) is left as a free-text `history` field, not the 8 structured sub-arrays
+EkaCare offers. Two reasons: (1) Indian tier-2/3 transcripts are 3–8 minutes and rarely
+take a systematic history on tape, so the fields would be empty almost always; (2) **an
+empty structured field is a fabrication surface** — the same next-token-plausibility
+hazard behind "never invent a dose" [E3]. **Adding a field has a cost, not just a benefit.**
+
+**Dose-null policy = KEPT.** Dose is `null` unless explicitly stated; never inferred. The
+dataset convention of reading "1 tablet" from the word "Tablet" is a scoring artifact, not
+a clinical instruction — auto-filling a dose risks a 2×/5× overdose if the physician
+rubber-stamps it. The physician review step exists to fill such gaps from clinical
+judgment. This *costs* recall on `medication_dose` (0.000) by design.
+
+**Do-not-translate policy = KEPT.** Run ASR and extraction in the source language;
+pre-translating Hindi/Marathi to English degrades accuracy and loses code-switch nuance.
+The cross-lingual eval gap (English rubric vs source-language note) is a *measurement
+limitation* [P2.4], handled by a Devanagari presence check in the scorer — not a model
+failure.
+
+**Denoising default = OFF.** Stationary noise reduction raises WER on clean recordings;
+it is a per-noise-profile toggle, benchmarked before enabling, never always-on.
+
+---
+
+# Appendix
+
+## A. Glossary
+
+- **ASR** — Automatic Speech Recognition (audio → text).
+- **Diarization** — segmenting audio by *who* is speaking ("who spoke when").
+- **Code-switching** — mixing languages mid-sentence (Hindi + English), constant in
+  Indian clinics.
+- **WER / Keyword WER / Drug-KW WER** — see [P2.2].
+- **DER** — Diarization Error Rate.
+- **Embedding** — a vector whose position encodes meaning; similarity = cosine of the
+  angle between vectors. See [E3].
+- **LID** — Language IDentification (Whisper's per-segment language verdict).
+- **CTranslate2** — the C++ inference engine behind faster-whisper (not PyTorch; CPU/AMX,
+  no Metal).
+- **Quantization (int8)** — storing weights as 8-bit integers to cut RAM (~10 GB → 3.6 GB).
+- **CDSCO** — India's drug regulator; its approved-drug list is the validation dictionary.
+- **SNOMED CT** — a clinical terminology; provides canonical concept IDs.
+- **Rubric** — one scored success criterion attached to a transcript in the EkaCare set.
+- **DISTORTED-but-present / TRUE DROP** — the two acoustic-miss kinds. See [E8], [P2.6].
+- **Acoustic floor** — the WER no text post-processing can cross (distorted + dropped
+  misses). See [P2.7].
+
+## B. Reproduce it
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+ollama list                      # qwen2.5:3b-instruct must be present for L4
+pytest tests/ -v                 # all stage tests
+python src/pipeline.py <wav>     # full pipeline on one file
+python eval/run_eval.py          # KARMA eval on the frozen sets
+```
+
+Frozen sets: 10-clip Hindi ASR; 15-clip / 33-drug ASR; 24-sample L4 (12 EN + 12 HI/MR,
+indices in `eval/run_eval.py:FROZEN_INDICES`). Datasets live in `data/` (gitignored),
+HF_TOKEN in `.env`. Key files: `src/l3_5_normalize.py` (3-tier normalizer),
+`src/l4_extract.py` (prompt rules + `_build_note`), `eval/run_eval.py` (rubric scorer +
+frequency canon map).
+
+## C. Per-phase checkpoint format
+
+Every phase checkpoint appends an experiment entry to Part IV in this structure (plain
+language, no jargon without a one-line definition):
 
 ```
-## Phase N — <name> (YYYY-MM-DD)
+## [E#] <name> (YYYY-MM-DD)
 
-### (a) What this phase does
-<3 sentences>
+**What.** <3 sentences>
 
-### (b) Hardest bugs
+**Hardest bugs.**
 1. <bug> — root cause: <why, not just the symptom>
 2. <bug> — root cause: <why, not just the symptom>
 
-### (c) Fine-tuning hook
-<one thing that will matter when we fine-tune later>
+**Hook.** <one thing that will matter when we fine-tune later>
 ```
