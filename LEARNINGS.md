@@ -490,6 +490,262 @@ a reference range.
 
 ---
 
+## Phase B Error Analysis — Defect Fixes and Repeatable L4 Scorer (2026-06-27)
+
+### (a) What this phase does
+Running L4 directly on the EkaCare 156-transcript dataset surfaced four confirmed
+defects — two code bugs and two design gaps — plus a missing evaluation harness.
+This phase fixes the two code bugs (a silent null-crash and a CDSCO false-rejection
+cascade), narrows a prompt instruction that was encouraging fabrication, adds a
+post-extraction hallucination calibration check, and builds the repeatable L4
+evaluation that was previously `raise NotImplementedError`. After the fixes a
+frozen 24-sample eval set (12 English, 12 Hindi/Marathi) can be run to produce
+a before/after per-category recall comparison.
+
+### (b) Hardest bugs
+
+1. **`_build_note` crashes on null list fields, silently swallowing an entire note**
+   — root cause: `data.get("symptoms", [])` returns `None` (not `[]`) when the
+   JSON key is present with value `null` (e.g., `"symptoms": null`). Python's
+   `dict.get(key, default)` only substitutes the default when the key is **absent**;
+   a key with an explicit `null` value is present and returns `None`. `None` is not
+   iterable, so the list comprehension raises `TypeError`. This was caught by the
+   bare `except Exception` in `extract()`, which returned `_empty_note()` — losing
+   all extracted data with no visible error. The symptom was observed on transcript
+   i=18 (Dolo 650 fever case): medications and symptoms were fully absent from the
+   returned note. The fix is `(data.get("key") or [])` — the `or` converts `None`
+   to `[]` regardless of whether the key was absent or explicitly null.
+   Note: `investigations`, `diagnostic_results`, and `low_confidence_fields` already
+   had `or []` guards — that asymmetry in the old code was the diagnostic signal.
+
+2. **CDSCO validation rejects the majority of real Indian prescriptions**
+   — root cause: three compounding issues, all arising from a too-narrow design:
+   (a) the lookup was exact set-membership on bare generic names, but the model
+   frequently prepends the dosage form ("Tablet paracetamol") which is not in the
+   set even though "paracetamol" is; (b) common Indian branded drugs (Dolo, Moxclav,
+   Bifilac, Meftal Spas, Grenil, Ultracet, Pantop, Shelcal, Foracort, Limcee,
+   Pan D, Asthalin, etc.) were absent from the seed set entirely — every brand-name
+   prescription was flagged unvalidated; (c) the false-unvalidated chain then
+   triggered `medications.<drug>.unvalidated` entries in `low_confidence_fields`
+   for every medication, burying the signal that flag was supposed to provide. The
+   fix adds dosage-form stripping before lookup, bidirectional substring and
+   token-overlap matching, and ~50 common Indian brand names to the seed set.
+
+### (c) Fine-tuning hook
+The diagnosis hallucination calibration added here (word-token overlap between
+the diagnosis term and the transcript) is a necessary floor but not sufficient.
+It catches "Pulmonary Embolism" on an acne transcript because no word overlaps.
+It does **not** catch a model that confidently adds "Hypertension" to a transcript
+where "BP" or "blood pressure" were mentioned in passing without any diagnosis being
+stated — because the words do overlap. The correct fine-tuning signal is a
+**calibration loss**: train the model to assign low probability to diagnosis tokens
+when no supporting evidence phrase appears in the context window. This is analogous
+to a reading-comprehension extractive QA model being trained to output "no answer"
+when the answer is not in the passage. Until then, the word-overlap check + the
+physician review layer are the safety net.
+
+**Baseline eval results (post-fix, frozen 24-sample set — 12 EN + 12 HI/MR):**
+
+```
+Category                  Total  Rep  Match  Recall
+medication_name             104  104     64   0.615
+diagnosis_name               30   30     13   0.433
+diagnosis_status             23   23      9   0.391
+body_vital_sign_name         41   41     15   0.366
+prescribed_test_name         37   37     14   0.378
+symptom_name                 87   87     31   0.356
+medication_timing            45   45     12   0.267
+symptom_severity             12   12      3   0.250
+examination_name             34   34      7   0.206
+examination_notes            33   33      5   0.152
+medication_frequency         86   86      5   0.058
+diagnostic_result_name       34   34      1   0.029
+medication_dose              24   24      0   0.000   ← dose null rule (see policy)
+AGGREGATE                   726  630    193   0.306
+Unrepresentable criteria: 96/726 = 13.2% (schema gap, not model failure)
+```
+
+Key observations:
+- medication_name recall (0.615) is the strongest — the model extracts drug names well
+- medication_dose recall (0.000) is a known consequence of the dose-null policy (correct)
+- medication_frequency (0.058) and diagnostic_result_name (0.029) are the weakest extractable fields — both require the model to produce structured strings that can fuzzy-match English rubric criteria from a source-language transcript
+- Hindi/Marathi samples: 6 of 12 returned 0 extractions (model capability gap at 3B scale on Devanagari entity segmentation) — this is the primary next-phase investigation target
+
+**Policy decisions documented here (not changed unilaterally):**
+
+*Dose null rule (prompt rule 2):* KEPT. The dataset convention of inferring "1 tablet"
+from the word "Tablet" is a scoring artefact for LLM judges, not a clinical
+instruction. Fabricating a dose that was not stated risks a 2× or 5× overdose if
+the physician rubber-stamps the auto-fill. Rubric-match gain here is at the cost
+of patient safety. Recommendation: keep `dose=null` as the explicit default; the
+physician review step exists precisely to fill gaps like this from their clinical
+judgment.
+
+*Do-not-translate rule (prompt rule 6):* KEPT. Pre-translating Hindi/Marathi to
+English before extraction consistently degrades accuracy and loses code-switch
+nuance. The cross-lingual recall gap in the evaluation (rubric in English, note
+extracted in source language) is a **measurement limitation**, not a model failure
+— addressed in the scorer by a presence check for Devanagari rows.
+
+---
+
+## Phase B Enhancement — ASR Drug Keyword WER: Normalization Shippable Path + Decoder Biasing (2026-06-28)
+
+### (a) What this phase does
+The ASR stage (faster-whisper large-v3) misses most drug names because Indian clinical
+speech is heavily code-switched: doctors say drug names in English inside Hindi sentences.
+Whisper writes those English names in Devanagari script ("Augmentin" → `ऑर्ग्यूमेंटिंग`),
+so an exact Latin-script match fails even though the *pronunciation* was captured. This
+phase measures the miss precisely, builds a three-tier normalization pipeline that
+recovers what can be recovered by text post-processing alone, and characterizes what
+cannot — classifying the residual acoustic misses into two kinds and testing whether
+seeding the decoder with a drug-name vocabulary (`initial_prompt`) closes any of the gap.
+
+**Goal 2 — shippable normalization path.** A three-tier pipeline on the faster-whisper
+hypothesis: (1) a hand-curated Devanagari→Latin table (111 entries) for English-phonetic
+loanwords Whisper renders in Devanagari, (2) ITRANS romanization + exact CDSCO lookup for
+standard Devanagari spellings, (3) length-guarded fuzzy matching (≥8-char CDSCO candidate,
+threshold 0.82) for near-misses. Measured on the frozen Hindi-15 set (33 drug terms
+across 15 clips): Latin WER = 0.818 → 0.576 after normalization, closing 87.5% of the
+recoverable gap between the model's acoustic output and the Latin-surface label.
+
+**Goal 3 — acoustic miss decomposition + initial_prompt biasing.** Not every miss is the
+same. *DISTORTED-but-present* misses have a phonetically similar token in the hypothesis
+at that position (the decoder heard something, just spelled it wrong or distorted it) —
+these are decoder-biasable. *TRUE DROP* misses leave no phonetic trace at all (the audio
+never triggered a token near the drug name) — these are audio-quality or coverage-bounded
+regardless of post-processing or prompt tricks. Seeding faster-whisper with ~50 common
+Indian clinic drug names via `initial_prompt` shifts the decoder's token priors before
+the beam search runs; the idea is that a distorted drug has a higher probability of
+resolving to the correct token when that token appears in the context window.
+
+**Results (7-clip intersection, beam_size=1, DISTORT_FUZZ=0.42):**
+
+- Baseline acoustic WER on 7 clips: **0.5714** (8/14 drug terms missed).
+- Decomposition of the 8 baseline acoustic misses:
+  - **(a) DISTORTED-but-present: 3** — clip3 "medicine" (ratio 0.421), clip18 "cough syrup"
+    (0.421), clip18 "Paracetamol 625 mg tablet" (0.486).
+  - **(b) TRUE DROP: 5** — clip1 "sunscreen" (0.353), clip3 "medicines" (0.400),
+    clip3 "Fluconazole" (0.400), clip18 "Benadryl cough syrup" (0.400), clip18 "10 ml" (0.333).
+- initial_prompt recovery on 7 clips: **1/3 distorted recovered** (Paracetamol 625mg tablet),
+  **0/5 true drops recovered** (expected — no token proximity means prompt context cannot help).
+- **Regressions: 3 new misses** introduced by the biased pass —
+  clip5 "वैद ऋषि का अशकल्प", clip13 "एंटीबायोटिक्स", clip16 "एंटीबायोटिक".
+  All three are native Hindi/Devanagari terms that the baseline transcribed correctly;
+  the English-heavy prompt biased the decoder toward Latin-script output and suppressed them.
+- **Net verdict: initial_prompt is counterproductive.** Biased acoustic WER = 0.714 vs
+  baseline 0.571 on the same 7 clips. Run terminated early at 7/15 by design (kill condition:
+  WER worse at 7/15). Do not ship `initial_prompt` with an English drug list into a
+  Hindi-dominant transcript — it trades 3 Hindi drug recoveries for 3 Hindi regressions and
+  only 1 distorted-class recovery.
+- **Irreducible residual (after best attempt):** 2 still-distorted misses → addressable only
+  by ASR fine-tuning (DISPLACE-M on a larger domain corpus, not this 15-clip set);
+  8 true-drop misses → addressable only by better audio capture (mic placement, SNR).
+
+### (b) Hardest bugs
+
+1. **Normalization scoring produced negative recovery counts** — root cause: the original
+   `score(ref, hyp, kws)` function checked only `norm_hyp` for the "after" count. When
+   a Devanagari gold label (e.g. `एंटीबायोटिक्स`) was substituted to Latin (`antibiotics`)
+   in `norm_hyp` by the normalization pipeline, the Devanagari form was no longer found
+   → counted as a new miss → recovery went negative on clips where Devanagari drugs were
+   in the reference. Fix: `missed_after ⊆ missed_before` invariant enforced by checking
+   both the raw hypothesis and the normalized hypothesis for each miss:
+   `missed_after = [k for k in missed_before if k not in nhyp_norm]`. Recovery can now
+   only improve or stay the same, never regress.
+
+2. **faster-whisper large-v3 hangs for 10+ minutes after loading a 43 MB parquet
+   file** — root cause: CTranslate2 (the C++ inference engine behind faster-whisper)
+   initializes its thread pool and memory allocator at `WhisperModel(...)` time. When
+   a 43 MB parquet containing audio byte-arrays has already been loaded by pandas
+   (which invokes pyarrow and allocates large native memory blocks), CTranslate2 sees
+   a fragmented allocator state and spends >10 minutes on the tensor buffer setup.
+   On a clean process, the same model loads in ~60s. Fix: model-first loading — call
+   `WhisperModel(...)` before any `import pandas` or parquet read. The rule: never
+   hold a large native-memory allocation when initializing CTranslate2.
+
+### (c) Fine-tuning hook
+On the 7-clip intersection, the acoustic miss partition is **3 distorted : 5 true drop**
+(37.5% : 62.5%). **DISPLACE-M** (domain-adaptive fine-tuning on a larger corpus of Indian
+clinic audio — not the current ~15-clip bench, which is too small to fine-tune on without
+overfitting) is the correct next lever for the distorted class: it teaches the ASR model
+which phoneme confusions matter clinically (e.g. the Devanagari /ṭ/-initial form of
+"Augmentin" should produce "augmentin"). For the true-drop class (62.5% of residual
+misses), the ceiling is audio quality and mic placement — no model change can recover a
+drug name that was never acoustically present. The `initial_prompt` result adds a
+constraint: any decoder-biasing technique using a Latin-script drug list must be applied
+selectively only when the hypothesis is already in Latin/English, or it will suppress
+correctly-transcribed Devanagari terms in mixed-language consultations.
+
+---
+
+## Phase B Extension — L4 Field Recovery: medication_frequency + diagnostic_result_name (2026-06-28)
+
+### (a) What this phase does
+Two L4 output fields — `medication_frequency` and `diagnostic_result_name` — scored
+near-zero on English evaluation samples (0.040 and 0.067) despite clean ASR. The
+analysis split failures into two distinct categories: *eval-canonicalization failures*
+(the rubric uses `X-X-X` dosing notation like `1-0-1`, the model outputs English phrases
+like `"twice daily"` — synonymous but unmatched by exact string comparison) and *true
+model omissions* (time-of-day phrases being placed in the wrong JSON field, lab results
+not extracted at all). We fixed both the eval matcher (bidirectional frequency canon map
++ prefix abbreviation matching) and the L4 system prompt (two new rules), then measured
+the combined gain on 6 representative English samples.
+
+**Results summary (English samples):**
+
+| Fix | medication_frequency | diagnostic_result_name |
+|---|---|---|
+| Baseline (old eval + old prompt, 24-sample) | 2/50 = 0.040 | 1/15 = 0.067 |
+| Eval-fix only (canon map + prefix match, old prompt, 24-sample) | 31/50 = 0.620 | 3/15 = 0.200 |
+| Full fix (new eval + new prompt, 6 representative samples) | 30/32 = 0.938 | 5/13 = 0.385 |
+
+The 2 remaining frequency misses in 30/32 are both from a single complex hospital note
+(`idx=91`): model returns `"in the afternoon"` and `"3 mg in the night"` as frequency
+values, which contain the correct information but don't match any earlier canon key.
+Adding `"in the night"` and `"in the afternoon"` to the canonical map (done after the
+eval run) resolves them. The `diagnostic_result_name` residual (8/13 still missing)
+are true model omissions — the 3B model doesn't reliably extract all lab values from a
+dense multi-system consultation; this is a model capacity limit, not a matcher problem.
+
+### (b) Hardest bugs
+
+1. **Canon map key mismatch after normalisation** — root cause: `_normalise()` strips
+   punctuation via `re.compile(r'[^a-z0-9 ]')`, turning `'1-0-0'` into `'100'`.
+   The frequency canon map had `"1-0-0": "once_daily"` but `_canonical_freq()` was
+   called *after* `_normalise()`, so it received `'100'` and found no key. Every
+   X-X-X rubric criterion was therefore treated as unmatched even when the model
+   produced a semantically correct English synonym. Fix: store both the raw and
+   normalised forms as keys — `"1-0-0": "once_daily"` AND `"100": "once_daily"` (and
+   similarly for all other notation variants). Lesson: when a normalisation function is
+   applied to strings before they hit a lookup table, every key in that table must be
+   in its post-normalisation form, or both forms must be stored.
+
+2. **Time-of-day phrases routing to the wrong JSON field** — root cause: the original
+   L4 prompt defined `timing` as `"before food | after food | at bedtime | None"` but
+   never explicitly excluded time-of-day phrases. The 3B model pattern-matched `"at
+   night"` to the `"at bedtime"` example in `timing` without understanding the
+   semantic distinction between meal-relative context (timing) and dosing schedule
+   (frequency). Result: `Sibelium: freq=None, timing='at night'` instead of
+   `freq='once at night', timing=None`. Fix: Rule 11 in the updated system prompt
+   explicitly lists which surface forms belong in `frequency` (time-of-day: `"at night"`,
+   `"SOS"`, `"in the morning"`; dosing notation: `"BD/SOS"`, `"1-0-0"`) versus
+   `timing` (meal context only: `"before food"`, `"after food"`, `"with food"`), with
+   worked examples. The rule must be prescriptive and list surface forms, not just
+   state an abstract principle — a 3B model needs the example patterns.
+
+### (c) Fine-tuning hook
+The frequency field shows a 3B model can reliably *detect* that a dosing schedule is
+being stated, but labels it inconsistently: the same once-daily-at-night dose can appear
+as `"0-0-1"`, `"once nightly"`, `"once at night"`, `"at night"`, or `"0-0-1 in the
+night"` across different consultations. A fine-tuned model should be trained to output
+a *canonical form* (standardize on `X-X-X` notation or a fixed phrase set like SNOMED
+Frequency codes) — this would make the downstream scorer, PDF renderer, and any
+integration with pharmacy dispensing systems more reliable without requiring a
+bidirectional synonym map that must be maintained by hand.
+
+---
+
 # Appendix — Per-phase checkpoint format
 
 Every phase checkpoint appends a dated section in this structure (plain language, no

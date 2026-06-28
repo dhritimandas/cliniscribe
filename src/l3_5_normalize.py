@@ -1,17 +1,264 @@
-"""L3.5 — Lay-term to clinical-concept normalization via parrotlet-e embeddings."""
+"""L3.5 — Post-ASR normalization: drug-term transliteration + concept glossing.
 
+Two passes in sequence:
+1. Drug normalization (no model): 3-tier Devanagari→Latin pipeline
+   (curated table → exact CDSCO → length-guarded fuzzy match).
+2. Concept normalization (parrotlet-e): lay symptom/condition terms glossed
+   with canonical clinical names + SNOMED IDs.
+"""
+
+import difflib
 import gc
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
 
+from src.cdsco import _APPROVED_DRUGS
 from src.concepts import CONCEPTS
 from src.types import Turn
 
 logger = logging.getLogger(__name__)
 
+# ── Pass 1: Devanagari drug-name normalization ─────────────────────────────
+# Constants: tuned on frozen Hindi-15 set (vaani-large-v3 + faster-whisper).
+
+_DRUG_FUZZY_THRESHOLD = 0.82
+_DRUG_FUZZY_MIN_LEN = 8  # CDSCO candidate must be ≥8 chars to enter fuzzy
+
+# Hand-curated Devanagari → Latin table (longest-match wins).
+# Covers English-phonetic drug names Whisper renders in Devanagari script.
+_DEVA_CURATED: dict[str, str] = {
+    "मेडिसिन्स": "medicines",
+    "ऑर्ग्यूमेंटिंग": "augmentin",
+    "मेडिसिन": "medicine",
+    "डीओ टेबलेट": "DO tablet",
+    "टेबलेट": "tablet",
+    "टैबलेट": "tablet",
+    "ऑग्मेंट": "augmentin",
+    "ऑग्युमेंट": "augmentin",
+    "ऑर्ग्यूमेंट": "augmentin",
+    "दवाई": "medicine",
+    "दवा": "medicine",
+    "इंजेक्शन": "injection",
+    "इंजेक्‍शन": "injection",
+    "कैप्सूल": "capsule",
+    "सिरप": "syrup",
+    "कफ सिरप": "cough syrup",
+    "जेल": "gel",
+    "एंटीबायोटिक": "antibiotic",
+    "एंटीबायोटिक्स": "antibiotics",
+    "सनस्क्रीन": "sunscreen",
+    "मलहम": "ointment",
+    "क्रीम": "cream",
+    "ड्रॉप्स": "drops",
+    "सस्पेंशन": "suspension",
+    "टिंचर": "tincture",
+    "पैरासिटामोल": "paracetamol",
+    "पैरासिटमोल": "paracetamol",
+    "फ्लूकोनाज़ोल": "fluconazole",
+    "फ्लुकोनाज़ोल": "fluconazole",
+    "फ्लूकोनाज़ोल 150": "fluconazole 150",
+    "मेट्रोनिडाज़ोल": "metronidazole",
+    "एजिथ्रोमाइसिन": "azithromycin",
+    "एजिथ्रोमायसिन": "azithromycin",
+    "एमोक्सिसिलिन": "amoxicillin",
+    "अमोक्सिसिलिन": "amoxicillin",
+    "आइबुप्रोफेन": "ibuprofen",
+    "आईबुप्रोफेन": "ibuprofen",
+    "ओमेप्राज़ोल": "omeprazole",
+    "ओमेप्रेज़ोल": "omeprazole",
+    "पैंटोप्राज़ोल": "pantoprazole",
+    "मेटफॉर्मिन": "metformin",
+    "डिक्लोफेनैक": "diclofenac",
+    "डाइक्लोफेनेक": "diclofenac",
+    "सेटिरीज़ीन": "cetirizine",
+    "सेटिरिज़ीन": "cetirizine",
+    "रेनिटिडीन": "ranitidine",
+    "सेफिक्सिम": "cefixime",
+    "लेवोसाल्बुटामोल": "levosalbutamol",
+    "साल्बुटामोल": "salbutamol",
+    "मोन्टेलुकास्ट": "montelukast",
+    "टेल्मिसार्टन": "telmisartan",
+    "एम्लोडिपिन": "amlodipine",
+    "अम्लोडिपिन": "amlodipine",
+    "एटोर्वास्टेटिन": "atorvastatin",
+    "लोसार्टन": "losartan",
+    "वारफेरिन": "warfarin",
+    "एस्पिरिन": "aspirin",
+    "बीटामेथासोन": "betamethasone",
+    "डिक्सीसाइक्लिन": "doxycycline",
+    "डॉक्सीसाइक्लिन": "doxycycline",
+    "क्लोनाज़ेपाम": "clonazepam",
+    "अल्प्राज़ोलम": "alprazolam",
+    "रैनिटिडीन": "ranitidine",
+    "ड्रोटावेरिन": "drotaverine",
+    "मेफेनामिक एसिड": "mefenamic acid",
+    "मेफेनामिक": "mefenamic acid",
+    "ट्रामाडोल": "tramadol",
+    "विटामिन सी": "vitamin c",
+    "विटामिन डी": "vitamin d",
+    "विटामिन डी3": "vitamin d3",
+    "कैल्शियम कार्बोनेट": "calcium carbonate",
+    "मल्टीविटामिन": "multivitamin",
+    "आयरन": "iron",
+    "फोलिक एसिड": "folic acid",
+    "जिंक": "zinc",
+    "प्रोबायोटिक": "probiotic",
+    "ओमेगा 3": "omega 3",
+    "फ्लुटिकासोन": "fluticasone",
+    "बुडेसोनाइड": "budesonide",
+    "टर्बुटालिन": "terbutaline",
+    "क्लोरफेनिरामाइन": "chlorpheniramine",
+    "डेक्सट्रोमेथोर्फन": "dextromethorphan",
+    "गुआइफेनेसिन": "guaifenesin",
+    "कोडीन": "codeine",
+    "डोलो": "dolo",
+    "डोलो 650": "dolo 650",
+    "कैल्पोल": "calpol",
+    "ग्लाइकोमेट": "glycomet",
+    "ग्लाइकोमेट जीपी": "glycomet gp",
+    "ओमनीजेल": "omnigel",
+    "ओम्नि जेल": "omnigel",
+    "वोवेरान": "voveran",
+    "पैंटोप": "pantop",
+    "लिमसी": "limcee",
+    "शेल्कल": "shelcal",
+    "अस्थालिन": "asthalin",
+    "लेवोलिन": "levolin",
+    "फोराकोर्ट": "foracort",
+    "ड्रोटिन": "drotin",
+    "ज़ीफी": "zifi",
+    "ज़िफी": "zifi",
+    "मेफ्टल": "meftal",
+    "मेफ्टल स्पास": "meftal spas",
+    "अल्ट्रासेट": "ultracet",
+    "पैन डी": "pan d",
+    "पैन-डी": "pan d",
+    "मॉक्सीक्लाव": "moxclav",
+    "बाइफिलैक": "bifilac",
+}
+
+_DEVA_RE = re.compile(r"[ऀ-ॿ]")
+
+
+def _is_devanagari(token: str) -> bool:
+    return bool(_DEVA_RE.search(token))
+
+
+def _itrans_romanize(text: str) -> str:
+    """ITRANS romanization with English-loanword post-processing."""
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+
+        r = transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS).lower()
+    except Exception:
+        return text.lower()
+    r = r.replace("ph", "f")
+    r = r.replace("ai", "a")
+    r = re.sub(r"a$", "", r)
+    return r
+
+
+def _normalize_roman(r: str) -> str:
+    """Additional normalization for CDSCO exact lookup."""
+    r = r.replace("aa", "a").replace("ii", "i").replace("uu", "u")
+    r = re.sub(r"([bcdfghjklmnpqrstvwxyz])\1", r"\1", r)
+    r = re.sub(r"sh", "s", r)
+    r = re.sub(r"([aeiou])n$", r"\1", r)
+    return r.strip()
+
+
+# Pre-build CDSCO lookup tables at import time (fast, no I/O).
+_CDSCO_NORM_EXACT: dict[str, str] = {}
+for _drug in _APPROVED_DRUGS:
+    if not _drug.strip():
+        continue
+    _r = _itrans_romanize(_drug.lower())
+    _n = _normalize_roman(_r)
+    _CDSCO_NORM_EXACT[_n] = _drug
+    _CDSCO_NORM_EXACT[_n.replace(" ", "")] = _drug
+
+_CDSCO_FUZZY_LIST: list[tuple[str, str]] = [
+    (d.lower().replace(" ", ""), d)
+    for d in _APPROVED_DRUGS
+    if len(d.replace(" ", "")) >= _DRUG_FUZZY_MIN_LEN
+]
+
+
+def _cdsco_exact(roman: str) -> str | None:
+    n1 = _normalize_roman(roman)
+    return _CDSCO_NORM_EXACT.get(n1) or _CDSCO_NORM_EXACT.get(n1.replace(" ", ""))
+
+
+def _cdsco_fuzzy(roman: str) -> str | None:
+    flat = roman.replace(" ", "")
+    best_name, best_r = None, 0.0
+    for norm_key, canonical in _CDSCO_FUZZY_LIST:
+        r = difflib.SequenceMatcher(None, flat, norm_key).ratio()
+        if r > best_r:
+            best_r, best_name = r, canonical
+    return best_name if best_r >= _DRUG_FUZZY_THRESHOLD else None
+
+
+def _normalize_drug_text(text: str) -> str:
+    """Apply 3-tier Devanagari→Latin drug normalization to a single string.
+
+    Processes windows of 3, 2, 1 tokens (longest match wins). Only windows
+    containing at least one Devanagari token are examined. Already-covered
+    positions are skipped.
+
+    Args:
+        text: Raw ASR hypothesis string (may contain Devanagari tokens).
+
+    Returns:
+        String with matched Devanagari drug spans replaced by their Latin forms.
+    """
+    tokens = text.split()
+    hits: dict[tuple[int, int], str] = {}  # (start, end) → latin
+
+    for window in (3, 2, 1):
+        for i in range(len(tokens) - window + 1):
+            span = tokens[i : i + window]
+            if not any(_is_devanagari(t) for t in span):
+                continue
+            if any(s <= i < e or s < i + window <= e for (s, e) in hits):
+                continue
+
+            span_text = " ".join(span)
+
+            latin = _DEVA_CURATED.get(span_text.strip())
+            if latin:
+                hits[(i, i + window)] = latin
+                continue
+
+            roman = _itrans_romanize(span_text)
+            latin = _cdsco_exact(roman)
+            if latin:
+                hits[(i, i + window)] = latin
+                continue
+
+            latin = _cdsco_fuzzy(roman)
+            if latin:
+                hits[(i, i + window)] = latin
+
+    if not hits:
+        return text
+
+    result = list(tokens)
+    offset = 0
+    for (s, e), latin in sorted(hits.items()):
+        sa, ea = s - offset, e - offset
+        logger.debug("L3.5 drug: '%s' → '%s'", " ".join(result[sa:ea]), latin)
+        result[sa:ea] = [latin]
+        offset += (e - s) - 1
+    return " ".join(result)
+
+
+# ── Pass 2: parrotlet-e concept normalization ──────────────────────────────
 MODEL_ID = "ekacare/parrotlet-e"
 COSINE_THRESHOLD = 0.65
 HARDNEG_MARGIN = 0.05   # span must score ≥ this much higher than its hardest hard-negative
@@ -205,6 +452,18 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     if not turns:
         return turns
 
+    # Pass 1: Devanagari drug-name normalization (no model, always runs first).
+    turns = [
+        Turn(
+            speaker_role=t.speaker_role,
+            text=_normalize_drug_text(t.text),
+            start=t.start,
+            end=t.end,
+        )
+        for t in turns
+    ]
+
+    # Pass 2: lay-term concept glossing via parrotlet-e embeddings.
     backend = _EmbeddingBackend()
 
     # Reference matrix: canonical term + all variants per concept.

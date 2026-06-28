@@ -9,7 +9,10 @@ from src.l3_5_normalize import (
     _Match,
     _best_non_overlapping,
     _gloss_turn,
+    _is_devanagari,
+    _itrans_romanize,
     _ngrams,
+    _normalize_drug_text,
     _passes_hardneg_gate,
 )
 from src.types import Turn
@@ -125,6 +128,53 @@ def test_gloss_preserves_metadata() -> None:
     assert result.speaker_role == "PATIENT"
     assert result.start == 1.5
     assert result.end == 3.0
+
+
+# ── Drug normalization helpers (fast, no model) ──────────────────────────────
+
+
+def test_is_devanagari_detects_devanagari() -> None:
+    assert _is_devanagari("पैरासिटामोल")
+    assert not _is_devanagari("paracetamol")
+    assert not _is_devanagari("625")
+
+
+def test_itrans_romanize_paracetamol() -> None:
+    # पैरासिटामोल should romanize to something close to "paracetamol"
+    r = _itrans_romanize("पैरासिटामोल")
+    assert "para" in r or "pra" in r  # ITRANS may vary slightly
+
+
+def test_normalize_drug_text_curated_hit() -> None:
+    # Tier 1: exact Devanagari curated match
+    result = _normalize_drug_text("doctor ne एंटीबायोटिक्स diya")
+    assert "antibiotics" in result
+    assert "एंटीबायोटिक्स" not in result
+
+
+def test_normalize_drug_text_curated_bigram() -> None:
+    # Tier 1: 2-token curated match "कफ सिरप"
+    result = _normalize_drug_text("isne कफ सिरप liya")
+    assert "cough syrup" in result
+
+
+def test_normalize_drug_text_no_devanagari_unchanged() -> None:
+    text = "patient has fever and cough"
+    assert _normalize_drug_text(text) == text
+
+
+def test_normalize_drug_text_longest_match_wins() -> None:
+    # "मेडिसिन्स" (medicines, 3 tokens if split differently) vs "मेडिसिन" (medicine)
+    # Both are curated. Longest-first window (3→2→1) should prefer longer if present.
+    result = _normalize_drug_text("मेडिसिन्स leni hai")
+    assert "medicines" in result
+
+
+def test_normalize_drug_text_mixed_script() -> None:
+    # Latin tokens are untouched; only Devanagari spans are processed
+    result = _normalize_drug_text("take paracetamol aur पैंटोप्राज़ोल daily")
+    assert "paracetamol" in result  # original Latin preserved
+    assert "pantoprazole" in result  # Devanagari converted
 
 
 # ── Hard-negative gate (fast, no model) ──────────────────────────────────────
