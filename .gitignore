@@ -11,6 +11,7 @@ eka-medical-asr-dataset/
 # Local working docs (internal use, never committed)
 *.docx
 *.pages
+HANDOFF.md
 
 # Python
 __pycache__/
