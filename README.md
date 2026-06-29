@@ -50,15 +50,33 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env   # then add your HF_TOKEN
 ollama pull qwen2.5:3b-instruct
 ```
 
-Verify the HuggingFace token:
+### HuggingFace token
 
-```bash
-python -c "from huggingface_hub import whoami; import json; print(json.dumps(whoami(), indent=2))"
-```
+Several stages download gated models and datasets from HuggingFace (the pyannote
+diarizer in L2, the parrotlet-e encoder in L3.5, and the EkaCare datasets for
+evaluation), so a token is required.
+
+1. Create a token at <https://huggingface.co/settings/tokens> — a `read` token is enough.
+2. Copy the template and add your token:
+   ```bash
+   cp .env.example .env
+   ```
+   Edit `.env` so the line reads (no quotes, no spaces):
+   ```
+   HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+3. Verify it works:
+   ```bash
+   python -c "from huggingface_hub import whoami; import json; print(json.dumps(whoami(), indent=2))"
+   ```
+
+The token is loaded automatically — `src/pipeline.py` and `eval/run_eval.py` call
+`load_dotenv()` on startup, which reads `.env` into the environment, and the stages pick
+it up via `os.environ["HF_TOKEN"]`. You never export it manually or pass it on the command
+line. `.env` is gitignored; never commit your token.
 
 ## Usage
 
