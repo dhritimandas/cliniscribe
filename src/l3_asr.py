@@ -9,8 +9,6 @@ from faster_whisper import WhisperModel
 from src import config
 from src.types import Segment, Turn
 
-ASR_MODEL = "large-v3"
-
 # Doctor heuristic: bag-of-words score over transcribed text.
 # Doctors tend to use question forms (eliciting symptoms) AND clinical terms
 # (drug names, diagnoses). The speaker with the higher combined score is DOCTOR.
@@ -65,8 +63,8 @@ def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
         Marathi code-switching. task="transcribe" is explicit to prevent
         translation even if Whisper internally detects a non-English segment.
     """
-    model = WhisperModel(ASR_MODEL, device="cpu", compute_type="int8")
-    logger.info("L3: loaded faster-whisper %s", ASR_MODEL)
+    model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
+    logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
 
     raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
     for seg in segments:

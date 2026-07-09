@@ -4,12 +4,11 @@ import json
 import logging
 import re
 
+from src import config
 from src.cdsco import validate_drug
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
 
 logger = logging.getLogger(__name__)
-
-_MODEL = "qwen2.5:3b-instruct"
 
 _SYSTEM_PROMPT = """\
 You are a clinical documentation assistant. Extract structured medical information \
@@ -271,7 +270,7 @@ def extract(turns: list[Turn]) -> ClinicalNote:
     for attempt in range(1, 3):
         try:
             response = ollama.chat(
-                model=_MODEL,
+                model=config.EXTRACT_MODEL,
                 messages=messages,
                 format="json",
                 options={"temperature": 0},

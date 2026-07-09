@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src import config
 from src.cdsco import _APPROVED_DRUGS
 from src.concepts import CONCEPTS
 from src.types import Turn
@@ -259,9 +260,11 @@ def _normalize_drug_text(text: str) -> str:
 
 
 # ── Pass 2: parrotlet-e concept normalization ──────────────────────────────
-MODEL_ID = "ekacare/parrotlet-e"
-COSINE_THRESHOLD = 0.65
-HARDNEG_MARGIN = 0.05   # span must score ≥ this much higher than its hardest hard-negative
+# Model id and thresholds live in src/config.py; re-exported here so existing
+# importers (tests) keep working.
+MODEL_ID = config.NORMALIZE_MODEL
+COSINE_THRESHOLD = config.COSINE_THRESHOLD
+HARDNEG_MARGIN = config.HARDNEG_MARGIN
 MAX_NGRAM = 3           # unigrams through trigrams
 
 
