@@ -13,11 +13,14 @@ from src.types import Segment
 logger = logging.getLogger(__name__)
 
 
-def diarize(wav_path: str) -> list[Segment]:
+def diarize(wav_path: str, pipeline=None) -> list[Segment]:
     """Segment audio by speaker using pyannote diarization.
 
     Args:
         wav_path: Path to a 16 kHz mono WAV file (output of L1).
+        pipeline: Optional preloaded pyannote Pipeline. When provided it is
+            used as-is and NOT released — for eval harnesses iterating many
+            clips. Production passes None: load, use, release.
 
     Returns:
         List of Segment(start, end, speaker) sorted by start time.
@@ -35,14 +38,16 @@ def diarize(wav_path: str) -> list[Segment]:
     """
     from pyannote.audio import Pipeline
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        raise EnvironmentError("HF_TOKEN not set — required for pyannote model download")
+    owns_pipeline = pipeline is None
+    if owns_pipeline:
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            raise EnvironmentError("HF_TOKEN not set — required for pyannote model download")
 
-    pipeline = Pipeline.from_pretrained(config.DIARIZE_MODEL, token=hf_token)
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-    pipeline.to(device)
-    logger.info("L2: loaded %s on %s", config.DIARIZE_MODEL, device)
+        pipeline = Pipeline.from_pretrained(config.DIARIZE_MODEL, token=hf_token)
+        device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        pipeline.to(device)
+        logger.info("L2: loaded %s on %s", config.DIARIZE_MODEL, device)
 
     audio_array, sr = sf.read(wav_path, dtype="float32", always_2d=True)
     # soundfile returns (samples, channels); pyannote needs (channels, samples)
@@ -60,7 +65,9 @@ def diarize(wav_path: str) -> list[Segment]:
     segments.sort(key=lambda s: s.start)
     logger.info("L2: %d segments, %d speakers", len(segments), len({s.speaker for s in segments}))
 
-    del pipeline, waveform, audio_input
+    if owns_pipeline:
+        del pipeline
+    del waveform, audio_input
     gc.collect()
     if torch.backends.mps.is_available():
         torch.mps.empty_cache()
