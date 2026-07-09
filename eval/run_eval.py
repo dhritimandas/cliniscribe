@@ -10,6 +10,7 @@ against an honest before-number on the same frozen set.
 import json
 import logging
 import os
+import re
 import tempfile
 
 from dotenv import load_dotenv
@@ -129,6 +130,254 @@ def run_asr_eval() -> None:
     print(f"\nFull results: {RESULTS_PATH}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Extraction-eval scoring (module-level so the live eval and --rescore share
+# one matcher — divergent scorers are how measurement bugs are born).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Category → schema field mapping ─────────────────────────────────────────
+# Each entry: (schema_field_name, extractor_fn(note) → list[str])
+REPRESENTABLE_MAP: dict[str, tuple[str, object]] = {
+    "medication_name": ("medications[].drug", lambda note: [m.drug for m in note.medications]),
+    "medication_dose": (
+        "medications[].dose", lambda note: [m.dose for m in note.medications if m.dose]),
+    "medication_frequency": (
+        "medications[].frequency",
+        lambda note: [m.frequency for m in note.medications if m.frequency]),
+    "medication_timing": (
+        "medications[].timing", lambda note: [m.timing for m in note.medications if m.timing]),
+    "symptom_name": ("symptoms[].name", lambda note: [s.name for s in note.symptoms]),
+    "symptom_severity": (
+        "symptoms[].severity", lambda note: [s.severity for s in note.symptoms if s.severity]),
+    "body_vital_sign_name": ("vitals[].name", lambda note: [v.name for v in note.vitals]),
+    "body_vital_sign_value": ("vitals[].value", lambda note: [v.value for v in note.vitals]),
+    "diagnosis_name": ("diagnosis[].term", lambda note: [d.term for d in note.diagnosis]),
+    "diagnosis_status": (
+        "diagnosis[].status", lambda note: [d.status for d in note.diagnosis if d.status]),
+    "prescribed_test_name": ("investigations[]", lambda note: list(note.investigations)),
+    "diagnostic_result_name": (
+        "diagnostic_results[]", lambda note: list(note.diagnostic_results)),
+    "examination_name": (
+        "examination", lambda note: [note.examination] if note.examination else []),
+    "examination_notes": (
+        "examination", lambda note: [note.examination] if note.examination else []),
+}
+
+UNREPRESENTABLE_CATS: frozenset[str] = frozenset(
+    {
+        "medical_condition_name", "medical_condition_status",
+        "current_medication_name", "lifestyle_habit_name",
+        "family_history_name", "family_history_who",
+        "foodotherallergy_name", "pastprocedures_name",
+        "recenttravelhistory_name", "symptom_laterality",
+        "diagnosis_laterality", "drugallergy_name",
+        "diagnostic_result_value", "diagnostic_result_interpretation",
+    }
+)
+
+# ── Rubric parsing ───────────────────────────────────────────────────────────
+_RUBRIC_RE = re.compile(
+    r"Rubric ID:\s*(\d+)\s*\nCategory ID:\s*([^\n]+)\s*\nCriterion:\s*([^\n]+(?:\n(?!Rubric ID:)[^\n]*)*)",
+    re.MULTILINE,
+)
+_PUNCT_STRIP_RE = re.compile(r"[^a-z0-9 ]")
+
+
+def _parse_rubrics(text: str) -> list[tuple[int, str, str]]:
+    """Return list of (id, category, criterion) tuples from rubric text."""
+    return [
+        (int(m.group(1)), m.group(2).strip().lower(), m.group(3).strip())
+        for m in _RUBRIC_RE.finditer(text)
+    ]
+
+
+def _normalise(s: object) -> str:
+    """Normalise to lowercase, stripped, punctuation-free string."""
+    if isinstance(s, dict):
+        s = s.get("term") or s.get("name") or s.get("value") or str(s)
+    return _PUNCT_STRIP_RE.sub("", str(s).lower().strip())
+
+
+# ── Frequency canonical map (see LEARNINGS Phase B — E9) ─────────────────────
+_FREQ_CANON: dict[str, str] = {
+    "1-0-0": "once_daily", "100": "once_daily",
+    "0-0-1": "once_daily", "001": "once_daily",
+    "0-1-0": "once_daily", "010": "once_daily",
+    "1-0-1": "twice_daily", "101": "twice_daily",
+    "1-1-1": "three_daily", "111": "three_daily",
+    "1-1-0": "twice_daily", "110": "twice_daily",
+    "0-1-1": "twice_daily", "011": "twice_daily",
+    "bd/sos": "twice_daily", "bdsos": "twice_daily",
+    "od": "once_daily", "bd": "twice_daily", "bid": "twice_daily",
+    "tds": "three_daily", "tid": "three_daily", "hs": "once_daily",
+    "sos": "prn", "prn": "prn",
+    "once daily": "once_daily", "once a day": "once_daily",
+    "one daily": "once_daily", "1 daily": "once_daily",
+    "once in the morning": "once_daily", "one in the morning": "once_daily",
+    "once daily morning": "once_daily", "in the morning": "once_daily",
+    "once at night": "once_daily", "once nightly": "once_daily",
+    "once daily at night": "once_daily",
+    "at night": "once_daily", "at bedtime": "once_daily",
+    "in the night": "once_daily", "in the afternoon": "once_daily",
+    "at noon": "once_daily", "once at noon": "once_daily",
+    "twice daily": "twice_daily", "twice a day": "twice_daily",
+    "two times a day": "twice_daily", "2 times a day": "twice_daily",
+    "morning and night": "twice_daily", "morning and evening": "twice_daily",
+    "three times a day": "three_daily", "three times daily": "three_daily",
+    "thrice a day": "three_daily", "thrice daily": "three_daily",
+    "3 times a day": "three_daily",
+    "as needed": "prn", "when needed": "prn", "if needed": "prn",
+}
+_FREQ_STRIP_RE = re.compile(
+    r"\s+(?:before|after|with)\s+(?:food|meals?|eat\w*)"
+    r"|\s+for\s+\d+\s+(?:day|week|month)\w*",
+    re.IGNORECASE,
+)
+_FREQ_CANON_SORTED = sorted(_FREQ_CANON, key=len, reverse=True)
+
+
+def _canonical_freq(s: str) -> str | None:
+    """Map a normalised frequency string to its canonical group, or None."""
+    stripped = _FREQ_STRIP_RE.sub("", s).strip()
+    if stripped in _FREQ_CANON:
+        return _FREQ_CANON[stripped]
+    for part in stripped.split("/"):
+        part = part.strip()
+        if part in _FREQ_CANON:
+            return _FREQ_CANON[part]
+    for key in _FREQ_CANON_SORTED:
+        if key in stripped:
+            return _FREQ_CANON[key]
+    return None
+
+
+# ── Vital-sign canons (B1 split: 43% of symptom/vital misses were matcher) ──
+# Name synonyms are clinical domain knowledge, not bench-mined one-offs.
+_VITAL_NAME_CANON: dict[str, str] = {
+    "spo2": "spo2", "oxygen saturation": "spo2", "o2 saturation": "spo2",
+    "peripheral oxygen saturation": "spo2", "saturation": "spo2",
+    "bp": "bp", "blood pressure": "bp",
+    "pulse": "pulse", "pulse rate": "pulse", "heart rate": "pulse",
+    "temperature": "temperature", "temp": "temperature",
+    "body temperature": "temperature",
+    "respiratory rate": "rr", "rr": "rr",
+    "weight": "weight", "height": "height",
+}
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+# Symptom qualifier synonyms: "decreased appetite" == "low appetite".
+_SYMPTOM_QUALIFIER_CANON: dict[str, str] = {
+    "decreased": "low", "reduced": "low", "poor": "low", "diminished": "low",
+}
+
+
+def _canonical_vital_name(s: str) -> str | None:
+    return _VITAL_NAME_CANON.get(s.strip())
+
+
+def _numeric_subset(gold: str, candidate: str) -> bool:
+    """True if every number in gold appears in candidate (vital values:
+    '136/88 mmHg' matches '136 systolic and 88 diastolic')."""
+    gold_nums = _NUM_RE.findall(gold)
+    if not gold_nums:
+        return False
+    cand_nums = set(_NUM_RE.findall(candidate))
+    return all(n in cand_nums for n in gold_nums)
+
+
+def _canon_symptom_qualifiers(s: str) -> str:
+    return " ".join(_SYMPTOM_QUALIFIER_CANON.get(t, t) for t in s.split())
+
+
+def _token_overlap(a: str, b: str) -> float:
+    """Token overlap Jaccard coefficient."""
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _all_gold_covered(gold: str, candidate: str) -> bool:
+    """True if every gold token is present in (or is a prefix of) a candidate token."""
+    gt_tokens = gold.split()
+    ct_tokens = candidate.split()
+    if not gt_tokens:
+        return False
+    for gt in gt_tokens:
+        found = False
+        for ct in ct_tokens:
+            if gt == ct:
+                found = True
+                break
+            if len(gt) >= 3 and len(ct) >= 3 and (gt.startswith(ct) or ct.startswith(gt)):
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+def _extract_quoted(criterion: str) -> str:
+    """Extract first single-quoted value from a criterion string."""
+    m = re.search(r"'([^']+)'", criterion)
+    return m.group(1) if m else criterion
+
+
+def _fuzzy_match(criterion: str, field_values: list[str], *, cat: str = "") -> bool:
+    """Return True if criterion matches any of the extracted field values."""
+    gold = _normalise(_extract_quoted(criterion))
+    if not gold:
+        return False
+    gold_canon = _canonical_freq(gold) if cat == "medication_frequency" else None
+    gold_vital = _canonical_vital_name(gold) if cat == "body_vital_sign_name" else None
+    if cat == "symptom_name":
+        gold = _canon_symptom_qualifiers(gold)
+    for val in field_values:
+        candidate = _normalise(val)
+        if not candidate:
+            continue
+        if cat == "symptom_name":
+            candidate = _canon_symptom_qualifiers(candidate)
+        if gold in candidate or candidate in gold:
+            return True
+        if _token_overlap(gold, candidate) >= 0.5:
+            return True
+        if _all_gold_covered(gold, candidate):
+            return True
+        if gold_canon and _canonical_freq(candidate) == gold_canon:
+            return True
+        # Vital NAME synonymy: 'Peripheral oxygen saturation' == 'SpO2'
+        if gold_vital and _canonical_vital_name(candidate) == gold_vital:
+            return True
+        # Vital VALUE surface forms: '136/88 mmHg' == '136 systolic and 88 diastolic'
+        if cat == "body_vital_sign_value" and _numeric_subset(gold, candidate):
+            return True
+    return False
+
+
+def _is_devanagari(text: str) -> bool:
+    return bool(re.search(r"[ऀ-ॿ]", text))
+
+
+def _note_from_dict(d: dict):
+    """Rebuild a ClinicalNote from its dataclasses.asdict form (saved results)."""
+    from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Vital
+
+    return ClinicalNote(
+        chief_complaint=d.get("chief_complaint"),
+        history=d.get("history"),
+        symptoms=[Symptom(**s) for s in d.get("symptoms", [])],
+        vitals=[Vital(**v) for v in d.get("vitals", [])],
+        examination=d.get("examination"),
+        diagnosis=[Diagnosis(**x) for x in d.get("diagnosis", [])],
+        medications=[Medication(**m) for m in d.get("medications", [])],
+        investigations=list(d.get("investigations", [])),
+        diagnostic_results=list(d.get("diagnostic_results", [])),
+        advice=d.get("advice"),
+        follow_up=d.get("follow_up"),
+        low_confidence_fields=list(d.get("low_confidence_fields", [])),
+    )
+
+
 def run_extraction_eval() -> None:
     """Evaluate L4 extraction on a frozen subset of the EkaCare clinical-note dataset.
 
@@ -211,256 +460,7 @@ def run_extraction_eval() -> None:
         74, 75, 45, 47, 48, 44, 49, 24, 46, 134, 60, 140,
     ]
 
-    # ── Category → schema field mapping ─────────────────────────────────────
-    # Each entry: (schema_field_name, extractor_fn(note) → list[str])
-    # extractor_fn returns the list of string values to match against.
-    REPRESENTABLE_MAP: dict[str, tuple[str, object]] = {
-        "medication_name": (
-            "medications[].drug",
-            lambda note: [m.drug for m in note.medications],
-        ),
-        "medication_dose": (
-            "medications[].dose",
-            lambda note: [m.dose for m in note.medications if m.dose],
-        ),
-        "medication_frequency": (
-            "medications[].frequency",
-            lambda note: [m.frequency for m in note.medications if m.frequency],
-        ),
-        "medication_timing": (
-            "medications[].timing",
-            lambda note: [m.timing for m in note.medications if m.timing],
-        ),
-        "symptom_name": (
-            "symptoms[].name",
-            lambda note: [s.name for s in note.symptoms],
-        ),
-        "symptom_severity": (
-            "symptoms[].severity",
-            lambda note: [s.severity for s in note.symptoms if s.severity],
-        ),
-        "body_vital_sign_name": (
-            "vitals[].name",
-            lambda note: [v.name for v in note.vitals],
-        ),
-        "body_vital_sign_value": (
-            "vitals[].value",
-            lambda note: [v.value for v in note.vitals],
-        ),
-        "diagnosis_name": (
-            "diagnosis[].term",
-            lambda note: [d.term for d in note.diagnosis],
-        ),
-        "diagnosis_status": (
-            "diagnosis[].status",
-            lambda note: [d.status for d in note.diagnosis if d.status],
-        ),
-        "prescribed_test_name": (
-            "investigations[]",
-            lambda note: list(note.investigations),
-        ),
-        "diagnostic_result_name": (
-            "diagnostic_results[]",
-            lambda note: list(note.diagnostic_results),
-        ),
-        "examination_name": (
-            "examination",
-            lambda note: [note.examination] if note.examination else [],
-        ),
-        "examination_notes": (
-            "examination",
-            lambda note: [note.examination] if note.examination else [],
-        ),
-    }
-
-    UNREPRESENTABLE_CATS: frozenset[str] = frozenset(
-        {
-            "medical_condition_name",
-            "medical_condition_status",
-            "current_medication_name",
-            "lifestyle_habit_name",
-            "family_history_name",
-            "family_history_who",
-            "foodotherallergy_name",
-            "pastprocedures_name",
-            "recenttravelhistory_name",
-            "symptom_laterality",
-            "diagnosis_laterality",
-            "drugallergy_name",
-            "diagnostic_result_value",
-            "diagnostic_result_interpretation",
-        }
-    )
-
-    # ── Rubric parsing ───────────────────────────────────────────────────────
-    _RUBRIC_RE = re.compile(
-        r"Rubric ID:\s*(\d+)\s*\nCategory ID:\s*([^\n]+)\s*\nCriterion:\s*([^\n]+(?:\n(?!Rubric ID:)[^\n]*)*)",
-        re.MULTILINE,
-    )
-    _PUNCT_RE = re.compile(r"[^a-z0-9 ]")
-
-    def _parse_rubrics(text: str) -> list[tuple[int, str, str]]:
-        """Return list of (id, category, criterion) tuples from rubric text."""
-        results = []
-        for m in _RUBRIC_RE.finditer(text):
-            rid = int(m.group(1))
-            cat = m.group(2).strip().lower()
-            crit = m.group(3).strip()
-            results.append((rid, cat, crit))
-        return results
-
-    def _normalise(s: object) -> str:
-        """Normalise to lowercase, stripped, punctuation-free string.
-
-        Accepts non-str inputs (e.g. dicts that a model may have returned in a
-        list field) by converting to string first. When the input is a dict
-        with a 'term' or 'name' key (model mis-typed a diagnostic result as an
-        object), extract that string rather than the raw repr.
-        """
-        if isinstance(s, dict):
-            s = s.get("term") or s.get("name") or s.get("value") or str(s)
-        return _PUNCT_RE.sub("", str(s).lower().strip())
-
-    # ── Frequency canonical map ───────────────────────────────────────────────
-    # Maps normalised frequency strings (from rubric OR extracted note) to a
-    # canonical group key.  Two values match if they share the same key.
-    # Groups: once_daily / twice_daily / three_daily / prn.
-    # X-X-X notation (morning-afternoon-evening): 1-0-0 / 0-0-1 / 0-1-0 all
-    # mean "once a day" at different times — grouped under once_daily.
-    # Both raw (with dashes/slashes) and _normalise()-d forms (dashes/slashes stripped
-    # by _PUNCT_RE) must be present, because _canonical_freq receives already-normalised
-    # strings: '1-0-0' → '100', 'BD/SOS' → 'bdsos'.
-    _FREQ_CANON: dict[str, str] = {
-        # X-X-X raw and normalised forms
-        "1-0-0": "once_daily",  "100": "once_daily",
-        "0-0-1": "once_daily",  "001": "once_daily",
-        "0-1-0": "once_daily",  "010": "once_daily",
-        "1-0-1": "twice_daily", "101": "twice_daily",
-        "1-1-1": "three_daily", "111": "three_daily",
-        "1-1-0": "twice_daily", "110": "twice_daily",
-        "0-1-1": "twice_daily", "011": "twice_daily",
-        # BD/SOS and compound forms (raw and normalised)
-        "bd/sos": "twice_daily", "bdsos": "twice_daily",
-        # Standard abbreviations (already survive _normalise unchanged)
-        "od": "once_daily", "bd": "twice_daily", "bid": "twice_daily",
-        "tds": "three_daily", "tid": "three_daily", "hs": "once_daily",
-        "sos": "prn", "prn": "prn",
-        # English phrases
-        "once daily": "once_daily", "once a day": "once_daily",
-        "one daily": "once_daily", "1 daily": "once_daily",
-        "once in the morning": "once_daily", "one in the morning": "once_daily",
-        "once daily morning": "once_daily", "in the morning": "once_daily",
-        "once at night": "once_daily", "once nightly": "once_daily",
-        "once daily at night": "once_daily",
-        "at night": "once_daily", "at bedtime": "once_daily",
-        "in the night": "once_daily", "in the afternoon": "once_daily",
-        "at noon": "once_daily", "once at noon": "once_daily",
-        "twice daily": "twice_daily", "twice a day": "twice_daily",
-        "two times a day": "twice_daily", "2 times a day": "twice_daily",
-        "morning and night": "twice_daily", "morning and evening": "twice_daily",
-        "three times a day": "three_daily", "three times daily": "three_daily",
-        "thrice a day": "three_daily", "thrice daily": "three_daily",
-        "3 times a day": "three_daily",
-        "as needed": "prn", "when needed": "prn", "if needed": "prn",
-    }
-    # Strip meal-timing and duration suffixes before looking up canonical form.
-    _FREQ_STRIP_RE = re.compile(
-        r"\s+(?:before|after|with)\s+(?:food|meals?|eat\w*)"
-        r"|\s+for\s+\d+\s+(?:day|week|month)\w*",
-        re.IGNORECASE,
-    )
-
-    # Sorted longest-first so substring scan prefers the most specific match.
-    _FREQ_CANON_SORTED = sorted(_FREQ_CANON, key=len, reverse=True)
-
-    def _canonical_freq(s: str) -> str | None:
-        """Map a normalised frequency string to its canonical group, or None.
-
-        Tries in order: direct lookup → slash-part lookup → longest-substring
-        scan (handles 'milligram once at night' → 'once at night' → once_daily).
-        """
-        stripped = _FREQ_STRIP_RE.sub("", s).strip()
-        if stripped in _FREQ_CANON:
-            return _FREQ_CANON[stripped]
-        for part in stripped.split("/"):
-            part = part.strip()
-            if part in _FREQ_CANON:
-                return _FREQ_CANON[part]
-        for key in _FREQ_CANON_SORTED:
-            if key in stripped:
-                return _FREQ_CANON[key]
-        return None
-
-    def _token_overlap(a: str, b: str) -> float:
-        """Token overlap Jaccard coefficient."""
-        ta = set(a.split())
-        tb = set(b.split())
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / len(ta | tb)
-
-    def _all_gold_covered(gold: str, candidate: str) -> bool:
-        """Return True if every gold token is present in (or is a prefix of) a candidate token.
-
-        Handles medical abbreviations and truncations:
-          'USG Abd' vs 'USG of abdomen'  — 'abd' is prefix of 'abdomen'
-          'Serum Creatinine' vs 'serum creat of 1.3' — 'creatinine'.startswith('creat')
-        Minimum token length 3 to avoid spurious short-token matches.
-        """
-        gt_tokens = gold.split()
-        ct_tokens = candidate.split()
-        if not gt_tokens:
-            return False
-        for gt in gt_tokens:
-            found = False
-            for ct in ct_tokens:
-                if gt == ct:
-                    found = True
-                    break
-                if len(gt) >= 3 and len(ct) >= 3 and (gt.startswith(ct) or ct.startswith(gt)):
-                    found = True
-                    break
-            if not found:
-                return False
-        return True
-
-    def _extract_quoted(criterion: str) -> str:
-        """Extract first single-quoted value from a criterion string."""
-        m = re.search(r"'([^']+)'", criterion)
-        return m.group(1) if m else criterion
-
-    def _fuzzy_match(criterion: str, field_values: list[str], *, cat: str = "") -> bool:
-        """Return True if criterion matches any of the extracted field values.
-
-        Strategy:
-        1. Extract the quoted entity from the criterion (the 'Gold Standard').
-        2. Normalise both candidate and gold.
-        3. Accept if: substring (bidirectional) OR token-overlap ≥ 0.5
-           OR all gold tokens are covered (with prefix match for abbreviations).
-        4. For medication_frequency: additionally compare canonical freq groups
-           (maps X-X-X notation ↔ English equivalents like 'twice daily').
-        """
-        gold = _normalise(_extract_quoted(criterion))
-        if not gold:
-            return False
-        gold_canon = _canonical_freq(gold) if cat == "medication_frequency" else None
-        for val in field_values:
-            candidate = _normalise(val)
-            if not candidate:
-                continue
-            if gold in candidate or candidate in gold:
-                return True
-            if _token_overlap(gold, candidate) >= 0.5:
-                return True
-            if _all_gold_covered(gold, candidate):
-                return True
-            # Frequency canonicalization: e.g. '1-0-1' == 'twice_daily' == 'twice a day'
-            if gold_canon and _canonical_freq(candidate) == gold_canon:
-                return True
-        return False
-
-    def _is_devanagari(text: str) -> bool:
-        return bool(re.search(r"[ऀ-ॿ]", text))
+    # (Scoring helpers are module-level — shared with rescore_extraction_eval.)
 
     # ── Load dataset ─────────────────────────────────────────────────────────
     dfs = [pd.read_parquet(p) for p in DATASET_FILES]
@@ -636,6 +636,59 @@ def run_extraction_eval() -> None:
     print(f"Frozen set:   {FROZEN_SET_PATH}")
 
 
+def rescore_extraction_eval(results_path: str = "outputs/extraction_baseline.json") -> None:
+    """Re-score SAVED extraction notes with the current matcher — no model calls.
+
+    Isolates matcher changes from model changes: the notes are identical, so
+    any recall shift is the scorer's doing (same pattern as re-scoring saved
+    ASR hypotheses). Rubric criteria are reloaded from the dataset because the
+    saved copies are truncated to 80 chars.
+    """
+    import pathlib
+
+    import pandas as pd
+
+    with open(results_path, encoding="utf-8") as f:
+        saved = json.load(f)
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    dfs = [
+        pd.read_parquet(root / f"eka-clinical-note-generation-dataset/test-0000{i}.parquet")
+        for i in (0, 1)
+    ]
+    df = pd.concat(dfs, ignore_index=True)
+
+    cat_rep: dict[str, int] = {}
+    cat_matched: dict[str, int] = {}
+    for sample in saved["per_sample"]:
+        idx = sample["idx"]
+        note = _note_from_dict(sample["note"])
+        is_deva = sample["language"] == "hindi_marathi"
+        for rid, cat, criterion in _parse_rubrics(str(df.loc[idx, "rubrics"])):
+            if cat in UNREPRESENTABLE_CATS or cat not in REPRESENTABLE_MAP:
+                continue
+            cat_rep[cat] = cat_rep.get(cat, 0) + 1
+            _, extractor = REPRESENTABLE_MAP[cat]
+            field_values = extractor(note)
+            if is_deva:
+                matched = bool(field_values) and _fuzzy_match(criterion, field_values, cat=cat)
+            else:
+                matched = _fuzzy_match(criterion, field_values, cat=cat)
+            if matched:
+                cat_matched[cat] = cat_matched.get(cat, 0) + 1
+
+    print(f"\nRESCORE of {results_path} with current matcher (same notes):")
+    print(f"{'Category':<35} {'Rep':>6} {'Match':>6} {'Recall':>7}")
+    print("-" * 60)
+    for cat in sorted(cat_rep):
+        rep, m = cat_rep[cat], cat_matched.get(cat, 0)
+        print(f"{cat:<35} {rep:>6} {m:>6} {m / rep:>7.3f}")
+    all_rep = sum(cat_rep.values())
+    all_m = sum(cat_matched.values())
+    print("-" * 60)
+    print(f"{'AGGREGATE':<35} {all_rep:>6} {all_m:>6} {all_m / all_rep:>7.3f}")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -649,9 +702,16 @@ if __name__ == "__main__":
         default="asr",
         help="Which stage to evaluate (default: asr)",
     )
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="extraction only: re-score saved notes with the current matcher (no model calls)",
+    )
     args = parser.parse_args()
 
     if args.stage == "asr":
         run_asr_eval()
+    elif args.rescore:
+        rescore_extraction_eval()
     else:
         run_extraction_eval()
