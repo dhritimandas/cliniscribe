@@ -506,11 +506,16 @@ def run_extraction_eval() -> None:
         # Memory discipline: the Ollama client is lightweight (HTTP), no large
         # model held resident in Python — no explicit gc needed between rows.
 
+        import dataclasses
+
         sample_results = {
             "idx": int(idx),
             "session_id": row["session_id"],
             "language": "hindi_marathi" if is_deva else "english",
             "n_rubrics": len(rubrics),
+            # Full note included so failure attribution (extraction vs
+            # routing/matching) can be analysed without re-running the model.
+            "note": dataclasses.asdict(note),
             "criteria": [],
         }
 
