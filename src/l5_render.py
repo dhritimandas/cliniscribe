@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -21,6 +22,48 @@ logger = logging.getLogger(__name__)
 
 _WARN_COLOR = colors.HexColor("#D97706")   # amber — low-confidence flag
 _DRAFT_COLOR = colors.HexColor("#DC2626")  # red — draft watermark
+
+# Dotted low-confidence flags → clinician sentences for the PDF footer.
+# Phrasing is deliberately neutral ("could not be confirmed", not "not stated
+# in audio") — a missing value may be an extraction miss of something that WAS
+# spoken; the PDF must not assert facts about the recording.
+_FLAG_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^medications\.(?P<x>.+)\.dose_unknown$"),
+     "Dose for {x} could not be confirmed — verify with the patient"),
+    (re.compile(r"^medications\.(?P<x>.+)\.unvalidated$"),
+     "'{x}' is not in the CDSCO drug list — verify the drug name"),
+    (re.compile(r"^medications\.(?P<x>.+)\.unnamed$"),
+     "A medication was mentioned without a clear name ({x}) — identify it"),
+    (re.compile(r"^diagnosis\.(?P<x>.+)\.no_transcript_overlap$"),
+     "Diagnosis '{x}' lacks clear support in the conversation — confirm"),
+    (re.compile(r"^symptoms\.(?P<x>.+)$"),
+     "Symptom '{x}' could not be confirmed — verify with the patient"),
+    (re.compile(r"^vitals\.(?P<x>.+)$"),
+     "Vital sign '{x}' could not be confirmed — re-measure if needed"),
+]
+_FIELD_LABELS: dict[str, str] = {
+    "chief_complaint": "Chief complaint",
+    "history": "History",
+    "examination": "Examination findings",
+    "diagnosis": "Diagnosis",
+    "medications": "Medications",
+    "investigations": "Ordered investigations",
+    "diagnostic_results": "Diagnostic results",
+    "advice": "Advice",
+    "follow_up": "Follow-up",
+}
+
+
+def _flag_sentence(flag: str) -> str:
+    """Translate a dotted low-confidence flag into a clinician sentence."""
+    for pattern, template in _FLAG_PATTERNS:
+        m = pattern.match(flag)
+        if m:
+            return template.format(x=m.group("x"))
+    if flag in _FIELD_LABELS:
+        return f"{_FIELD_LABELS[flag]} could not be determined — complete manually"
+    # Unknown pattern: render something readable rather than a dotted path.
+    return flag.replace("_", " ").replace(".", " — ") + " (verify)"
 
 
 def render(note: ClinicalNote, out_path: str | None = None) -> str:
@@ -189,12 +232,10 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
     if low_conf:
         story.append(Spacer(1, 4 * mm))
         story.append(
-            Paragraph(
-                f"<b>Low-confidence fields (⚑ — physician must verify):</b> "
-                + ", ".join(sorted(low_conf)),
-                warn,
-            )
+            Paragraph("<b>Items to verify before signing (⚑):</b>", warn)
         )
+        for flag in sorted(low_conf):
+            story.append(Paragraph(f"• {_flag_sentence(flag)}", warn))
 
     doc.build(story)
     logger.info("L5: rendered draft PDF → %s", path)
