@@ -22,7 +22,9 @@ Run:  PYTHONPATH=. python eval/drug_bench.py           # asr (resumable) + score
 import json
 import logging
 import os
+import re
 import tempfile
+import unicodedata
 
 from dotenv import load_dotenv
 
@@ -98,11 +100,53 @@ def run_asr(
     return results
 
 
+# ── Script-symmetric fold (scorer correctness, not recovery) ────────────────
+# Gold labels and hypotheses mix scripts and spacing for the SAME drug:
+# gold 'तेंडोलाईफ' vs hyp 'टेंडो लाइफ'; gold 'एंटीबायोटिक्स' vs hyp 'antibiotics'.
+# The ASR captured the drug — a script/spacing-blind scorer must not call it a
+# miss. Fold = coarse Devanagari→Latin + lowercase + drop non-alnum; matching
+# is EXACT equality of despaced folds over hypothesis token windows. No fuzzy
+# matching here: fuzz is how the substring false-positive bug class returns.
+_FOLD_MAP = {
+    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
+    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
+    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
+    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
+    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
+    "ज़": "z", "फ़": "f", "ा": "a", "ि": "i", "ी": "i", "ु": "u",
+    "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
+    "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
+    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+}
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
+
+
+def _fold(text: str) -> str:
+    """Coarse phonetic fold: Devanagari→Latin, lowercase, alnum+space only."""
+    folded = "".join(_FOLD_MAP.get(ch, ch) for ch in unicodedata.normalize("NFC", text))
+    return _NON_ALNUM_RE.sub("", folded.lower())
+
+
+def _folded_match(gold: str, hyp: str) -> bool:
+    """True if gold's despaced fold equals some hyp token-window's despaced fold."""
+    gold_key = _fold(gold).replace(" ", "")
+    if not gold_key:
+        return False
+    hyp_tokens = _fold(hyp).split()
+    max_n = min(len(hyp_tokens), len(gold.split()) + 2)
+    for n in range(1, max_n + 1):
+        for i in range(len(hyp_tokens) - n + 1):
+            if "".join(hyp_tokens[i : i + n]) == gold_key:
+                return True
+    return False
+
+
 def score(results: dict) -> None:
     """Score drug keywords raw vs normalized on cached hypotheses."""
     from src.l3_5_normalize import normalize
 
-    tot = {"present": 0, "miss_raw": 0, "miss_strict": 0, "miss_union": 0}
+    tot = {"present": 0, "miss_raw": 0, "miss_folded": 0,
+           "miss_strict": 0, "miss_union": 0}
     for clip in results["per_clip"]:
         ref, raw_hyp = clip["reference"], clip["raw_hypothesis"]
         kws = clip["drug_keywords"]
@@ -113,10 +157,18 @@ def score(results: dict) -> None:
         present, miss_raw = keyword_hits(ref, raw_hyp, kws)
         _, miss_strict = keyword_hits(ref, norm_hyp, kws)
         _, miss_union = keyword_hits(ref, f"{raw_hyp} {norm_hyp}", kws)
+        # folded: raw-or-normalized hyp, script/spacing-symmetric exact match
+        miss_folded = 0
+        for kw in kws:
+            p, m = keyword_hits(ref, f"{raw_hyp} {norm_hyp}", [kw])
+            if p and m and not _folded_match(kw, f"{raw_hyp} {norm_hyp}"):
+                miss_folded += 1
         clip["normalized_hypothesis"] = norm_hyp
         clip["drug"] = {"present": present, "missed_raw": miss_raw,
+                        "missed_folded": miss_folded,
                         "missed_strict": miss_strict, "missed_union": miss_union}
         for k, v in (("present", present), ("miss_raw", miss_raw),
+                     ("miss_folded", miss_folded),
                      ("miss_strict", miss_strict), ("miss_union", miss_union)):
             tot[k] += v
 
@@ -129,8 +181,10 @@ def score(results: dict) -> None:
         "drug_wer_raw": _rate(tot["miss_raw"]),
         "drug_wer_normalized_strict": _rate(tot["miss_strict"]),
         "drug_wer_normalized_union": _rate(tot["miss_union"]),
+        "drug_wer_folded": _rate(tot["miss_folded"]),
         "recovered_strict": tot["miss_raw"] - tot["miss_strict"],
         "recovered_union": tot["miss_raw"] - tot["miss_union"],
+        "recovered_folded": tot["miss_raw"] - tot["miss_folded"],
     }
     with open(RESULTS_PATH, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
