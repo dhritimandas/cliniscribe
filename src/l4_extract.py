@@ -90,6 +90,38 @@ def _parse(raw: str) -> dict:
     return json.loads(_strip_fences(raw))
 
 
+# Generic terms that must never populate a drug NAME on a prescription:
+# "the doctor gave medicine" is not a prescribable entry. Matching is
+# whole-string after normalisation ("syrup" is generic; "Benadryl cough
+# syrup" is not). Devanagari "X की दवा(ई)" phrases are caught by the
+# generic-head rule in _is_generic_drug_name.
+_GENERIC_DRUG_TERMS: frozenset[str] = frozenset(
+    {
+        "medicine", "medicines", "medication", "medications",
+        "tablet", "tablets", "capsule", "capsules",
+        "syrup", "cough syrup", "injection", "gel", "cream",
+        "ointment", "drops", "painkiller", "pain killer",
+        "dawai", "dawa",
+        "दवाई", "दवा", "दवाइयां", "टैबलेट", "जेल", "इंजेक्शन", "सिरप",
+    }
+)
+# Devanagari generic head nouns: a name ENDING in one of these ("डायबिटीज की
+# दवाई" = "diabetes medicine") is generic unless some token validates in CDSCO.
+_GENERIC_HEAD_TOKENS: frozenset[str] = frozenset({"दवाई", "दवा", "दवाइयां"})
+
+
+def _is_generic_drug_name(drug: str) -> bool:
+    """Return True if the extracted drug string names no identifiable drug."""
+    norm = " ".join(drug.lower().split())
+    if norm in _GENERIC_DRUG_TERMS:
+        return True
+    tokens = norm.split()
+    if tokens and tokens[-1] in _GENERIC_HEAD_TOKENS:
+        # "X की दवाई" — generic unless any token is a real CDSCO drug.
+        return not any(validate_drug(t) for t in tokens if len(t) >= 4)
+    return False
+
+
 _TOKEN_RE = re.compile(r"[a-z]+", re.IGNORECASE)
 _MIN_OVERLAP_TOKEN_LEN = 4  # ignore short words (conjunctions, articles, etc.)
 # Speaker-role prefix tokens that appear in every turn and must be excluded
@@ -153,10 +185,26 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     ]
 
     medications: list[Medication] = []
+    low_conf: list[str] = list(data.get("low_confidence_fields") or [])
+    n_unnamed = 0
     for m in (data.get("medications") or []):
         drug = (m.get("drug") or "").strip()
         if not drug:
             continue
+        if _is_generic_drug_name(drug):
+            # A generic term ("medicine", "दवाई") must never appear as a drug
+            # NAME on a prescription. Keep the row — its dose/frequency/
+            # duration may be real — but mark it unnamed and low-confidence.
+            # Numbered so multiple unnamed rows get distinct flags.
+            n_unnamed += 1
+            label = f"unnamed medication {n_unnamed}"
+            logger.warning(
+                "L4: generic drug name %r converted to %r", drug, label
+            )
+            flag = f"medications.{label}.unnamed"
+            if flag not in low_conf:
+                low_conf.append(flag)
+            drug = label
         medications.append(
             Medication(
                 drug=drug,
@@ -167,8 +215,6 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 validated=validate_drug(drug),
             )
         )
-
-    low_conf: list[str] = list(data.get("low_confidence_fields") or [])
 
     # Hallucination calibration: flag any diagnosis whose term shares no word
     # with the transcript. This catches the most egregious fabrications (e.g.
@@ -193,7 +239,9 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 )
 
     for med in medications:
-        if not med.validated:
+        if not med.validated and not med.drug.startswith("unnamed medication"):
+            # unnamed rows already carry a .unnamed flag; .unvalidated would
+            # double-flag the same problem.
             flag = f"medications.{med.drug}.unvalidated"
             if flag not in low_conf:
                 low_conf.append(flag)
