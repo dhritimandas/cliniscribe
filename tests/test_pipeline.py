@@ -41,6 +41,7 @@ def stubbed_stages(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "normalize", lambda turns: turns)
     monkeypatch.setattr(pipeline, "extract", lambda turns: _NOTE)
     monkeypatch.setattr(pipeline, "render", fake_render)
+    monkeypatch.setattr(pipeline, "warm_llm", lambda: None)  # no Ollama in tests
     return tmp_path
 
 

@@ -6,7 +6,7 @@ import logging
 import torch
 from faster_whisper import WhisperModel
 
-from src import config
+from src import config, telemetry
 from src.types import Segment, Turn
 
 # Doctor heuristic: bag-of-words score over transcribed text.
@@ -43,12 +43,18 @@ def _doctor_score(text: str) -> int:
     return sum(1 for t in tokens if t.strip(".,?!।") in _DOCTOR_TOKENS)
 
 
-def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
+def transcribe(
+    wav_path: str, segments: list[Segment], model: WhisperModel | None = None
+) -> list[Turn]:
     """Transcribe each diarized segment and assign a speaker role.
 
     Args:
         wav_path: Path to a 16 kHz mono WAV file (output of L1).
         segments: Diarized segments from L2.
+        model: Optional preloaded WhisperModel. When provided it is used as-is
+            and NOT released — for eval harnesses iterating many clips, where
+            per-clip model loading dominates runtime. Production passes None:
+            load, use, release (the 24 GB memory discipline).
 
     Returns:
         List of Turn(speaker_role, text, start, end) in chronological order.
@@ -63,8 +69,11 @@ def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
         Marathi code-switching. task="transcribe" is explicit to prevent
         translation even if Whisper internally detects a non-English segment.
     """
-    model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
-    logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
+    owns_model = model is None
+    if owns_model:
+        with telemetry.timer("l3.model_load"):
+            model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
+        logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
 
     raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
     for seg in segments:
@@ -82,10 +91,11 @@ def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
         if text:
             raw_turns.append((seg.speaker, text, seg.start, seg.end))
 
-    del model
-    gc.collect()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    if owns_model:
+        del model
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     if not raw_turns:
         return []

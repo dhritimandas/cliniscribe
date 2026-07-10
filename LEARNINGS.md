@@ -764,3 +764,207 @@ jargon without a one-line definition):
 ### (c) Fine-tuning hook
 <one thing that will matter when we fine-tune later>
 ```
+
+---
+
+## Phase B Hardening — Honest rulers, context windows, and the drug bench (2026-07-10)
+
+### (a) What this phase does
+This phase repaired the measurement instruments (the "rulers") and the two worst
+production defects they had been hiding, then built a drug-keyword bench large
+enough to say something real about drug-name recovery. The eval scorer moved from
+substring matching (which counted "ors" as found inside "doctors") to
+token-boundary matching, the L4 extractor got the context window it silently
+lacked, and a 49-clip frozen drug bench replaced a 7-term sample that could not
+measure recovery at all. Every fix was measured on frozen data before and after,
+with the drug-bench holdout kept blind to all fix decisions.
+
+### (b) Hardest bugs
+
+1. **Six of twelve Hindi/Marathi consultations extracted nothing — blamed on the
+   model, caused by a config default.** Root cause: `extract()` never set
+   Ollama's `num_ctx`, and the default (4096 tokens) silently truncates long
+   Devanagari transcripts (a 5.4k-character transcript is ~5,000 tokens — 
+   Devanagari costs roughly one token per character). The truncation cut off the
+   system prompt containing the JSON schema, so the model returned literally
+   `{}`. The failure correlated perfectly with transcript LENGTH, not script or
+   language — that correlation, visible in ten minutes of static analysis, was
+   the tell that pointed away from the "3B Devanagari capability gap" hypothesis
+   the previous phase had recorded. Fix: `EXTRACT_NUM_CTX=16384`. All five
+   previously-empty samples now produce full notes; frozen-set aggregate recall
+   rose 0.306 → 0.495. Lesson (fourth occurrence): when a model "fails", first
+   prove the model actually SAW the input.
+
+2. **The drug normalizer's new fuzzy tier deleted a dose.** Extending fuzzy
+   CDSCO matching to Latin spans made "paracetamol 625" match the canonical
+   entry "paracetamol" (similarity 0.88) — and the substitution replaced the
+   span, silently discarding "625". Root cause: span-replacement semantics
+   assumed the canonical form carries at least as much information as the span
+   it replaces, which is false whenever the canonical is a prefix of a
+   drug+dose phrase. On a prescription, a deleted dose is a patient-safety
+   incident, not a rounding error. Fix: a substitution may never remove a digit
+   token that does not survive in the canonical form; regression-tested. Lesson:
+   any automatic text substitution in a clinical pipeline needs an information-
+   preservation invariant, not just a similarity threshold.
+
+### (c) Fine-tuning hook
+The 49-clip drug bench decomposes drug misses into classes with different owners:
+distorted-but-present forms dominate (15 of 18 dev misses), and a measured subset
+is text-recoverable (dev drug WER 0.750 → 0.600 via the Latin-span tier plus
+script-symmetric scoring). The residual distorted class — Devanagari brand
+variants like जिफिट for ज़ीफी (Zifi) at ~0.67 similarity — sits BELOW any safe
+substitution threshold: mapping it by text risks substituting the wrong drug.
+That class is precisely what ASR fine-tuning on a domain corpus should fix, and
+the bench now provides the frozen before-number and metric ladder
+(raw → normalized → folded) to prove whether it did. Open hypothesis for a fresh
+bench slice (rows 60+): extending the Latin fuzzy tier's lexicon from CDSCO-only
+to include curated brand values would recover 1-char Latin brand distortions
+("glycomate" → Glycomet); it was discovered by inspecting the holdout, so it
+must be validated on data neither dev nor holdout has touched.
+
+---
+
+## Phase B Hardening (2) — Long measurements on a laptop, and closing the original 0/7 (2026-07-10)
+
+### (a) What this phase does
+This phase made multi-hour benchmark runs survivable on a MacBook that sleeps,
+restarts its tooling, and throttles background work — and then used the finished
+bench to answer the question that started it: are the original seven missed drug
+terms still missed? Compute now runs detached from the assistant session with
+per-clip caching, so any interruption costs at most one clip. The verdict on the
+original seven: one recovered, and the other six are provably not text-recoverable
+— a decomposition, not an excuse.
+
+### (b) Hardest bugs
+
+1. **Background workers kept dying, three different ways, and each looked like
+   the same mystery.** Root causes, once separated: (i) benchmark processes were
+   children of the assistant session, so every session restart reaped them; (ii)
+   macOS puts orphaned "nohup" processes into background quality-of-service — a
+   scheduling class that confines them to efficiency cores, silently capping each
+   at ~87% of one core; (iii) laptop sleep paused what survived overnight (5 clips
+   progressed in 8 hours). No single observation distinguished these — the fix
+   required treating them as a stack: detach the process tree (nohup + disown, so
+   the work outlives the session), lift the QoS clamp (taskpolicy), and hold the
+   machine awake for the run's duration (caffeinate with a time cap). Lesson:
+   "the job died" is not a root cause; process lifecycle, scheduler class, and
+   power state fail independently and must be ruled out independently.
+
+2. **A completion check that could never fire.** The waiter tested "50 clips
+   cached" because the bench spans 50 dataset rows — but the dataset contains a
+   duplicate transcript hash, so 50 rows yield 49 unique clips. The workers all
+   exited successfully while the monitor waited forever for a 50th clip that
+   does not exist. Root cause: conflating row COUNT with unique IDENTITY —
+   the same class of error as double-counting a patient who registered twice.
+   Lesson: completion conditions must be derived from the same identity key the
+   work is deduplicated by, never from the input's nominal size.
+
+### (c) Fine-tuning hook
+The original seven misses are now fully attributed: 1 recovered by the Latin-span
+tier + fold-symmetric scoring (Augmentin 650 mg), 3 are gold-labeling artifacts
+(generic words — "medicine(s)" — that our own prescription layer refuses to treat
+as drug names), 2 are true acoustic drops (sunscreen, Fluconazole — better
+microphone, not better models), and 1 is an out-of-lexicon Ayurvedic compound.
+Combined with the 49-clip bench (dev drug WER 0.750 → 0.600 after text fixes),
+the text-processing ceiling is now measured on two frozen sets. Everything above
+that ceiling and below the true-drop floor is the ASR fine-tuning target, and the
+per-class attribution means a future fine-tune can be scored on exactly the class
+it claims to fix — distorted-but-present drug tokens — rather than on an average
+that mixes in unfixable misses.
+
+---
+
+## Latency Phase — Instrument first, and the fix that failed its own gate (2026-07-10)
+
+### (a) What this phase does
+This phase measured where the pipeline's time actually goes before optimizing
+anything, then tested three latency levers against a hard rule: no accuracy
+change. Instrumentation (per-stage wall clock, model-load times, peak memory,
+written per session) showed transcription is 82–92% of end-to-end time and
+everything else is almost irrelevant. One lever shipped (warming the LLM during
+an earlier CPU-light stage), and two were measured and rejected — including the
+one we had believed in for weeks.
+
+### (b) Hardest bugs
+
+1. **Whole-file ASR — the designed fix — regressed the patient-safety metric
+   and was rejected.** The plan (recorded in HANDOFF since Phase A) was to stop
+   decoding per diarized segment and transcribe the whole file once, attaching
+   words to speakers by timestamp. Implemented and measured on the frozen set:
+   overall word error IMPROVED (0.52 → 0.43) but keyword error — drug names,
+   clinical terms — regressed badly (0.57 → 0.79). Root cause: one whole-file
+   pass locks the clip into a single detected language, so English clinical
+   terms embedded in Hindi speech get phonetically absorbed into Devanagari
+   ("lab test" → "लाप टेस्ट"). The per-segment decoding we wanted to remove was
+   accidentally PROTECTING code-switched terms, because each short segment
+   re-detects its own language. The documented flag for this (multilingual=True)
+   measured byte-identical — inert on clips short enough to fit one internal
+   chunk. Lesson: an improvement on the headline metric can be a regression on
+   the metric that matters; and a "textbook fix" is a hypothesis until measured.
+
+2. **Attribution under noise: the totals moved the wrong way while the change
+   worked.** After shipping the LLM warm-up, end-to-end totals LOOKED 14–16%
+   worse — because transcription (untouched by the change) drifted with thermal
+   state between runs, swamping the real gain. The honest resolution was a
+   variance envelope: isolate the changed stage and repeat it — warm inference
+   spread was 0.4s across runs while the cold-start penalty was 12.8s, so the
+   improvement is ~30x the noise floor. Lesson: when the dominant stage is
+   noisy, never present end-to-end totals as evidence about a non-dominant
+   stage; measure the changed stage against its own repeat-variance.
+
+### (c) Fine-tuning hook
+The latency ceiling is transcription itself: ~20x real-time on CPU with the
+current model, and both safe software levers are exhausted (whole-file decoding
+fails the accuracy gate; more threads are slower on this chip). The remaining
+latency moves are (1) hiding transcription inside recording time — designed,
+deferred until a capture UI exists (docs/incremental_capture_design.md) — and
+(2) a smaller or quantized ASR model, which is an ACCURACY decision, not a
+latency one: any model swap must clear the frozen keyword/drug-WER gate first,
+and the code-switch absorption failure above predicts exactly where a smaller
+model will break.
+
+---
+
+## L4/L5 Defects Phase — Attribute before you fix (2026-07-10)
+
+### (a) What this phase does
+This phase took the three worst product-facing defects — missing symptoms and
+vitals, generic words appearing as drug names on prescriptions, and
+developer-notation warnings in the PDF — and attributed each failure to its true
+layer before touching any code. The attribution changed the fix list: half the
+"model failures" were the evaluation matcher, none were the PDF renderer, and
+none were absent from the audio. Fixes then landed where the evidence pointed:
+matcher synonym canons, a generic-term guard with dose/frequency preservation,
+and plain-language footer sentences.
+
+### (b) Hardest bugs
+
+1. **The automated failure classifier called 6 of 7 cases "not in the
+   transcript" — and manual review overturned every one of them.** Root cause:
+   the transcript-scan matcher was synonym-blind. "Peripheral oxygen saturation"
+   IS in the transcript — as "SpO2"; "136/88 mmHg" is there as "136" and "88"
+   spoken separately. An automated attribution tool inherits every blind spot of
+   the matcher it is built from, so its "not-a-bug" class — the one that closes
+   issues — is exactly where its errors concentrate. The advisor-mandated manual
+   spot-check of that class was the only thing standing between us and closing
+   six real, fixable misses as dataset noise. Lesson: when a classifier's output
+   decides what gets IGNORED, audit that class by hand, always.
+
+2. **Flag strings collided when two medications had no name.** Converting
+   generic drug mentions ("medicine", "दवाई") to "unnamed medication" made two
+   such rows produce identical low-confidence flags — and the dedup logic
+   silently dropped one, so a prescription with two unnamed drugs would warn the
+   physician about only one. Root cause: flags were keyed by drug NAME, and the
+   fix made names non-unique. Caught in advisor review before shipping; fixed by
+   numbering ("unnamed medication 1", "unnamed medication 2"). Lesson: any
+   transformation that maps distinct entities onto one label must check every
+   downstream consumer that assumed the label was a key.
+
+### (c) Fine-tuning hook
+The corrected split (57% extraction / 43% matcher / 0% rendering) gives the
+first clean per-layer error budget for symptoms and vitals. The extraction
+misses cluster on a specific behavior — vitals spoken as ranges ("BP has been
+130 to 140") that the model does not lift into the vitals list — which is a
+concrete, few-shot-teachable pattern for either prompt work or a future
+fine-tune, and the matcher canons mean any gain will now actually show up in
+the score instead of being eaten by synonym mismatches.

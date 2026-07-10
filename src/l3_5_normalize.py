@@ -205,18 +205,47 @@ def _cdsco_fuzzy(roman: str) -> str | None:
     return best_name if best_r >= _DRUG_FUZZY_THRESHOLD else None
 
 
-def _normalize_drug_text(text: str) -> str:
-    """Apply 3-tier Devanagari→Latin drug normalization to a single string.
+# Latin spans are only fuzzy-matched when they contain a plausible drug-like
+# token: alphabetic, >= 5 chars, and not a common clinical/conversation word.
+# Whisper writes distorted drug names in Latin too ("gmenti 625" for
+# "Augmentin 625"); those spans previously bypassed all tiers because the
+# drug pass examined Devanagari-containing windows only.
+_LATIN_SPAN_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "tablet", "tablets", "capsule", "capsules", "syrup", "injection",
+        "medicine", "medicines", "doctor", "patient", "morning", "evening",
+        "night", "before", "after", "fever", "infection", "pressure",
+        "sugar", "blood", "test", "tests", "report", "daily", "times",
+        "twice", "thrice", "water", "days", "weeks", "month", "months",
+        "please", "problem", "little", "right", "there", "these", "those",
+        "about", "again", "because", "table", "would", "should", "could",
+    }
+)
 
-    Processes windows of 3, 2, 1 tokens (longest match wins). Only windows
-    containing at least one Devanagari token are examined. Already-covered
+
+def _latin_span_candidate(span: list[str]) -> bool:
+    """True if an all-Latin span is worth trying against the CDSCO tiers."""
+    alpha = [t for t in span if t.isalpha()]
+    if not any(len(t) >= 5 for t in alpha):
+        return False
+    return not any(t.lower() in _LATIN_SPAN_STOPWORDS for t in alpha)
+
+
+def _normalize_drug_text(text: str) -> str:
+    """Apply 3-tier drug normalization to a single string.
+
+    Processes windows of 3, 2, 1 tokens (longest match wins). Windows with
+    Devanagari tokens go through curated-table → ITRANS+CDSCO-exact →
+    CDSCO-fuzzy. All-Latin windows that look drug-like (see
+    _latin_span_candidate) go through CDSCO-exact → CDSCO-fuzzy with the
+    same thresholds — Whisper distorts Latin drug names too. Already-covered
     positions are skipped.
 
     Args:
-        text: Raw ASR hypothesis string (may contain Devanagari tokens).
+        text: Raw ASR hypothesis string.
 
     Returns:
-        String with matched Devanagari drug spans replaced by their Latin forms.
+        String with matched drug spans replaced by their canonical forms.
     """
     tokens = text.split()
     hits: dict[tuple[int, int], str] = {}  # (start, end) → latin
@@ -224,26 +253,42 @@ def _normalize_drug_text(text: str) -> str:
     for window in (3, 2, 1):
         for i in range(len(tokens) - window + 1):
             span = tokens[i : i + window]
-            if not any(_is_devanagari(t) for t in span):
-                continue
             if any(s <= i < e or s < i + window <= e for (s, e) in hits):
                 continue
 
             span_text = " ".join(span)
 
-            latin = _DEVA_CURATED.get(span_text.strip())
-            if latin:
-                hits[(i, i + window)] = latin
+            if any(_is_devanagari(t) for t in span):
+                latin = _DEVA_CURATED.get(span_text.strip())
+                if latin:
+                    hits[(i, i + window)] = latin
+                    continue
+
+                roman = _itrans_romanize(span_text)
+                latin = _cdsco_exact(roman)
+                if latin:
+                    hits[(i, i + window)] = latin
+                    continue
+
+                latin = _cdsco_fuzzy(roman)
+                if latin:
+                    hits[(i, i + window)] = latin
                 continue
 
-            roman = _itrans_romanize(span_text)
-            latin = _cdsco_exact(roman)
-            if latin:
-                hits[(i, i + window)] = latin
-                continue
-
-            latin = _cdsco_fuzzy(roman)
-            if latin:
+            if _latin_span_candidate(span):
+                roman = span_text.lower()
+                latin = _cdsco_exact(roman)
+                if latin is None:
+                    latin = _cdsco_fuzzy(roman)
+                if latin is None or latin.lower() == roman:
+                    # No hit, or span already equals the canonical form.
+                    continue
+                # Substitution must never delete dose information: every
+                # digit token in the span must survive in the canonical
+                # ("paracetamol 625" → "paracetamol" would drop the dose).
+                span_digits = [t for t in span if any(ch.isdigit() for ch in t)]
+                if any(d not in latin for d in span_digits):
+                    continue
                 hits[(i, i + window)] = latin
 
     if not hits:

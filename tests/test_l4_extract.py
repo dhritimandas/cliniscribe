@@ -490,3 +490,84 @@ def test_extract_live_returns_valid_schema() -> None:
     assert isinstance(note.low_confidence_fields, list)
     assert isinstance(note.diagnosis, list)
     assert isinstance(note.medications, list)
+
+
+# ── Generic-term leak (B2): दवाई/"medicine" must never be a drug NAME ──────
+
+
+def test_generic_drug_name_becomes_unnamed_medication() -> None:
+    from src.l4_extract import _build_note
+
+    data = {
+        "medications": [
+            {"drug": "medicine", "dose": None, "frequency": "twice daily"},
+        ]
+    }
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+    assert note.medications[0].frequency == "twice daily"  # info preserved
+    assert "medications.unnamed medication 1.unnamed" in note.low_confidence_fields
+
+
+def test_generic_devanagari_drug_name_becomes_unnamed() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "दवाई", "dose": None}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+
+
+def test_devanagari_generic_head_phrase_is_generic() -> None:
+    # "डायबिटीज की दवाई" = "diabetes medicine" — no identifiable drug.
+    from src.l4_extract import _is_generic_drug_name
+
+    assert _is_generic_drug_name("डायबिटीज की दवाई") is True
+
+
+def test_branded_compound_is_not_generic() -> None:
+    from src.l4_extract import _is_generic_drug_name
+
+    assert _is_generic_drug_name("Benadryl cough syrup") is False
+    assert _is_generic_drug_name("Paracetamol 650") is False
+
+
+def test_bare_form_words_are_generic() -> None:
+    from src.l4_extract import _is_generic_drug_name
+
+    for term in ("cough syrup", "tablet", "injection", "Medicines"):
+        assert _is_generic_drug_name(term) is True, term
+
+
+def test_two_unnamed_medications_get_distinct_flags() -> None:
+    from src.l4_extract import _build_note
+
+    data = {
+        "medications": [
+            {"drug": "medicine", "frequency": "1-0-1"},
+            {"drug": "दवा", "frequency": "0-0-1"},
+        ]
+    }
+    note = _build_note(data)
+    assert [m.drug for m in note.medications] == [
+        "unnamed medication 1",
+        "unnamed medication 2",
+    ]
+    flags = [f for f in note.low_confidence_fields if f.endswith(".unnamed")]
+    assert len(flags) == 2  # no collision
+
+
+def test_unnamed_medication_not_double_flagged_unvalidated() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "medicine"}]}
+    note = _build_note(data)
+    unvalidated = [f for f in note.low_confidence_fields if f.endswith(".unvalidated")]
+    assert unvalidated == []
+
+
+def test_real_drug_name_untouched_by_generic_filter() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "Paracetamol", "dose": "650 mg"}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "Paracetamol"
