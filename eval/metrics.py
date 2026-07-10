@@ -55,12 +55,31 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return _jiwer_wer(ref, hyp)
 
 
+def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
+    """Return True if needle appears as a contiguous token subsequence of haystack.
+
+    Tokens must match exactly — no substring or affix tolerance. A glued
+    alphanumeric hypothesis token (e.g. "paracetamol500") does NOT match the
+    keyword token "paracetamol"; this strictness is deliberate (no such glued
+    tokens occur in the frozen bench) and is fixture-tested so the decision
+    stays visible. Revisit only with evidence from real data.
+    """
+    n = len(needle)
+    if n == 0 or n > len(haystack):
+        return False
+    return any(haystack[i : i + n] == needle for i in range(len(haystack) - n + 1))
+
+
 def keyword_hits(reference: str, hypothesis: str, keywords: list[str]) -> tuple[int, int]:
     """Count reference keywords and how many are missing from the hypothesis.
 
     A keyword "counts" only if it appears in the reference (gold spans should
-    guarantee this, but we filter defensively). It is "missed" if its
-    normalized form is not a substring of the normalized hypothesis.
+    guarantee this, but we filter defensively). Matching is token-boundary:
+    after normalization, the keyword's token sequence must appear as a
+    contiguous, ordered token subsequence — never as a substring inside a
+    longer token ("ors" does not match "doctors"; "dolo" does not match
+    "dolores"). Works uniformly for Latin and Devanagari because both are
+    whitespace-tokenized after normalize_text.
 
     Args:
         reference: Ground-truth transcript.
@@ -72,10 +91,19 @@ def keyword_hits(reference: str, hypothesis: str, keywords: list[str]) -> tuple[
         many of those are absent from the hypothesis. Enables micro-averaging
         across a corpus (sum missed / sum present).
     """
-    norm_ref = normalize_text(reference)
-    norm_hyp = normalize_text(hypothesis)
-    present = [k for k in keywords if normalize_text(k) and normalize_text(k) in norm_ref]
-    missed = sum(1 for k in present if normalize_text(k) not in norm_hyp)
+    # Hyphens are token boundaries for keyword matching ("stress" is captured
+    # by "stress-related"), applied uniformly to keyword, reference, and
+    # hypothesis. Scoped here — normalize_text (and thus WER) is untouched.
+    def _kw_tokens(text: str) -> list[str]:
+        return normalize_text(text).replace("-", " ").split()
+
+    ref_tokens = _kw_tokens(reference)
+    hyp_tokens = _kw_tokens(hypothesis)
+    keyword_token_lists = [_kw_tokens(k) for k in keywords]
+    present = [
+        kt for kt in keyword_token_lists if kt and _contains_token_sequence(ref_tokens, kt)
+    ]
+    missed = sum(1 for kt in present if not _contains_token_sequence(hyp_tokens, kt))
     return len(present), missed
 
 
@@ -83,7 +111,7 @@ def keyword_wer(reference: str, hypothesis: str, keywords: list[str]) -> float:
     """Compute keyword error rate over clinically critical terms.
 
     Defined as 1 - recall: of the keywords that genuinely appear in the
-    reference, the fraction NOT reproduced (as a normalized substring) in the
+    reference, the fraction NOT reproduced (as a token-boundary match) in the
     hypothesis. This is the patient-safety view — a missed drug name or dosage
     is the error that matters, regardless of surrounding-word accuracy.
 

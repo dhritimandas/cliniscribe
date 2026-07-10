@@ -2,7 +2,6 @@
 
 import logging
 import os
-import tempfile
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -24,7 +23,7 @@ _WARN_COLOR = colors.HexColor("#D97706")   # amber — low-confidence flag
 _DRAFT_COLOR = colors.HexColor("#DC2626")  # red — draft watermark
 
 
-def render(note: ClinicalNote) -> str:
+def render(note: ClinicalNote, out_path: str | None = None) -> str:
     """Render a ClinicalNote as a draft prescription PDF.
 
     Output is watermarked DRAFT. low_confidence_fields and unvalidated
@@ -33,13 +32,15 @@ def render(note: ClinicalNote) -> str:
 
     Args:
         note: Structured clinical note from L4.
+        out_path: Destination PDF path. The pipeline passes the session-scoped
+            path (outputs/<session_id>/draft_rx.pdf). Defaults to
+            outputs/draft_rx.pdf for direct/dev use (overwritten per run).
 
     Returns:
-        Absolute path to the generated PDF in outputs/.
+        Path to the generated PDF.
     """
-    os.makedirs("outputs", exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix="_draft_rx.pdf", dir="outputs")
-    os.close(fd)
+    path = out_path or os.path.join("outputs", "draft_rx.pdf")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     doc = SimpleDocTemplate(
         path,

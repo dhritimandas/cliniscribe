@@ -14,7 +14,7 @@ VAD_TOP_DB = 40  # dB below peak to treat as silence
 logger = logging.getLogger(__name__)
 
 
-def preprocess(in_path: str, *, denoise: bool = False) -> str:
+def preprocess(in_path: str, *, denoise: bool = False, out_dir: str = "outputs") -> str:
     """Resample audio to 16 kHz mono WAV, optionally denoise, drop long silences.
 
     Args:
@@ -22,9 +22,12 @@ def preprocess(in_path: str, *, denoise: bool = False) -> str:
         denoise: Apply stationary noise reduction (default OFF). EkaCare's
             denoising-impact study shows aggressive reduction can degrade WER;
             benchmark with/without before enabling for a given noise profile.
+        out_dir: Directory for the processed WAV. The pipeline passes the
+            session directory (outputs/<session_id>/) so all artifacts of one
+            consultation share a location; defaults to outputs/ for direct use.
 
     Returns:
-        Path to the processed 16 kHz mono WAV file under outputs/.
+        Path to the processed 16 kHz mono WAV file under out_dir.
     """
     audio, _ = librosa.load(in_path, sr=TARGET_SR, mono=True)
 
@@ -34,8 +37,8 @@ def preprocess(in_path: str, *, denoise: bool = False) -> str:
     audio, _ = librosa.effects.trim(audio, top_db=VAD_TOP_DB)
 
     stem = os.path.splitext(os.path.basename(in_path))[0]
-    out_path = os.path.join("outputs", f"{stem}_16k.wav")
-    os.makedirs("outputs", exist_ok=True)
+    out_path = os.path.join(out_dir, f"{stem}_16k.wav")
+    os.makedirs(out_dir, exist_ok=True)
     sf.write(out_path, audio, TARGET_SR, subtype="PCM_16")
 
     logger.info("L1: %s → %s (%.1fs)", in_path, out_path, len(audio) / TARGET_SR)

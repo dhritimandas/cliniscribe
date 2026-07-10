@@ -2,11 +2,20 @@
 
 Stages execute sequentially. Each model is loaded, used, and released before
 the next stage begins — never hold ASR and LLM in memory simultaneously.
+
+All artifacts of one consultation live under outputs/<session_id>/:
+the preprocessed audio, the speaker-attributed transcript, the structured
+note, the draft PDF, and (future) physician corrections share that one ID.
 """
 
+import dataclasses
 import gc
+import json
 import logging
+import os
 import sys
+import time
+import uuid
 
 from dotenv import load_dotenv
 
@@ -16,22 +25,43 @@ from src.l3_asr import transcribe
 from src.l3_5_normalize import normalize
 from src.l4_extract import extract
 from src.l5_render import render
+from src.types import Turn
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+OUTPUTS_ROOT = "outputs"
 
-def run(in_path: str) -> str:
+
+def new_session_id() -> str:
+    """Return a sortable, collision-safe session ID (timestamp + 6 hex chars)."""
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _write_turns(turns: list[Turn], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([dataclasses.asdict(t) for t in turns], f, ensure_ascii=False, indent=2)
+
+
+def run(in_path: str, session_id: str | None = None) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
     Args:
         in_path: Path to the input audio file.
+        session_id: Consultation session ID; generated when omitted. All
+            artifacts are written under outputs/<session_id>/.
 
     Returns:
-        Path to the generated draft prescription PDF.
+        Path to the generated draft prescription PDF
+        (outputs/<session_id>/draft_rx.pdf).
     """
+    session_id = session_id or new_session_id()
+    session_dir = os.path.join(OUTPUTS_ROOT, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    logger.info("Session %s → %s", session_id, session_dir)
+
     logger.info("L1: preprocessing %s", in_path)
-    wav_path = preprocess(in_path)
+    wav_path = preprocess(in_path, out_dir=session_dir)
     gc.collect()
 
     logger.info("L2: diarizing %s", wav_path)
@@ -45,13 +75,16 @@ def run(in_path: str) -> str:
     logger.info("L3.5: normalizing %d turns", len(turns))
     turns = normalize(turns)
     gc.collect()
+    _write_turns(turns, os.path.join(session_dir, "transcript.json"))
 
     logger.info("L4: extracting clinical entities")
     note = extract(turns)
     gc.collect()
+    with open(os.path.join(session_dir, "note.json"), "w", encoding="utf-8") as f:
+        json.dump(dataclasses.asdict(note), f, ensure_ascii=False, indent=2)
 
     logger.info("L5: rendering prescription PDF")
-    pdf_path = render(note)
+    pdf_path = render(note, out_path=os.path.join(session_dir, "draft_rx.pdf"))
     gc.collect()
 
     logger.info("Done: %s", pdf_path)

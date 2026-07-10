@@ -97,13 +97,18 @@ class ClinicalNote:
 ```
 
 ```python
-def preprocess(in_path: str) -> str           # L1  → denoised 16kHz mono wav path
+def preprocess(in_path: str, *, denoise: bool = False, out_dir: str = "outputs") -> str  # L1 → 16kHz mono wav path
 def diarize(wav_path: str) -> list[Segment]   # L2  → diarized segments
 def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]  # L3 → attributed turns
 def normalize(turns: list[Turn]) -> list[Turn]  # L3.5 → normalized turns
 def extract(turns: list[Turn]) -> ClinicalNote  # L4  → structured JSON
-def render(note: ClinicalNote) -> str           # L5  → pdf path
+def render(note: ClinicalNote, out_path: str | None = None) -> str  # L5 → pdf path
 ```
+
+All artifacts of one consultation are session-scoped: `pipeline.run(in_path,
+session_id=None)` generates a session ID when omitted and writes the
+preprocessed audio, `transcript.json`, `note.json`, and `draft_rx.pdf` under
+`outputs/<session_id>/` (future physician corrections land there too).
 
 ## L4 Output Schema (spec §3.5)
 
