@@ -41,10 +41,11 @@ Do not supply a standard or typical dose. null means unknown.
 3. Add the field name to low_confidence_fields whenever you are uncertain about \
 a value or the value is absent but clinically expected.
 4. If the transcript already contains a clinical synonym in parentheses \
-(e.g. "sugar (Type 2 Diabetes Mellitus)"), extract that parenthetical term. \
-Do NOT add parenthetical clinical terms yourself — only use what is explicitly \
-written in the transcript. This rule exists for L3.5-normalised transcripts; \
-if no parenthetical is present, extract only what is said.
+— a lay term followed by its clinical name, e.g. "<lay term> (<clinical term>)" \
+— extract that parenthetical term. Do NOT add parenthetical clinical terms \
+yourself — only use what is explicitly written in the transcript. This rule \
+exists for L3.5-normalised transcripts; if no parenthetical is present, \
+extract only what is said.
 5. Extract only what is spoken. Do not add clinical knowledge not present \
 in the transcript.
 6. Use the language of the transcript for text fields. Do not translate.
@@ -55,10 +56,12 @@ explicitly denied (e.g. "no vomiting"). severity and since are null unless state
 temperature, weight). Only include a vital when a measured value is spoken. \
 Never invent a measurement.
 9. INVESTIGATIONS are tests the doctor ORDERS for later (e.g. "get a CBC"). \
-DIAGNOSTIC_RESULTS are results already available in the consultation \
-(e.g. "Hb is 9.2", "raised cholesterol", "HbA1c 9.1", "Vitamin D low", \
-"Total IGE 2107"). Extract each as a separate string. \
-Do not put ordered tests in diagnostic_results; do not put lab results in history.
+DIAGNOSTIC_RESULTS are results already available in the consultation — a test \
+name paired with its stated value or qualitative finding, exactly as spoken. \
+Extract each as a separate string. Do not put ordered tests in \
+diagnostic_results; do not put lab results in history. Never copy a value \
+from these instructions — only extract values actually spoken in the \
+transcript below.
 10. examination is free text describing physical-exam findings \
 (e.g. "abdomen soft, mild tenderness"). null if no exam is described.
 11. FREQUENCY is the dosing schedule — how often and when during the day: \
@@ -153,6 +156,27 @@ def _diagnosis_has_overlap(term: str, transcript_tokens: set[str]) -> bool:
     return bool(term_tokens & transcript_tokens)
 
 
+def _iter_dicts(items: list, field_name: str) -> list[dict]:
+    """Filter a list field to well-formed dict items, skipping malformed ones.
+
+    A malformed model response (e.g. a raw string mixed into a structured list
+    field — observed on a live sample where "vitals" contained a garbled
+    ["...", "examination: null", "diagnosis: null", ...] tail from a JSON
+    formatting slip) must degrade to a partial note, never crash the whole
+    extraction. Mirrors the tolerance investigations/diagnostic_results
+    already get via _coerce_str.
+    """
+    valid: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            valid.append(item)
+        else:
+            logger.warning(
+                "L4: non-dict item in %s skipped: %s", field_name, repr(item)[:80]
+            )
+    return valid
+
+
 def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     # Guard with `or []`: model may emit null for list fields (e.g. "symptoms": null).
     # data.get("symptoms", []) returns None when the key is present with value null,
@@ -164,13 +188,13 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             severity=s.get("severity") or None,
             since=s.get("since") or None,
         )
-        for s in (data.get("symptoms") or [])
+        for s in _iter_dicts(data.get("symptoms") or [], "symptoms")
         if s.get("name", "").strip()
     ]
 
     vitals = [
         Vital(name=v.get("name", "").strip(), value=str(v.get("value") or "").strip())
-        for v in (data.get("vitals") or [])
+        for v in _iter_dicts(data.get("vitals") or [], "vitals")
         if v.get("name", "").strip() and str(v.get("value") or "").strip()
     ]
 
@@ -180,14 +204,14 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             snomed_id=d.get("snomed_id"),
             status=d.get("status") or None,
         )
-        for d in (data.get("diagnosis") or [])
+        for d in _iter_dicts(data.get("diagnosis") or [], "diagnosis")
         if d.get("term", "").strip()
     ]
 
     medications: list[Medication] = []
     low_conf: list[str] = list(data.get("low_confidence_fields") or [])
     n_unnamed = 0
-    for m in (data.get("medications") or []):
+    for m in _iter_dicts(data.get("medications") or [], "medications"):
         drug = (m.get("drug") or "").strip()
         if not drug:
             continue
