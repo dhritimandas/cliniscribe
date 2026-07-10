@@ -968,3 +968,52 @@ misses cluster on a specific behavior — vitals spoken as ranges ("BP has been
 concrete, few-shot-teachable pattern for either prompt work or a future
 fine-tune, and the matcher canons mean any gain will now actually show up in
 the score instead of being eaten by synonym mismatches.
+
+---
+
+## Frontend Phase — The glue layer is where safety signals die (2026-07-10)
+
+### (a) What this phase does
+This phase built the offline review frontend (record → review → edit → sign →
+PDF) through coordinator-written contracts and parallel implementer subagents,
+then verified the whole flow in a real browser against the real pipeline. The
+verification pass — not the implementation pass — found the bugs that mattered:
+a physician-facing "verify this" badge that never rendered, a status file that
+intermittently returned garbage mid-write, and, upstream, an extraction prompt
+that was quietly fabricating laboratory results.
+
+### (b) Hardest bugs
+
+1. **The extraction prompt's own examples became patient data.** Six of
+   twenty-four frozen consultations contained lab values copied VERBATIM from
+   the instruction prompt's illustrative examples ("Hb is 9.2", "HbA1c 9.1",
+   "Total IGE 2107") into their notes as if measured. Root cause: a 3-billion-
+   parameter model does not reliably distinguish "example of the format" from
+   "content to reuse" — concrete values in instructions are training data for
+   the very next generation. The fix (abstract shape descriptions, zero
+   concrete values, a tripwire test on the prompt text) cost real recall
+   (0.495 → 0.457 aggregate) — and part of that loss was itself revealing:
+   the old diagnostic-results recall was partly CREDIT FOR FABRICATIONS that
+   happened to match other samples' rubrics. Lesson: in any extraction prompt
+   for a small model, every concrete value is a candidate hallucination; and a
+   metric can be inflated by the very failure it should catch.
+
+2. **The textbook defense that was structurally inert.** Whisper hallucinates
+   text on silence (a 20-second silent WAV deterministically produces a
+   Norwegian subtitle credit). The documented fix — vad_filter=True — was
+   probed under a WER gate and found to do literally nothing in our pipeline:
+   faster-whisper silently ignores the flag whenever clip_timestamps is set,
+   and our per-segment decoding always sets it. Four independent confirmations
+   (including byte-identical hallucinated output with the flag on and off).
+   Lesson: a mitigation you haven't watched fire is a hypothesis, not a
+   defense — the same lesson as multilingual=True in the latency phase, one
+   layer deeper: this flag LOOKED shippable because it passed the WER gate
+   with zero delta, and zero delta was precisely the proof it did nothing.
+
+### (c) Fine-tuning hook
+The review frontend now logs every physician correction as a structured diff
+(field, old, new, timestamp) in outputs/<session>/corrections.jsonl. That file
+is the future fine-tuning dataset this project has been missing: it captures
+exactly the model-output → clinician-accepted-truth pairs, per field, in the
+source language, with provenance back to the transcript — accumulating
+passively during real use, at zero annotation cost.
