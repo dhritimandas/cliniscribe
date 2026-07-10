@@ -2,8 +2,55 @@
 
 import os
 
+import pytest
+from pypdf import PdfReader
+
+import src.l5_render as l5_render
 from src.l5_render import _flag_sentence, render
-from src.types import ClinicalNote, Medication
+from src.types import ClinicalNote, Medication, Symptom
+
+# Stub for web/translations.LABELS (contract: docs/frontend_contracts.md
+# "Ownership of shared modules"). That module is built in parallel by another
+# agent; this stub only covers the keys src/l5_render.py actually consumes,
+# and is injected via monkeypatch — it is never written to web/translations.py.
+_STUB_LABELS = {
+    "hi": {
+        "chief_complaint": "मुख्य शिकायत",
+        "history": "इतिहास",
+        "symptoms": "लक्षण",
+        "vitals": "महत्वपूर्ण संकेत",
+        "examination": "जांच",
+        "diagnosis": "निदान",
+        "medications": "दवाइयाँ",
+        "drug": "दवा",
+        "dose": "खुराक",
+        "frequency": "आवृत्ति",
+        "timing": "समय",
+        "duration": "अवधि",
+        "investigations": "जांच के आदेश",
+        "diagnostic_results": "जांच परिणाम",
+        "advice": "सलाह",
+        "follow_up": "अनुवर्ती",
+        "verify": "हस्ताक्षर से पहले जांचें",
+        "draft_banner": "मसौदा — नैदानिक उपयोग के लिए नहीं",
+        "doctor_name": "डॉक्टर",
+        "reg_no": "पंजीकरण संख्या",
+        "clinic_address": "क्लिनिक",
+        "signed": "इलेक्ट्रॉनिक रूप से हस्ताक्षरित",
+    },
+    "mr": {
+        "chief_complaint": "मुख्य तक्रार",
+        "medications": "औषधे",
+        "vitals": "जीवनावश्यक चिन्हे",
+        "symptoms": "लक्षणे",
+    },
+}
+
+
+@pytest.fixture
+def stub_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inject a fixed LABELS dict so tests don't depend on web/translations.py."""
+    monkeypatch.setattr(l5_render, "LABELS", _STUB_LABELS)
 
 
 def test_dose_unknown_flag_is_plain_language() -> None:
@@ -43,8 +90,12 @@ def test_no_dotted_paths_reach_the_pdf(tmp_path) -> None:
         history=None,
         medications=[
             Medication(
-                drug="unnamed medication 1", dose=None, frequency="1-0-1",
-                timing=None, duration=None, validated=False,
+                drug="unnamed medication 1",
+                dose=None,
+                frequency="1-0-1",
+                timing=None,
+                duration=None,
+                validated=False,
             )
         ],
         low_confidence_fields=[
@@ -63,3 +114,90 @@ def test_no_dotted_paths_reach_the_pdf(tmp_path) -> None:
     assert "dose_unknown" not in text
     assert "medications.unnamed" not in text
     assert "could not be confirmed" in text
+
+
+def _simple_note(**overrides) -> ClinicalNote:
+    defaults = dict(
+        chief_complaint="fever",
+        history=None,
+        medications=[
+            Medication(
+                drug="Paracetamol",
+                dose="650 mg",
+                frequency="1-0-1",
+                timing="after food",
+                duration="5 days",
+                validated=True,
+            )
+        ],
+    )
+    defaults.update(overrides)
+    return ClinicalNote(**defaults)
+
+
+def test_render_positional_out_path_is_still_backward_compatible(tmp_path) -> None:
+    """render(note, out_path) — the pre-existing two-positional-arg call shape."""
+    out = str(tmp_path / "rx.pdf")
+    path = render(_simple_note(), out)
+    assert os.path.exists(path)
+
+
+def test_default_render_still_contains_draft_banner(tmp_path) -> None:
+    out = str(tmp_path / "rx.pdf")
+    render(_simple_note(), out_path=out)
+    text = "".join(page.extract_text() for page in PdfReader(out).pages)
+    assert "DRAFT" in text
+
+
+def test_lang_hi_label_appears_in_pdf_text_layer(stub_labels, tmp_path) -> None:
+    out = str(tmp_path / "rx_hi.pdf")
+    render(_simple_note(), out_path=out, lang="hi")
+    text = "".join(page.extract_text() for page in PdfReader(out).pages)
+    assert "दवाइयाँ" in text  # Hindi for "Medications"
+
+
+def test_signed_pdf_has_doctor_details_and_no_draft(tmp_path) -> None:
+    out = str(tmp_path / "rx_signed.pdf")
+    doctor = {"name": "Dr. Asha Rao", "reg_no": "MH12345", "clinic": "Rao Clinic"}
+    render(_simple_note(), out_path=out, signed=True, doctor=doctor)
+    text = "".join(page.extract_text() for page in PdfReader(out).pages)
+    assert "Dr. Asha Rao" in text
+    assert "MH12345" in text
+    assert "DRAFT" not in text
+
+
+def test_signed_without_doctor_raises() -> None:
+    with pytest.raises(ValueError):
+        render(_simple_note(), signed=True)
+
+
+@pytest.mark.parametrize("lang", ["en", "hi", "mr"])
+def test_devanagari_symptom_value_renders_without_error(
+    stub_labels, tmp_path, lang: str
+) -> None:
+    note = _simple_note(
+        symptoms=[Symptom(name="बुखार", severity="Mild", since="3 days")]
+    )
+    out = str(tmp_path / f"rx_{lang}.pdf")
+    path = render(note, out_path=out, lang=lang)
+    assert os.path.exists(path)
+
+
+def test_real_web_translations_module_wires_up_correctly(tmp_path) -> None:
+    """Integration proof: web.translations (owned by another agent, built in
+    parallel) is picked up as-is, with no monkeypatch, for lang="hi"."""
+    pytest.importorskip("web.translations")
+    out = str(tmp_path / "rx_hi_real.pdf")
+    render(_simple_note(), out_path=out, lang="hi")
+    text = "".join(page.extract_text() for page in PdfReader(out).pages)
+    assert "दवाइयाँ" in text  # web.translations.TRANSLATIONS["hi"]["medications"]
+
+
+def test_lang_en_labels_are_unaffected_by_web_translations_module() -> None:
+    """render(note, lang="en") must stay byte-identical to pre-multilingual
+    behavior even once web.translations exists and defines its own "en"
+    wording (which differs, e.g. "verify": "VERIFY")."""
+    assert l5_render._label("verify", "en") == "Items to verify before signing"
+    assert l5_render._label("draft_banner", "en") == (
+        "DRAFT — NOT FOR CLINICAL USE — PHYSICIAN REVIEW REQUIRED"
+    )
