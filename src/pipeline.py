@@ -19,12 +19,14 @@ import uuid
 
 from dotenv import load_dotenv
 
+import threading
+
 from src import telemetry
 from src.l1_preprocess import preprocess
 from src.l2_diarize import diarize
 from src.l3_asr import transcribe
 from src.l3_5_normalize import normalize
-from src.l4_extract import extract
+from src.l4_extract import extract, warm_llm
 from src.l5_render import render
 from src.types import Turn
 
@@ -83,9 +85,19 @@ def run(in_path: str, session_id: str | None = None) -> str:
     logger.info("L3: transcribing %d segments", len(segments))
     turns = _staged("l3_asr", transcribe, wav_path, segments)
 
+    # Warm the LLM while L3.5 runs on CPU: Whisper was released inside
+    # transcribe(), so only the (small) embedding model and Qwen coexist —
+    # the load-one-release-one discipline holds at its peak.
+    warm_thread = threading.Thread(target=warm_llm, daemon=True)
+    with telemetry.timer("l4.warm_dispatch"):
+        warm_thread.start()
+
     logger.info("L3.5: normalizing %d turns", len(turns))
     turns = _staged("l3_5_normalize", normalize, turns)
     _write_turns(turns, os.path.join(session_dir, "transcript.json"))
+
+    with telemetry.timer("l4.warm_join_wait"):
+        warm_thread.join(timeout=180)
 
     logger.info("L4: extracting clinical entities")
     note = _staged("l4_extract", extract, turns)

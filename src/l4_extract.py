@@ -290,6 +290,28 @@ def _empty_note() -> ClinicalNote:
     )
 
 
+def warm_llm() -> None:
+    """Preload the extraction model into the Ollama server (non-fatal).
+
+    Called on a background thread during L3.5 — after L3 has released
+    Whisper, so the load-one-release-one memory discipline holds. The
+    options MUST match extract()'s: Ollama restarts the model runner when
+    num_ctx changes, which would waste the warm-up.
+    """
+    import ollama
+
+    try:
+        ollama.generate(
+            model=config.EXTRACT_MODEL,
+            prompt="",
+            keep_alive=config.EXTRACT_KEEP_ALIVE,
+            options={"num_ctx": config.EXTRACT_NUM_CTX},
+        )
+        logger.info("L4: model warmed (%s)", config.EXTRACT_MODEL)
+    except Exception as exc:
+        logger.warning("L4: warm-up failed (non-fatal): %s", exc)
+
+
 def extract(turns: list[Turn]) -> ClinicalNote:
     """Extract a structured ClinicalNote from normalized transcript turns.
 
@@ -321,6 +343,7 @@ def extract(turns: list[Turn]) -> ClinicalNote:
                 model=config.EXTRACT_MODEL,
                 messages=messages,
                 format="json",
+                keep_alive=config.EXTRACT_KEEP_ALIVE,
                 options={
                     "temperature": 0,
                     # Without num_ctx, Ollama's default truncates long HI/MR

@@ -30,3 +30,7 @@ EXTRACT_NUM_CTX = 16384
 # Bound generation: degenerate unbounded JSON outputs were observed running
 # 40+ min on CPU during diagnosis; a full note is < ~800 tokens.
 EXTRACT_NUM_PREDICT = 2048
+# Keep Qwen resident between calls (consecutive consultations in a clinic
+# session) instead of Ollama's default unload; also enables the L3.5-time
+# preload. Whisper is always released before the LLM loads (pipeline order).
+EXTRACT_KEEP_ALIVE = "15m"
