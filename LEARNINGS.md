@@ -821,3 +821,53 @@ bench slice (rows 60+): extending the Latin fuzzy tier's lexicon from CDSCO-only
 to include curated brand values would recover 1-char Latin brand distortions
 ("glycomate" → Glycomet); it was discovered by inspecting the holdout, so it
 must be validated on data neither dev nor holdout has touched.
+
+---
+
+## Phase B Hardening (2) — Long measurements on a laptop, and closing the original 0/7 (2026-07-10)
+
+### (a) What this phase does
+This phase made multi-hour benchmark runs survivable on a MacBook that sleeps,
+restarts its tooling, and throttles background work — and then used the finished
+bench to answer the question that started it: are the original seven missed drug
+terms still missed? Compute now runs detached from the assistant session with
+per-clip caching, so any interruption costs at most one clip. The verdict on the
+original seven: one recovered, and the other six are provably not text-recoverable
+— a decomposition, not an excuse.
+
+### (b) Hardest bugs
+
+1. **Background workers kept dying, three different ways, and each looked like
+   the same mystery.** Root causes, once separated: (i) benchmark processes were
+   children of the assistant session, so every session restart reaped them; (ii)
+   macOS puts orphaned "nohup" processes into background quality-of-service — a
+   scheduling class that confines them to efficiency cores, silently capping each
+   at ~87% of one core; (iii) laptop sleep paused what survived overnight (5 clips
+   progressed in 8 hours). No single observation distinguished these — the fix
+   required treating them as a stack: detach the process tree (nohup + disown, so
+   the work outlives the session), lift the QoS clamp (taskpolicy), and hold the
+   machine awake for the run's duration (caffeinate with a time cap). Lesson:
+   "the job died" is not a root cause; process lifecycle, scheduler class, and
+   power state fail independently and must be ruled out independently.
+
+2. **A completion check that could never fire.** The waiter tested "50 clips
+   cached" because the bench spans 50 dataset rows — but the dataset contains a
+   duplicate transcript hash, so 50 rows yield 49 unique clips. The workers all
+   exited successfully while the monitor waited forever for a 50th clip that
+   does not exist. Root cause: conflating row COUNT with unique IDENTITY —
+   the same class of error as double-counting a patient who registered twice.
+   Lesson: completion conditions must be derived from the same identity key the
+   work is deduplicated by, never from the input's nominal size.
+
+### (c) Fine-tuning hook
+The original seven misses are now fully attributed: 1 recovered by the Latin-span
+tier + fold-symmetric scoring (Augmentin 650 mg), 3 are gold-labeling artifacts
+(generic words — "medicine(s)" — that our own prescription layer refuses to treat
+as drug names), 2 are true acoustic drops (sunscreen, Fluconazole — better
+microphone, not better models), and 1 is an out-of-lexicon Ayurvedic compound.
+Combined with the 49-clip bench (dev drug WER 0.750 → 0.600 after text fixes),
+the text-processing ceiling is now measured on two frozen sets. Everything above
+that ceiling and below the true-drop floor is the ASR fine-tuning target, and the
+per-class attribution means a future fine-tune can be scored on exactly the class
+it claims to fix — distorted-but-present drug tokens — rather than on an average
+that mixes in unfixable misses.
