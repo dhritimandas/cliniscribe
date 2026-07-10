@@ -6,7 +6,7 @@ import logging
 import torch
 from faster_whisper import WhisperModel
 
-from src import config
+from src import config, telemetry
 from src.types import Segment, Turn
 
 # Doctor heuristic: bag-of-words score over transcribed text.
@@ -71,7 +71,8 @@ def transcribe(
     """
     owns_model = model is None
     if owns_model:
-        model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
+        with telemetry.timer("l3.model_load"):
+            model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
         logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
 
     raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)

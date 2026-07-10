@@ -7,7 +7,7 @@ import os
 import soundfile as sf
 import torch
 
-from src import config
+from src import config, telemetry
 from src.types import Segment
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,12 @@ def diarize(wav_path: str, pipeline=None) -> list[Segment]:
         if not hf_token:
             raise EnvironmentError("HF_TOKEN not set — required for pyannote model download")
 
-        pipeline = Pipeline.from_pretrained(config.DIARIZE_MODEL, token=hf_token)
-        device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-        pipeline.to(device)
+        with telemetry.timer("l2.model_load"):
+            pipeline = Pipeline.from_pretrained(config.DIARIZE_MODEL, token=hf_token)
+            device = (
+                torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+            )
+            pipeline.to(device)
         logger.info("L2: loaded %s on %s", config.DIARIZE_MODEL, device)
 
     audio_array, sr = sf.read(wav_path, dtype="float32", always_2d=True)
