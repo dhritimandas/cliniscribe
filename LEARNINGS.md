@@ -922,3 +922,49 @@ deferred until a capture UI exists (docs/incremental_capture_design.md) — and
 latency one: any model swap must clear the frozen keyword/drug-WER gate first,
 and the code-switch absorption failure above predicts exactly where a smaller
 model will break.
+
+---
+
+## L4/L5 Defects Phase — Attribute before you fix (2026-07-10)
+
+### (a) What this phase does
+This phase took the three worst product-facing defects — missing symptoms and
+vitals, generic words appearing as drug names on prescriptions, and
+developer-notation warnings in the PDF — and attributed each failure to its true
+layer before touching any code. The attribution changed the fix list: half the
+"model failures" were the evaluation matcher, none were the PDF renderer, and
+none were absent from the audio. Fixes then landed where the evidence pointed:
+matcher synonym canons, a generic-term guard with dose/frequency preservation,
+and plain-language footer sentences.
+
+### (b) Hardest bugs
+
+1. **The automated failure classifier called 6 of 7 cases "not in the
+   transcript" — and manual review overturned every one of them.** Root cause:
+   the transcript-scan matcher was synonym-blind. "Peripheral oxygen saturation"
+   IS in the transcript — as "SpO2"; "136/88 mmHg" is there as "136" and "88"
+   spoken separately. An automated attribution tool inherits every blind spot of
+   the matcher it is built from, so its "not-a-bug" class — the one that closes
+   issues — is exactly where its errors concentrate. The advisor-mandated manual
+   spot-check of that class was the only thing standing between us and closing
+   six real, fixable misses as dataset noise. Lesson: when a classifier's output
+   decides what gets IGNORED, audit that class by hand, always.
+
+2. **Flag strings collided when two medications had no name.** Converting
+   generic drug mentions ("medicine", "दवाई") to "unnamed medication" made two
+   such rows produce identical low-confidence flags — and the dedup logic
+   silently dropped one, so a prescription with two unnamed drugs would warn the
+   physician about only one. Root cause: flags were keyed by drug NAME, and the
+   fix made names non-unique. Caught in advisor review before shipping; fixed by
+   numbering ("unnamed medication 1", "unnamed medication 2"). Lesson: any
+   transformation that maps distinct entities onto one label must check every
+   downstream consumer that assumed the label was a key.
+
+### (c) Fine-tuning hook
+The corrected split (57% extraction / 43% matcher / 0% rendering) gives the
+first clean per-layer error budget for symptoms and vitals. The extraction
+misses cluster on a specific behavior — vitals spoken as ranges ("BP has been
+130 to 140") that the model does not lift into the vitals list — which is a
+concrete, few-shot-teachable pattern for either prompt work or a future
+fine-tune, and the matcher canons mean any gain will now actually show up in
+the score instead of being eaten by synonym mismatches.
