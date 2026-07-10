@@ -112,8 +112,19 @@ def _read_json(path: str) -> Any:
 
 
 def _write_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    """Write JSON atomically (temp file + rename).
+
+    status.json is polled every ~1s by the SPA while a daemon thread writes
+    it from `on_stage` callbacks; a plain truncate-then-write left a window
+    where a concurrent read observed a zero-byte file and raised
+    `json.JSONDecodeError` (surfaced as a transient 500 on GET .../status).
+    `os.replace` is atomic on the same filesystem, so readers only ever see
+    the fully-written old or new content.
+    """
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
 
 
 def _note_from_dict(data: dict[str, Any]) -> ClinicalNote:
@@ -218,7 +229,8 @@ def process_session(sid: str) -> dict[str, str]:
 def get_status(sid: str) -> dict[str, Any]:
     """Return the current session state machine snapshot."""
     _session_dir(sid)
-    return _read_json(_status_path(sid))
+    with _status_lock:
+        return _read_json(_status_path(sid))
 
 
 # ── GET /api/sessions/{sid}/note ─────────────────────────────────────────

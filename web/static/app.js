@@ -524,15 +524,22 @@ function applyStatus(status) {
 function startStatusPolling() {
   applyStatus({ state: "processing", stage: null, stages_done: [] });
   statusPollHandle = setInterval(async () => {
-    const res = await api(`/api/sessions/${sessionId}/status`);
-    const status = await res.json();
-    applyStatus(status);
-    if (status.state === "review") {
-      clearInterval(statusPollHandle);
-      await loadNoteAndShowReview();
+    // A transient 500 (e.g. a status.json write in progress server-side)
+    // must never break polling — swallow and silently retry next tick.
+    try {
+      const res = await api(`/api/sessions/${sessionId}/status`);
+      if (!res.ok) return;
+      const status = await res.json();
+      applyStatus(status);
+      if (status.state === "review") {
+        clearInterval(statusPollHandle);
+        await loadNoteAndShowReview();
+      }
+      // status.error is surfaced only via console — no dashboard element per spec.
+      if (status.error) console.error("pipeline error:", status.error);
+    } catch (err) {
+      console.error("status poll failed, retrying next tick:", err);
     }
-    // status.error is surfaced only via console — no dashboard element per spec.
-    if (status.error) console.error("pipeline error:", status.error);
   }, 1000);
 }
 
@@ -647,9 +654,15 @@ function listCell(labelKey, items, itemsHtml) {
   const body = items.length
     ? itemsHtml
     : `<div class="item-row"><div class="value" data-empty="true">${t("empty")}</div></div>`;
+  // Bare-name flags (e.g. low_confidence_fields entry "vitals", resolved by
+  // web/provenance.py's flags_by_path to the group's own field name) concern
+  // the whole group, not one item[i] row — surface them here, since itemRow
+  // only ever renders per-item paths like "vitals[0].value" (bug: this flag
+  // was previously resolved server-side but never rendered anywhere).
+  const flagReason = flagsData[labelKey];
   return `
-  <div class="cell" data-group="${labelKey}">
-    <div class="label"><span>${t(labelKey)}</span></div>
+  <div class="cell ${flagReason ? "flagged" : ""}" data-group="${labelKey}">
+    <div class="label"><span>${t(labelKey)}</span>${flagReason ? `<span class="badge">${t("verify")}</span>` : ""}</div>
     ${body}
   </div>`;
 }
@@ -976,6 +989,17 @@ async function init() {
   stageLinesEl.querySelectorAll(".stage-line").forEach((el) => {
     el.querySelector(".text").textContent = t(stageKeyToText[el.dataset.stage]);
   });
+
+  // Session-restore-by-hash: reopen an already-processed session's review
+  // screen directly (e.g. #session=20260710-213933-8c4119) instead of
+  // re-recording. The SPA has no other session-restore path, and reloading
+  // is otherwise a dead end once a session has moved past the capture screen.
+  const sessionMatch = location.hash.match(/^#session=([A-Za-z0-9_-]+)$/);
+  if (sessionMatch) {
+    sessionId = sessionMatch[1];
+    await loadNoteAndShowReview();
+    return;
+  }
   showScreen("capture");
 }
 

@@ -46,6 +46,23 @@ def _write_transcript(sid: str, turns: list[dict]) -> None:
         json.dump(turns, f)
 
 
+# ── _write_json atomicity ──────────────────────────────────────────────────
+
+
+def test_write_json_is_atomic_and_leaves_no_tmp_file(tmp_path) -> None:
+    """Regression test: status.json is polled every ~1s while a daemon thread
+    writes it; a non-atomic write let a poll observe a zero-byte file and
+    raise JSONDecodeError. `os.replace` must leave only the final file."""
+    path = os.path.join(tmp_path, "status.json")
+
+    app_module._write_json(path, {"state": "processing", "stage": "l3_asr"})
+
+    assert os.path.exists(path)
+    assert not os.path.exists(f"{path}.tmp")
+    with open(path, encoding="utf-8") as f:
+        assert json.load(f) == {"state": "processing", "stage": "l3_asr"}
+
+
 # ── session creation ───────────────────────────────────────────────────────
 
 
