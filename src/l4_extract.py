@@ -273,7 +273,13 @@ def extract(turns: list[Turn]) -> ClinicalNote:
                 model=config.EXTRACT_MODEL,
                 messages=messages,
                 format="json",
-                options={"temperature": 0},
+                options={
+                    "temperature": 0,
+                    # Without num_ctx, Ollama's default truncates long HI/MR
+                    # transcripts → empty {} notes (see config.EXTRACT_NUM_CTX).
+                    "num_ctx": config.EXTRACT_NUM_CTX,
+                    "num_predict": config.EXTRACT_NUM_PREDICT,
+                },
             )
             raw = (
                 response.message.content
