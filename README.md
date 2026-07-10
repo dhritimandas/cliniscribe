@@ -76,6 +76,34 @@ pytest tests/ -v
 Datasets (EkaCare, open access on HuggingFace) are pulled into `data/` on first use;
 both `data/` and `outputs/` are gitignored.
 
+## Review frontend (offline web app)
+
+A fully offline FastAPI + single-page app for the record → review → edit →
+sign → PDF workflow (`docs/frontend_contracts.md` documents the API and data
+contracts):
+
+```bash
+# Ollama must be running (L4 extraction + translation)
+uvicorn web.app:app --host 127.0.0.1 --port 8000
+# then open http://127.0.0.1:8000/ in a browser
+```
+
+| Capture (Zen) | Processing |
+|---|---|
+| ![Capture screen](docs/screenshots/capture-zen.png) | ![Processing stages](docs/screenshots/processing-stages.png) |
+
+| Review (Sage) | Transcript drawer |
+|---|---|
+| ![Review card](docs/screenshots/review-sage.png) | ![Transcript drawer](docs/screenshots/transcript-drawer.png) |
+
+Record in the browser (or upload a file), watch real per-stage progress, review
+the extracted note with per-field provenance ("source" links into the
+speaker-attributed transcript), edit inline (every edit is logged to
+`outputs/<session>/corrections.jsonl` as a structured diff), switch the UI and
+note text between English/Hindi/Marathi (drug names and doses are never
+machine-translated), then sign to produce the final PDF. Flagged fields carry a
+text "VERIFY" badge — uncertainty is never conveyed by color alone.
+
 ## Repository structure
 
 ```
