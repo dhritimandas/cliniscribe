@@ -17,6 +17,19 @@ EXTRACT_MODEL = "qwen2.5:3b-instruct"  # L4 — via Ollama
 # beam=1 0.7381 — see outputs/beam_study.json for the measurement.
 ASR_BEAM_SIZE = 5
 
+# NOT a working silence-hallucination defense — kept False. faster-whisper's
+# own docs (transcribe.py: "vad_filter will be ignored if clip_timestamps is
+# used") mean this flag is a no-op at our call site, which always passes
+# clip_timestamps for per-segment decoding. Measured on the frozen bench
+# (eval/vad_study.py) and reproduced directly against faster-whisper: with an
+# explicit clip_timestamps, vad_filter=True does not change transcribe()'s
+# output at all, byte-for-byte, including on 20s of pure silence that Silero
+# VAD itself correctly flags as speech-free (see
+# tests/test_l3_asr.py::test_vad_filter_is_a_noop_on_silence_with_clip_timestamps).
+# Do not flip this to True expecting protection — it does nothing while
+# per-segment clip_timestamps decoding is in place.
+ASR_VAD_FILTER = False
+
 # ── L3.5 concept matching (E5 study: hard-negative gate) ─────────────────────
 COSINE_THRESHOLD = 0.65  # min cosine similarity for a lay→clinical concept match
 HARDNEG_MARGIN = 0.05  # span must beat its hardest hard-negative by this margin

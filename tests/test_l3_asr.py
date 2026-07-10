@@ -52,3 +52,49 @@ def test_role_unknown_for_single_speaker() -> None:
     segments = [Segment(start=0.03, end=2.75, speaker="SPEAKER_00")]
     turns = transcribe(wav, segments)
     assert all(t.speaker_role == "UNKNOWN" for t in turns)
+
+
+@pytest.mark.slow
+def test_vad_filter_is_a_noop_on_silence_with_clip_timestamps() -> None:
+    """Silence hallucinates identically regardless of config.ASR_VAD_FILTER.
+
+    faster-whisper hallucinates text (a fixed, deterministic phrase for this
+    model/beam/audio, not flaky) when asked to decode pure silence. The
+    hypothesis was that vad_filter=True would suppress this. It does not:
+    faster-whisper's own docs state "vad_filter will be ignored if
+    clip_timestamps is used" (transcribe.py), and transcribe() always passes
+    clip_timestamps for per-segment decoding — confirmed directly against
+    WhisperModel.transcribe (vad_filter=True + explicit clip_timestamps still
+    hallucinates; vad_filter=True + no clip_timestamps correctly returns zero
+    segments). This test documents that reality: toggling
+    config.ASR_VAD_FILTER must not change transcribe()'s output at all.
+    Guards against a future dev "fixing" the flag without noticing it never
+    took effect, and against a faster-whisper upgrade silently changing this
+    interaction (which would be worth re-running the gate over).
+    """
+    import os
+
+    import numpy as np
+    import soundfile as sf
+
+    from src import config
+    from src.l3_asr import transcribe
+
+    wav_path = "outputs/_test_silence_20s.wav"
+    silence = np.zeros(20 * 16_000, dtype=np.float32)
+    sf.write(wav_path, silence, 16_000, subtype="PCM_16")
+    segments = [Segment(start=0.0, end=20.0, speaker="S0")]
+
+    original = config.ASR_VAD_FILTER
+    try:
+        config.ASR_VAD_FILTER = False
+        turns_no_vad = transcribe(wav_path, segments)
+        config.ASR_VAD_FILTER = True
+        turns_vad = transcribe(wav_path, segments)
+    finally:
+        config.ASR_VAD_FILTER = original
+        os.remove(wav_path)
+
+    print(f"vad_filter=False: {[t.text for t in turns_no_vad]}")
+    print(f"vad_filter=True:  {[t.text for t in turns_vad]}")
+    assert [t.text for t in turns_no_vad] == [t.text for t in turns_vad]

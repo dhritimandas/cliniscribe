@@ -68,6 +68,11 @@ def transcribe(
         language=None enables per-segment auto-detection for Hindi/English/
         Marathi code-switching. task="transcribe" is explicit to prevent
         translation even if Whisper internally detects a non-English segment.
+        vad_filter (config.ASR_VAD_FILTER) is passed through but is a measured
+        no-op here: faster-whisper ignores vad_filter whenever clip_timestamps
+        is set, and this call always sets clip_timestamps for per-segment
+        decoding. It provides no silence-hallucination protection — kept
+        False (see src.config.ASR_VAD_FILTER for the full explanation).
     """
     owns_model = model is None
     if owns_model:
@@ -83,8 +88,10 @@ def transcribe(
             task="transcribe",
             clip_timestamps=f"{seg.start},{seg.end}",
             # Read at call time (not import time) so eval studies can override
-            # src.config.ASR_BEAM_SIZE; pipeline and eval share this one value.
+            # src.config.ASR_BEAM_SIZE / ASR_VAD_FILTER; pipeline and eval
+            # share these values.
             beam_size=config.ASR_BEAM_SIZE,
+            vad_filter=config.ASR_VAD_FILTER,
             word_timestamps=False,
         )
         text = " ".join(chunk.text.strip() for chunk in gen).strip()
