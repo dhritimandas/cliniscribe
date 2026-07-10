@@ -3,11 +3,16 @@
 import logging
 import os
 import re
+from datetime import datetime
+from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -20,26 +25,97 @@ from src.types import ClinicalNote
 
 logger = logging.getLogger(__name__)
 
-_WARN_COLOR = colors.HexColor("#D97706")   # amber — low-confidence flag
+_WARN_COLOR = colors.HexColor("#D97706")  # amber — low-confidence flag
 _DRAFT_COLOR = colors.HexColor("#DC2626")  # red — draft watermark
+_SIGNED_COLOR = colors.HexColor("#374151")  # grayscale — signed header/footer
+
+# Vendored Unicode font for Devanagari text runs (hi/mr labels, and any
+# Devanagari values regardless of language). This particular Noto static
+# build has NO Latin glyphs, so it must only ever wrap Devanagari-script
+# substrings, never a whole mixed-script string — see _wrap_devanagari.
+_FONT_NAME = "NotoSansDevanagari"
+_FONT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "web"
+    / "fonts"
+    / f"{_FONT_NAME}-Regular.ttf"
+)
+_DEVANAGARI_FONT_AVAILABLE = False
+if _FONT_PATH.exists():
+    try:
+        pdfmetrics.registerFont(TTFont(_FONT_NAME, str(_FONT_PATH)))
+        _DEVANAGARI_FONT_AVAILABLE = True
+    except Exception:
+        logger.warning("Could not register Devanagari font at %s", _FONT_PATH)
+else:
+    logger.warning(
+        "Devanagari font not found at %s; hi/mr text will render with missing glyphs",
+        _FONT_PATH,
+    )
+
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]+")
+
+try:
+    from web.translations import TRANSLATIONS as LABELS
+except ImportError:
+    LABELS: dict[str, dict[str, str]] = {}
+
+# English fallback for section/UI labels — used when web.translations is
+# absent or missing a key. Values here are byte-identical to this module's
+# pre-existing hardcoded strings, so lang="en" behavior is unchanged.
+_EN_FALLBACK: dict[str, str] = {
+    "chief_complaint": "Chief Complaint",
+    "history": "History",
+    "symptoms": "Symptoms",
+    "vitals": "Vitals",
+    "examination": "Examination",
+    "diagnosis": "Diagnosis",
+    "medications": "Medications",
+    "drug": "Drug",
+    "dose": "Dose",
+    "frequency": "Frequency",
+    "timing": "Timing",
+    "duration": "Duration",
+    "investigations": "Investigations (Ordered)",
+    "diagnostic_results": "Diagnostic Results (Available)",
+    "advice": "Advice",
+    "follow_up": "Follow-up",
+    "verify": "Items to verify before signing",
+    "draft_banner": "DRAFT — NOT FOR CLINICAL USE — PHYSICIAN REVIEW REQUIRED",
+    "doctor_name": "Doctor",
+    "reg_no": "Reg. No.",
+    "signed": "Signed electronically",
+}
 
 # Dotted low-confidence flags → clinician sentences for the PDF footer.
 # Phrasing is deliberately neutral ("could not be confirmed", not "not stated
 # in audio") — a missing value may be an extraction miss of something that WAS
 # spoken; the PDF must not assert facts about the recording.
 _FLAG_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^medications\.(?P<x>.+)\.dose_unknown$"),
-     "Dose for {x} could not be confirmed — verify with the patient"),
-    (re.compile(r"^medications\.(?P<x>.+)\.unvalidated$"),
-     "'{x}' is not in the CDSCO drug list — verify the drug name"),
-    (re.compile(r"^medications\.(?P<x>.+)\.unnamed$"),
-     "A medication was mentioned without a clear name ({x}) — identify it"),
-    (re.compile(r"^diagnosis\.(?P<x>.+)\.no_transcript_overlap$"),
-     "Diagnosis '{x}' lacks clear support in the conversation — confirm"),
-    (re.compile(r"^symptoms\.(?P<x>.+)$"),
-     "Symptom '{x}' could not be confirmed — verify with the patient"),
-    (re.compile(r"^vitals\.(?P<x>.+)$"),
-     "Vital sign '{x}' could not be confirmed — re-measure if needed"),
+    (
+        re.compile(r"^medications\.(?P<x>.+)\.dose_unknown$"),
+        "Dose for {x} could not be confirmed — verify with the patient",
+    ),
+    (
+        re.compile(r"^medications\.(?P<x>.+)\.unvalidated$"),
+        "'{x}' is not in the CDSCO drug list — verify the drug name",
+    ),
+    (
+        re.compile(r"^medications\.(?P<x>.+)\.unnamed$"),
+        "A medication was mentioned without a clear name ({x}) — identify it",
+    ),
+    (
+        re.compile(r"^diagnosis\.(?P<x>.+)\.no_transcript_overlap$"),
+        "Diagnosis '{x}' lacks clear support in the conversation — confirm",
+    ),
+    (
+        re.compile(r"^symptoms\.(?P<x>.+)$"),
+        "Symptom '{x}' could not be confirmed — verify with the patient",
+    ),
+    (
+        re.compile(r"^vitals\.(?P<x>.+)$"),
+        "Vital sign '{x}' could not be confirmed — re-measure if needed",
+    ),
 ]
 _FIELD_LABELS: dict[str, str] = {
     "chief_complaint": "Chief complaint",
@@ -66,22 +142,83 @@ def _flag_sentence(flag: str) -> str:
     return flag.replace("_", " ").replace(".", " — ") + " (verify)"
 
 
-def render(note: ClinicalNote, out_path: str | None = None) -> str:
-    """Render a ClinicalNote as a draft prescription PDF.
+def _label(key: str, lang: str) -> str:
+    """Look up a section label for `lang`, falling back to English.
 
-    Output is watermarked DRAFT. low_confidence_fields and unvalidated
-    medications are visually flagged in amber. Physician review is mandatory
-    before this document reaches a patient record.
+    lang="en" always resolves to this module's own English strings
+    (_EN_FALLBACK), never web.translations' "en" table — this is what
+    guarantees render(note) stays byte-identical to pre-multilingual
+    behavior regardless of what wording the sibling module uses for "en".
+    """
+    if lang != "en":
+        translated = LABELS.get(lang, {}).get(key)
+        if translated:
+            return translated
+    return _EN_FALLBACK.get(key, key)
+
+
+def _wrap_devanagari(text: str) -> str:
+    """Wrap Devanagari-script runs in the vendored Unicode font face.
+
+    Everything else is left untouched (rendered in the paragraph's default
+    Latin-capable font). This is mixed-script safe in both directions: the
+    default font can't render Devanagari, and the vendored Devanagari font
+    has no Latin glyphs — so a run must never be rendered whole in one font.
+    Returns `text` unchanged when there is nothing Devanagari to wrap (the
+    common lang="en" path), which keeps that path byte-for-byte identical to
+    before this function existed.
+    """
+    if not text or not _DEVANAGARI_FONT_AVAILABLE or not _DEVANAGARI_RE.search(text):
+        return text
+    out: list[str] = []
+    last = 0
+    for m in _DEVANAGARI_RE.finditer(text):
+        if m.start() > last:
+            out.append(text[last : m.start()])
+        out.append(f'<font face="{_FONT_NAME}">{_xml_escape(m.group())}</font>')
+        last = m.end()
+    if last < len(text):
+        out.append(text[last:])
+    return "".join(out)
+
+
+def render(
+    note: ClinicalNote,
+    out_path: str | None = None,
+    *,
+    lang: str = "en",
+    signed: bool = False,
+    doctor: dict[str, str] | None = None,
+) -> str:
+    """Render a ClinicalNote as a draft or signed prescription PDF.
+
+    Draft mode (signed=False, the default) is watermarked DRAFT.
+    low_confidence_fields and unvalidated medications are visually flagged in
+    amber. Physician review is mandatory before this document reaches a
+    patient record. Signed mode replaces the DRAFT banner with a grayscale
+    doctor/clinic header and a signature line — no red anywhere.
 
     Args:
         note: Structured clinical note from L4.
         out_path: Destination PDF path. The pipeline passes the session-scoped
             path (outputs/<session_id>/draft_rx.pdf). Defaults to
             outputs/draft_rx.pdf for direct/dev use (overwritten per run).
+        lang: Section-label language — "en", "hi", or "mr". Field values are
+            always printed as-is (drug names are never translated).
+        signed: If True, renders the signed header/footer instead of the
+            DRAFT banner. Requires `doctor`.
+        doctor: Required when signed=True — {"name", "reg_no", "clinic"}.
 
     Returns:
         Path to the generated PDF.
     """
+    if signed and (
+        not doctor or not all(k in doctor for k in ("name", "reg_no", "clinic"))
+    ):
+        raise ValueError(
+            "signed=True requires doctor={'name': ..., 'reg_no': ..., 'clinic': ...}"
+        )
+
     path = out_path or os.path.join("outputs", "draft_rx.pdf")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
@@ -110,27 +247,57 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
         spaceAfter=4,
         borderPad=3,
     )
+    signed_style = ParagraphStyle(
+        "Signed",
+        parent=styles["Normal"],
+        fontSize=9,
+        textColor=_SIGNED_COLOR,
+        alignment=1,  # centre
+        spaceAfter=2,
+    )
 
     low_conf = set(note.low_confidence_fields or [])
+    date_str = datetime.now().strftime("%Y-%m-%d")
 
     def field(label: str, value: str | None, field_key: str | None = None) -> list:
         if not value:
             return []
         s = warn if (field_key and field_key in low_conf) else body
         flag = " ⚑" if (field_key and field_key in low_conf) else ""
-        return [Paragraph(f"<b>{label}:</b> {value}{flag}", s), Spacer(1, 1 * mm)]
+        label_r, value_r = _wrap_devanagari(label), _wrap_devanagari(value)
+        return [Paragraph(f"<b>{label_r}:</b> {value_r}{flag}", s), Spacer(1, 1 * mm)]
 
-    story = [
-        Paragraph("DRAFT — NOT FOR CLINICAL USE — PHYSICIAN REVIEW REQUIRED", draft_style),
-        Paragraph("CliniScribe — Draft Consultation Note", h1),
-        Spacer(1, 3 * mm),
-    ]
+    if signed:
+        doctor_name_label = _wrap_devanagari(_label("doctor_name", lang))
+        reg_no_label = _wrap_devanagari(_label("reg_no", lang))
+        doctor_name = _wrap_devanagari(doctor["name"])
+        reg_no = _wrap_devanagari(doctor["reg_no"])
+        story = [
+            Paragraph(_wrap_devanagari(doctor["clinic"]), signed_style),
+            Paragraph(
+                f"{doctor_name_label}: {doctor_name}"
+                f"    {reg_no_label}: {reg_no}"
+                f"    {date_str}",
+                signed_style,
+            ),
+            Spacer(1, 2 * mm),
+            Paragraph("CliniScribe — Consultation Note", h1),
+            Spacer(1, 3 * mm),
+        ]
+    else:
+        story = [
+            Paragraph(_wrap_devanagari(_label("draft_banner", lang)), draft_style),
+            Paragraph("CliniScribe — Draft Consultation Note", h1),
+            Spacer(1, 3 * mm),
+        ]
 
-    story += field("Chief Complaint", note.chief_complaint, "chief_complaint")
-    story += field("History", note.history, "history")
+    story += field(
+        _label("chief_complaint", lang), note.chief_complaint, "chief_complaint"
+    )
+    story += field(_label("history", lang), note.history, "history")
 
     if note.symptoms:
-        story.append(Paragraph("Symptoms", h2))
+        story.append(Paragraph(_wrap_devanagari(_label("symptoms", lang)), h2))
         for s in note.symptoms:
             parts = [s.name]
             if s.finding_status != "Present":
@@ -142,7 +309,8 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
             key = f"symptoms.{s.name}"
             p_style = warn if key in low_conf else body
             flag = " ⚑" if key in low_conf else ""
-            story.append(Paragraph("• " + ", ".join(parts) + flag, p_style))
+            line = _wrap_devanagari(", ".join(parts))
+            story.append(Paragraph("• " + line + flag, p_style))
         story.append(Spacer(1, 2 * mm))
 
     # Always render vitals section with standard rows for Height/Weight/BP.
@@ -152,7 +320,7 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
     ordered_names = _VITAL_ORDER + [
         n for n in extracted_vitals if n not in _VITAL_ORDER
     ]
-    story.append(Paragraph("Vitals", h2))
+    story.append(Paragraph(_wrap_devanagari(_label("vitals", lang)), h2))
     data = [["Parameter", "Value"]]
     for name in ordered_names:
         v = extracted_vitals.get(name)
@@ -166,37 +334,54 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F4F6")),
                 ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [colors.white, colors.HexColor("#F9FAFB")],
+                ),
             ]
         )
     )
     story += [t, Spacer(1, 2 * mm)]
 
-    story += field("Examination", note.examination, "examination")
+    story += field(_label("examination", lang), note.examination, "examination")
 
     if note.diagnosis:
-        story.append(Paragraph("Diagnosis", h2))
+        story.append(Paragraph(_wrap_devanagari(_label("diagnosis", lang)), h2))
         for d in note.diagnosis:
             status = f" [{d.status}]" if d.status else ""
             snomed = f" (SNOMED: {d.snomed_id})" if d.snomed_id else ""
             flag = " ⚑" if f"diagnosis.{d.term}" in low_conf else ""
             p_style = warn if f"diagnosis.{d.term}" in low_conf else body
-            story.append(Paragraph(f"• {d.term}{status}{snomed}{flag}", p_style))
+            term = _wrap_devanagari(d.term)
+            story.append(Paragraph(f"• {term}{status}{snomed}{flag}", p_style))
         story.append(Spacer(1, 2 * mm))
 
     if note.medications:
-        story.append(Paragraph("Medications", h2))
-        data = [["Drug", "Dose", "Frequency", "Timing", "Duration", "Validated"]]
+        story.append(Paragraph(_wrap_devanagari(_label("medications", lang)), h2))
+        data = [
+            [
+                _label("drug", lang),
+                _label("dose", lang),
+                _label("frequency", lang),
+                _label("timing", lang),
+                _label("duration", lang),
+                "Validated",
+            ]
+        ]
         for m in note.medications:
             val_flag = "✓" if m.validated else "⚑ No"
-            data.append([
-                m.drug,
-                m.dose or "—",
-                m.frequency or "—",
-                m.timing or "—",
-                m.duration or "—",
-                val_flag,
-            ])
+            data.append(
+                [
+                    m.drug,
+                    m.dose or "—",
+                    m.frequency or "—",
+                    m.timing or "—",
+                    m.duration or "—",
+                    val_flag,
+                ]
+            )
         t = Table(
             data,
             colWidths=[38 * mm, 22 * mm, 28 * mm, 22 * mm, 22 * mm, 18 * mm],
@@ -207,7 +392,12 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F4F6")),
                     ("FONTSIZE", (0, 0), (-1, -1), 8),
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F9FAFB")]),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [colors.white, colors.HexColor("#F9FAFB")],
+                    ),
                     ("TEXTCOLOR", (-1, 1), (-1, -1), _WARN_COLOR),
                 ]
             )
@@ -215,28 +405,46 @@ def render(note: ClinicalNote, out_path: str | None = None) -> str:
         story += [t, Spacer(1, 2 * mm)]
 
     if note.investigations:
-        story.append(Paragraph("Investigations (Ordered)", h2))
+        story.append(Paragraph(_wrap_devanagari(_label("investigations", lang)), h2))
         for inv in note.investigations:
-            story.append(Paragraph(f"• {inv}", body))
+            story.append(Paragraph(f"• {_wrap_devanagari(inv)}", body))
         story.append(Spacer(1, 2 * mm))
 
     if note.diagnostic_results:
-        story.append(Paragraph("Diagnostic Results (Available)", h2))
+        story.append(
+            Paragraph(_wrap_devanagari(_label("diagnostic_results", lang)), h2)
+        )
         for res in note.diagnostic_results:
-            story.append(Paragraph(f"• {res}", body))
+            story.append(Paragraph(f"• {_wrap_devanagari(res)}", body))
         story.append(Spacer(1, 2 * mm))
 
-    story += field("Advice", note.advice, "advice")
-    story += field("Follow-up", note.follow_up, "follow_up")
+    story += field(_label("advice", lang), note.advice, "advice")
+    story += field(_label("follow_up", lang), note.follow_up, "follow_up")
 
     if low_conf:
         story.append(Spacer(1, 4 * mm))
         story.append(
-            Paragraph("<b>Items to verify before signing (⚑):</b>", warn)
+            Paragraph(f"<b>{_wrap_devanagari(_label('verify', lang))} (⚑):</b>", warn)
         )
         for flag in sorted(low_conf):
             story.append(Paragraph(f"• {_flag_sentence(flag)}", warn))
 
+    if signed:
+        signed_label = _wrap_devanagari(_label("signed", lang))
+        doctor_name = _wrap_devanagari(doctor["name"])
+        story.append(Spacer(1, 4 * mm))
+        story.append(
+            Paragraph(
+                f"{signed_label} — {doctor_name}, {date_str}",
+                signed_style,
+            )
+        )
+
     doc.build(story)
-    logger.info("L5: rendered draft PDF → %s", path)
+    logger.info(
+        "L5: rendered %s PDF (lang=%s) → %s",
+        "signed" if signed else "draft",
+        lang,
+        path,
+    )
     return path

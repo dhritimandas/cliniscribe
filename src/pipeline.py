@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 
 from dotenv import load_dotenv
 
@@ -46,13 +47,23 @@ def _write_turns(turns: list[Turn], path: str) -> None:
         json.dump([dataclasses.asdict(t) for t in turns], f, ensure_ascii=False, indent=2)
 
 
-def run(in_path: str, session_id: str | None = None) -> str:
+def run(
+    in_path: str,
+    session_id: str | None = None,
+    *,
+    on_stage: Callable[[str, str], None] | None = None,
+) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
     Args:
         in_path: Path to the input audio file.
         session_id: Consultation session ID; generated when omitted. All
             artifacts are written under outputs/<session_id>/.
+        on_stage: Optional callback invoked as `on_stage(name, event)` around
+            each stage, with `event` in `{"start", "end"}` and `name` one of
+            the stage_report keys (e.g. "l3_asr"). Used by the review-frontend
+            backend to mirror progress into status.json. Default None keeps
+            current behavior unchanged.
 
     Returns:
         Path to the generated draft prescription PDF
@@ -67,6 +78,8 @@ def run(in_path: str, session_id: str | None = None) -> str:
     stage_report: dict[str, dict[str, float]] = {}
 
     def _staged(name: str, fn, *args, **kwargs):
+        if on_stage:
+            on_stage(name, "start")
         t0 = time.perf_counter()
         result = fn(*args, **kwargs)
         gc.collect()
@@ -74,6 +87,8 @@ def run(in_path: str, session_id: str | None = None) -> str:
             "wall_s": round(time.perf_counter() - t0, 2),
             "peak_rss_mb_so_far": telemetry.peak_rss_mb(),
         }
+        if on_stage:
+            on_stage(name, "end")
         return result
 
     logger.info("L1: preprocessing %s", in_path)

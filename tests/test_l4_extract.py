@@ -372,6 +372,51 @@ def test_null_crash_regression_i18() -> None:
     assert isinstance(note.low_confidence_fields, list)
 
 
+def test_non_dict_list_item_skipped_not_crashed_idx99() -> None:
+    """Regression for idx=99 (live eval): a raw string mixed into a list field
+    must be skipped, not crash the whole extraction.
+
+    Root cause: on a live sample the model emitted a JSON formatting slip
+    where "vitals" was a list containing genuine vital dicts followed by
+    stray strings (a duplicate-key parsing artifact, e.g. "examination: null").
+    _build_note's list comprehensions called .get() on every item
+    unconditionally, so the first non-dict item raised
+    AttributeError("'str' object has no attribute 'get'"), caught by the
+    generic except-Exception branch in extract() and collapsing the whole
+    note to _empty_note() — losing every genuinely-extracted field, not just
+    the malformed one. Fixed by filtering to dict items before construction.
+    """
+    from src.l4_extract import _build_note
+
+    data = {
+        "chief_complaint": None,
+        "history": "",
+        "symptoms": "",  # garbled: string instead of list — already handled by `or []`
+        "vitals": [
+            {"name": "blood pressure", "value": "137/81"},
+            {"name": "pulse", "value": "71"},
+            "examination: null",  # malformed tail from a duplicate-key parse slip
+            "diagnosis: null",
+            "medications: null",
+        ],
+        "diagnosis": [
+            {"term": "raised total cholesterol", "snomed_id": None, "status": None},
+            "some garbled string",
+        ],
+        "medications": [
+            {"drug": "Tablet Calcirix XT", "dose": None, "frequency": "once daily"},
+            "garbled medication string",
+        ],
+        "investigations": [],
+        "diagnostic_results": [],
+        "low_confidence_fields": [],
+    }
+    note = _build_note(data)
+    assert [v.name for v in note.vitals] == ["blood pressure", "pulse"]
+    assert [d.term for d in note.diagnosis] == ["raised total cholesterol"]
+    assert [m.drug for m in note.medications] == ["Tablet Calcirix XT"]
+
+
 def test_cdsco_tablet_paracetamol_validates() -> None:
     """Regression for i=0: 'Tablet paracetamol' must validate as True.
 
@@ -571,3 +616,30 @@ def test_real_drug_name_untouched_by_generic_filter() -> None:
     data = {"medications": [{"drug": "Paracetamol", "dose": "650 mg"}]}
     note = _build_note(data)
     assert note.medications[0].drug == "Paracetamol"
+
+
+# ── Prompt-example leakage guard ──────────────────────────────────────────────
+
+
+def test_system_prompt_has_no_leaked_example_values() -> None:
+    """Rule 9's old few-shot lab values leaked verbatim into unrelated notes.
+
+    qwen2.5:3b copied "Hb is 9.2", "raised cholesterol", "HbA1c 9.1",
+    "Vitamin D low", "Total IGE 2107" from the prompt into diagnostic_results
+    on 6 of 24 frozen eval samples (idx 121, 131, 44, 49, 24, 140) — fabricated
+    lab results a physician could act on. Tripwire: the prompt must never
+    contain these concrete content-value examples again.
+    """
+    from src.l4_extract import _SYSTEM_PROMPT
+
+    leaked_examples = [
+        "Hb is 9.2",
+        "raised cholesterol",
+        "HbA1c 9.1",
+        "Vitamin D low",
+        "Total IGE 2107",
+    ]
+    for value in leaked_examples:
+        assert value not in _SYSTEM_PROMPT, (
+            f"Leaked example value {value!r} reintroduced into _SYSTEM_PROMPT"
+        )
