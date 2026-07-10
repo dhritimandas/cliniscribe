@@ -871,3 +871,54 @@ that ceiling and below the true-drop floor is the ASR fine-tuning target, and th
 per-class attribution means a future fine-tune can be scored on exactly the class
 it claims to fix — distorted-but-present drug tokens — rather than on an average
 that mixes in unfixable misses.
+
+---
+
+## Latency Phase — Instrument first, and the fix that failed its own gate (2026-07-10)
+
+### (a) What this phase does
+This phase measured where the pipeline's time actually goes before optimizing
+anything, then tested three latency levers against a hard rule: no accuracy
+change. Instrumentation (per-stage wall clock, model-load times, peak memory,
+written per session) showed transcription is 82–92% of end-to-end time and
+everything else is almost irrelevant. One lever shipped (warming the LLM during
+an earlier CPU-light stage), and two were measured and rejected — including the
+one we had believed in for weeks.
+
+### (b) Hardest bugs
+
+1. **Whole-file ASR — the designed fix — regressed the patient-safety metric
+   and was rejected.** The plan (recorded in HANDOFF since Phase A) was to stop
+   decoding per diarized segment and transcribe the whole file once, attaching
+   words to speakers by timestamp. Implemented and measured on the frozen set:
+   overall word error IMPROVED (0.52 → 0.43) but keyword error — drug names,
+   clinical terms — regressed badly (0.57 → 0.79). Root cause: one whole-file
+   pass locks the clip into a single detected language, so English clinical
+   terms embedded in Hindi speech get phonetically absorbed into Devanagari
+   ("lab test" → "लाप टेस्ट"). The per-segment decoding we wanted to remove was
+   accidentally PROTECTING code-switched terms, because each short segment
+   re-detects its own language. The documented flag for this (multilingual=True)
+   measured byte-identical — inert on clips short enough to fit one internal
+   chunk. Lesson: an improvement on the headline metric can be a regression on
+   the metric that matters; and a "textbook fix" is a hypothesis until measured.
+
+2. **Attribution under noise: the totals moved the wrong way while the change
+   worked.** After shipping the LLM warm-up, end-to-end totals LOOKED 14–16%
+   worse — because transcription (untouched by the change) drifted with thermal
+   state between runs, swamping the real gain. The honest resolution was a
+   variance envelope: isolate the changed stage and repeat it — warm inference
+   spread was 0.4s across runs while the cold-start penalty was 12.8s, so the
+   improvement is ~30x the noise floor. Lesson: when the dominant stage is
+   noisy, never present end-to-end totals as evidence about a non-dominant
+   stage; measure the changed stage against its own repeat-variance.
+
+### (c) Fine-tuning hook
+The latency ceiling is transcription itself: ~20x real-time on CPU with the
+current model, and both safe software levers are exhausted (whole-file decoding
+fails the accuracy gate; more threads are slower on this chip). The remaining
+latency moves are (1) hiding transcription inside recording time — designed,
+deferred until a capture UI exists (docs/incremental_capture_design.md) — and
+(2) a smaller or quantized ASR model, which is an ACCURACY decision, not a
+latency one: any model swap must clear the frozen keyword/drug-WER gate first,
+and the code-switch absorption failure above predicts exactly where a smaller
+model will break.
