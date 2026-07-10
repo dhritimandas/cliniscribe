@@ -764,3 +764,60 @@ jargon without a one-line definition):
 ### (c) Fine-tuning hook
 <one thing that will matter when we fine-tune later>
 ```
+
+---
+
+## Phase B Hardening — Honest rulers, context windows, and the drug bench (2026-07-10)
+
+### (a) What this phase does
+This phase repaired the measurement instruments (the "rulers") and the two worst
+production defects they had been hiding, then built a drug-keyword bench large
+enough to say something real about drug-name recovery. The eval scorer moved from
+substring matching (which counted "ors" as found inside "doctors") to
+token-boundary matching, the L4 extractor got the context window it silently
+lacked, and a 49-clip frozen drug bench replaced a 7-term sample that could not
+measure recovery at all. Every fix was measured on frozen data before and after,
+with the drug-bench holdout kept blind to all fix decisions.
+
+### (b) Hardest bugs
+
+1. **Six of twelve Hindi/Marathi consultations extracted nothing — blamed on the
+   model, caused by a config default.** Root cause: `extract()` never set
+   Ollama's `num_ctx`, and the default (4096 tokens) silently truncates long
+   Devanagari transcripts (a 5.4k-character transcript is ~5,000 tokens — 
+   Devanagari costs roughly one token per character). The truncation cut off the
+   system prompt containing the JSON schema, so the model returned literally
+   `{}`. The failure correlated perfectly with transcript LENGTH, not script or
+   language — that correlation, visible in ten minutes of static analysis, was
+   the tell that pointed away from the "3B Devanagari capability gap" hypothesis
+   the previous phase had recorded. Fix: `EXTRACT_NUM_CTX=16384`. All five
+   previously-empty samples now produce full notes; frozen-set aggregate recall
+   rose 0.306 → 0.495. Lesson (fourth occurrence): when a model "fails", first
+   prove the model actually SAW the input.
+
+2. **The drug normalizer's new fuzzy tier deleted a dose.** Extending fuzzy
+   CDSCO matching to Latin spans made "paracetamol 625" match the canonical
+   entry "paracetamol" (similarity 0.88) — and the substitution replaced the
+   span, silently discarding "625". Root cause: span-replacement semantics
+   assumed the canonical form carries at least as much information as the span
+   it replaces, which is false whenever the canonical is a prefix of a
+   drug+dose phrase. On a prescription, a deleted dose is a patient-safety
+   incident, not a rounding error. Fix: a substitution may never remove a digit
+   token that does not survive in the canonical form; regression-tested. Lesson:
+   any automatic text substitution in a clinical pipeline needs an information-
+   preservation invariant, not just a similarity threshold.
+
+### (c) Fine-tuning hook
+The 49-clip drug bench decomposes drug misses into classes with different owners:
+distorted-but-present forms dominate (15 of 18 dev misses), and a measured subset
+is text-recoverable (dev drug WER 0.750 → 0.600 via the Latin-span tier plus
+script-symmetric scoring). The residual distorted class — Devanagari brand
+variants like जिफिट for ज़ीफी (Zifi) at ~0.67 similarity — sits BELOW any safe
+substitution threshold: mapping it by text risks substituting the wrong drug.
+That class is precisely what ASR fine-tuning on a domain corpus should fix, and
+the bench now provides the frozen before-number and metric ladder
+(raw → normalized → folded) to prove whether it did. Open hypothesis for a fresh
+bench slice (rows 60+): extending the Latin fuzzy tier's lexicon from CDSCO-only
+to include curated brand values would recover 1-char Latin brand distortions
+("glycomate" → Glycomet); it was discovered by inspecting the holdout, so it
+must be validated on data neither dev nor holdout has touched.
