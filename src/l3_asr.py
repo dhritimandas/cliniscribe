@@ -58,7 +58,10 @@ def _doctor_score(text: str) -> int:
 
 
 def transcribe(
-    wav_path: str, segments: list[Segment], model: WhisperModel | None = None
+    wav_path: str,
+    segments: list[Segment],
+    model: WhisperModel | None = None,
+    on_progress=None,
 ) -> list[Turn]:
     """Transcribe each diarized segment and assign a speaker role.
 
@@ -69,6 +72,11 @@ def transcribe(
             and NOT released — for eval harnesses iterating many clips, where
             per-clip model loading dominates runtime. Production passes None:
             load, use, release (the 24 GB memory discipline).
+        on_progress: Optional callback(done_seconds, total_seconds) invoked
+            after each segment decodes — real transcription progress (decoded
+            audio seconds over total segment seconds), used by the review
+            frontend for the percent/ETA display. Exceptions are swallowed:
+            progress reporting must never break transcription.
 
     Returns:
         List of Turn(speaker_role, text, start, end) in chronological order.
@@ -113,6 +121,9 @@ def transcribe(
         )
         return " ".join(chunk.text.strip() for chunk in gen).strip()
 
+    total_seconds = sum(max(0.0, s.end - s.start) for s in segments)
+    done_seconds = 0.0
+
     raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
     for seg in segments:
         text = _decode(seg, language=None)
@@ -133,6 +144,13 @@ def transcribe(
 
         if text:
             raw_turns.append((seg.speaker, text, seg.start, seg.end))
+
+        done_seconds += max(0.0, seg.end - seg.start)
+        if on_progress is not None:
+            try:
+                on_progress(done_seconds, total_seconds)
+            except Exception:
+                logger.debug("on_progress callback failed (ignored)", exc_info=True)
 
     if owns_model:
         del model
