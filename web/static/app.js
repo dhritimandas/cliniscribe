@@ -946,8 +946,19 @@ function toggleProvenance(path) {
   const panel = noteGrid.querySelector(`.prov[data-prov-for="${path}"]`);
   if (!panel) return;
   const isOpen = !panel.hidden;
-  if (isOpen) {
+  const drawerOpen = drawerEl.classList.contains("open");
+  if (isOpen && drawerOpen) {
     panel.hidden = true;
+    return;
+  }
+  if (isOpen && !drawerOpen) {
+    // Defensive desync recovery: the panel's own flag says open but the
+    // drawer visually is not (e.g. a future path closes the drawer without
+    // going through closeDrawer()) — re-open + re-scroll rather than
+    // silently closing a panel the user can no longer see, which would
+    // read as the button doing nothing.
+    const prov = provenanceData[path];
+    if (prov) scrollDrawerToTurn(prov.turn_index);
     return;
   }
   const parts = [];
@@ -1018,8 +1029,16 @@ document.getElementById("view-transcript-btn").addEventListener("click", () => {
 
 // Bug 2: the drawer must never trap the user — close via the pinned CLOSE
 // button, Escape, or a click anywhere outside it.
+// Bug A (drawer/panel state desync): closing the drawer must also reset
+// every per-field .prov panel's own open/closed flag, so the two states
+// (drawer open, panel hidden) never fall out of sync — otherwise re-clicking
+// the same source button after a close reads panel.hidden as still "open"
+// and toggleProvenance() silently closes it instead of reopening the drawer.
 function closeDrawer() {
   drawerEl.classList.remove("open");
+  document.querySelectorAll(".prov").forEach((panel) => {
+    panel.hidden = true;
+  });
 }
 
 document.getElementById("drawer-close-btn").addEventListener("click", closeDrawer);

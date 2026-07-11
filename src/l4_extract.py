@@ -1,8 +1,10 @@
 """L4 — Clinical entity extraction via Qwen2.5-3B-Instruct (Ollama)."""
 
+import difflib
 import json
 import logging
 import re
+import unicodedata
 
 from src import config
 from src.cdsco import validate_drug
@@ -69,7 +71,11 @@ transcript below.
 "once in the morning", "1-0-1". Extract it whenever a dosing schedule is stated. \
 TIMING is ONLY for meal-relative context: "before food", "after food", "with food". \
 Time-of-day phrases ("at night", "SOS", "in the morning") and dosing notation \
-("1-0-0", "BD/SOS") belong in frequency, not timing.\
+("1-0-0", "BD/SOS") belong in frequency, not timing.
+12. DRUG names must be copied EXACTLY as written in the transcript — the same \
+characters, in the same script. Never transliterate, translate, or re-spell a \
+drug name into a different script or a different spelling than what appears \
+in the transcript.\
 """
 
 
@@ -156,6 +162,99 @@ def _diagnosis_has_overlap(term: str, transcript_tokens: set[str]) -> bool:
     return bool(term_tokens & transcript_tokens)
 
 
+# ── Drug-name source-fidelity restoration (deterministic backstop) ─────────
+# qwen2.5:3b sometimes re-spells a Latin-script drug name spoken in the
+# transcript into Devanagari, or otherwise distorts its spelling, instead of
+# copying it verbatim (real case: transcript "naxdom 500" -> LLM "नक्सडम 500").
+# CDSCO validation then fails on an invented spelling. This is a source-
+# fidelity restoration, not a lexicon lookup: we only ever substitute text
+# that was actually said in the transcript, so there is no wrong-drug
+# substitution risk the way there would be with a fuzzy drug-list match.
+
+# Adapted from eval/drug_bench.py's _fold (reimplemented here, not imported —
+# eval/ and src/ are separate module boundaries). "क्स"/"क्श" are common
+# Devanagari digraphs for the English "x" sound in loanwords (टैक्स, बॉक्स,
+# एक्स-रे); folded to "x" before the per-character pass, since the
+# per-character map alone renders them as "ks", which folds far from the
+# Latin spelling of names that use "x".
+_DRUG_FOLD_DIGRAPHS: tuple[tuple[str, str], ...] = (("क्स", "x"), ("क्श", "x"))
+_DRUG_FOLD_MAP: dict[str, str] = {
+    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
+    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
+    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
+    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
+    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
+    "ज़": "z", "फ़": "f", "ा": "a", "ि": "i", "ी": "i", "ु": "u",
+    "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
+    "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
+    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+}
+_DRUG_FOLD_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
+_DRUG_WINDOW_SIZES: tuple[int, ...] = (1, 2, 3, 4)
+_DRUG_RESTORE_MIN_SIMILARITY = 0.80
+_ROLE_TAG_RE = re.compile(r"\[(?:DOCTOR|PATIENT|UNKNOWN)\]:\s*")
+
+
+def _fold_drug(text: str) -> str:
+    """Coarse phonetic fold: Devanagari→Latin, lowercase, alnum+space only."""
+    text = unicodedata.normalize("NFC", text)
+    for digraph, latin in _DRUG_FOLD_DIGRAPHS:
+        text = text.replace(digraph, latin)
+    folded = "".join(_DRUG_FOLD_MAP.get(ch, ch) for ch in text)
+    return _DRUG_FOLD_NON_ALNUM_RE.sub("", folded.lower())
+
+
+def _transcript_word_windows(transcript: str) -> list[str]:
+    """Return every contiguous window (sizes 1-4) of transcript surface words.
+
+    Role-tag prefixes ("[DOCTOR]: ") are stripped first so they never enter a
+    window's surface text.
+    """
+    words = _ROLE_TAG_RE.sub("", transcript).split()
+    windows: list[str] = []
+    for n in _DRUG_WINDOW_SIZES:
+        for i in range(len(words) - n + 1):
+            windows.append(" ".join(words[i : i + n]))
+    return windows
+
+
+def _restore_drug_spelling(drug: str, transcript: str) -> str:
+    """Replace an LLM-re-spelled drug string with the transcript's own spelling.
+
+    Returns `drug` unchanged when it already fold-matches a transcript window
+    exactly, or when no window reaches fold-similarity >= 0.80 (nothing safe
+    to substitute). Otherwise returns the transcript's own surface text for
+    the best-matching window. Digits in `drug` (a dose glued onto the drug
+    name) are always preserved, even if the matched window doesn't include
+    them — never lose dose info to a restoration.
+    """
+    windows = _transcript_word_windows(transcript)
+    if not windows:
+        return drug
+
+    drug_fold_despaced = _fold_drug(drug).replace(" ", "")
+    if drug_fold_despaced and any(
+        _fold_drug(w).replace(" ", "") == drug_fold_despaced for w in windows
+    ):
+        return drug  # already an exact fold match — nothing to restore
+
+    best_window, best_ratio = "", 0.0
+    drug_fold = _fold_drug(drug)
+    for window in windows:
+        ratio = difflib.SequenceMatcher(None, drug_fold, _fold_drug(window)).ratio()
+        if ratio > best_ratio:
+            best_window, best_ratio = window, ratio
+
+    if best_ratio < _DRUG_RESTORE_MIN_SIMILARITY:
+        return drug  # nothing close enough in the transcript — keep as-is
+
+    digit_tokens = re.findall(r"\d+", drug)
+    missing_digits = [d for d in digit_tokens if d not in re.findall(r"\d+", best_window)]
+    if missing_digits:
+        return f"{best_window} {' '.join(missing_digits)}".strip()
+    return best_window
+
+
 def _iter_dicts(items: list, field_name: str) -> list[dict]:
     """Filter a list field to well-formed dict items, skipping malformed ones.
 
@@ -229,6 +328,14 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             if flag not in low_conf:
                 low_conf.append(flag)
             drug = label
+        else:
+            restored = _restore_drug_spelling(drug, transcript)
+            if restored != drug:
+                logger.info(
+                    "L4: restored drug spelling %r -> %r (source-fidelity backstop)",
+                    drug, restored,
+                )
+                drug = restored
         medications.append(
             Medication(
                 drug=drug,
