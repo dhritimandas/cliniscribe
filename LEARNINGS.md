@@ -1122,3 +1122,78 @@ form. Those logs, joined with corrections.jsonl, give a labeled dataset of
 exactly the token-fidelity failures an extraction fine-tune (or a
 constrained-decoding scheme locking drug spans to transcript substrings)
 should be evaluated against.
+
+---
+
+## Drug Canonicalization Phase — Skeletons, crowded streets, and the audit the metric couldn't do (2026-07-11)
+
+### (a) What this phase does
+This phase replaced the losing game of hand-listing every possible drug
+misspelling with a matcher that absorbs variants automatically: every drug
+name (546 now, up from 163) is reduced to a phonetic "sound skeleton" —
+script, vowel marks, doubling, and spacing stripped away, leaving the
+consonant backbone that speech recognition reliably preserves — and incoming
+words are matched skeleton-to-skeleton, with a bounded allowance for
+distortion. The same phase built the safety apparatus that makes fuzzy
+matching tolerable in medicine at all: an exhaustive substitution audit, a
+length floor, and an ambiguity guard. It also hardened extraction so that a
+drug name the model invents (like "nasal spray" for नैक्स्टोम) can never
+render as a real drug.
+
+### (b) Hardest bugs
+
+1. **The matcher turned "two-three" into a drug, and the accuracy score
+   could not see it.** With the initially specified tolerance (one letter of
+   slack from skeleton length 5), the new tier converted दो तीन ("two-three")
+   into Drotin, a fragment around "vital" into Revital, and a doctor's
+   surname (Pandey) into Pan-D — three invented drugs. The headline accuracy
+   number was byte-identical with and without them, because that metric only
+   asks "how many REAL drugs did we find?" — inserting a wrong drug removes
+   no real one. Root cause, in two layers: (i) metric blindness — recall
+   cannot see false alarms; and (ii) the geometry of short words — the space
+   of short skeletons is crowded (everyday words live there), so any short
+   drug skeleton has innocent neighbors one step away, while long skeletons
+   sit in nearly empty space where a near-miss is almost certainly the drug
+   itself. The catch came from a dedicated substitution audit: run the whole
+   test set with the new tier ON and OFF, diff to isolate every substitution
+   the new code made, and adjudicate each one against the recording's
+   human-written answer key (similarity explains why the machine guessed;
+   only the answer key says whether the guess is TRUE). The fix was a rule,
+   not a blacklist: raise the floor — no fuzzy matching below skeleton
+   length 9, exact match only — accepting the loss of one correct short
+   match (टिल्मा→Telma) to eliminate all three wrong ones, because the cost
+   matrix is asymmetric: an unmatched drug shows as "unnamed — VERIFY" and
+   costs the doctor five seconds; a wrong drug prints on a prescription.
+   Re-audit after the fix: zero wrong substitutions across all 59 cached
+   recordings. Second rail: if a skeleton sits within tolerance of TWO
+   different drugs (albendazole/mebendazole, one letter apart, both real),
+   the system refuses to choose and flags instead.
+
+2. **The fast engine hallucinated fluent Portuguese on Hindi speech — and
+   the repetition detector was structurally blind to it.** The fast-ASR
+   gate run surfaced a hallucination class beyond the documented repetition
+   loops: confident, fluent, wrong-language text ("Obrigada", Turkish,
+   Indonesian) on Hindi clinical audio. It isn't repetitive, dense, or
+   empty, so every lexical signal (compression ratio, n-gram repeats,
+   chars/sec) passes it. Root cause of the blindness: the detector was
+   built from the failure taxonomy we had OBSERVED, and a new failure class
+   sat outside it. The mitigating fact discovered in the same run: the
+   engine itself reports its detected language — the misdetection is
+   sitting in the metadata, so an allowlist (we support exactly hi/en/mr)
+   plus a forced-Hindi re-decode catches it deterministically, the same
+   pattern that fixed the Urdu-script incident. Bonus root cause from the
+   same gate: ~9-10s FIXED cost per decode call regardless of audio length
+   (Whisper pads every input to a 30-second window), so latency scales
+   with segment COUNT, not duration — the fix is fewer, fuller windows,
+   not a faster model.
+
+### (c) Fine-tuning hook
+The substitution audit is reusable as a standing harness: any future change
+to drug matching (or a fine-tuned extraction model) can be diff-audited the
+same way — every changed drug decision logged and adjudicated against gold —
+turning "did the score move?" into "show me every action you took."
+Meanwhile the audit's false-alarm examples (दो तीन→Drotin class) are exactly
+the hard negatives a learned drug-NER or constrained-decoding scheme should
+train against, and the wrong-language hallucination clips join the
+repetition-loop clips (f2096fbd, 1ae62262) in the acceptance set any
+fine-tuned ASR must clear.
