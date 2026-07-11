@@ -454,12 +454,85 @@ def test_translate_caches_to_disk_and_serves_repeat_calls(client, monkeypatch) -
     assert os.path.exists(os.path.join("outputs", sid, "translations_hi.json"))
 
 
-def test_translate_english_is_a_no_op(client) -> None:
+def test_translate_lang_en_skips_already_latin_script_text(client) -> None:
+    """lang="en" is a real target now, not a blanket no-op — but text that is
+    already Latin-script (no Devanagari/Arabic) needs no Ollama call at all."""
     sid = _create_session(client)
     _write_note(sid, ClinicalNote(chief_complaint="fever", history=None))
 
     response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "en"})
     assert response.json() == {"note_values": {}, "transcript": []}
+
+
+def test_translate_lang_en_translates_non_latin_source_text(client, monkeypatch) -> None:
+    """Bug 1 (target-language-absolute): a Devanagari-script note value
+    selecting English must actually translate to English, not pass through."""
+    sid = _create_session(client)
+    _write_note(sid, ClinicalNote(chief_complaint="बुखार", history=None))
+    _write_transcript(
+        sid,
+        [{"speaker_role": "PATIENT", "text": "मुझे बुखार है", "start": 0.0, "end": 2.0}],
+    )
+
+    calls = _stub_ollama_batch_translate(monkeypatch, [["Fever"], ["I have a fever"]])
+
+    response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "en"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["note_values"] == {"chief_complaint": "Fever"}
+    assert body["transcript"] == ["I have a fever"]
+    assert len(calls) == 2  # one batch call for note values, one for transcript
+
+
+def test_translate_per_item_retry_on_batch_misalignment_and_partial_failure(
+    client, monkeypatch
+) -> None:
+    """Per-item robustness (Bug 1 hardening): a misaligned batch response
+    falls back to per-item calls; one item's translation failure yields that
+    item's original text untranslated, never a blank value or a crash."""
+    sid = _create_session(client)
+    _write_note(
+        sid,
+        ClinicalNote(chief_complaint="बुखार", history="सरदर्द है", examination=None),
+    )
+    _write_transcript(sid, [])
+
+    class _FakeMessage:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.message = _FakeMessage(content)
+
+    calls: list[list[str]] = []
+
+    def fake_chat(model, messages, **kwargs):
+        payload = json.loads(messages[1]["content"])
+        calls.append(payload)
+        if len(payload) == 2:
+            # Simulate a misaligned batch translation (wrong length).
+            return _FakeResponse(json.dumps(["only one item"]))
+        # Per-item retry: one text succeeds, one raises to simulate failure.
+        text = payload[0]
+        if text == "सरदर्द है":
+            raise RuntimeError("ollama boom")
+        return _FakeResponse(json.dumps([f"translated: {text}"]))
+
+    import ollama
+
+    monkeypatch.setattr(ollama, "chat", fake_chat)
+
+    response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "hi"})
+    assert response.status_code == 200
+    body = response.json()
+    # chief_complaint recovered via per-item retry; history kept as original
+    # (untranslated, never blank) because its individual retry raised.
+    assert body["note_values"] == {
+        "chief_complaint": "translated: बुखार",
+        "history": "सरदर्द है",
+    }
+    assert len(calls) == 3  # 1 batch attempt + 2 per-item retries
 
 
 def test_translate_unsupported_language_is_400(client) -> None:

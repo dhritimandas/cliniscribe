@@ -363,7 +363,20 @@ def get_pdf(sid: str, lang: str = "en") -> FileResponse:
 # translated — dosage and numeric clinical safety (contract note).
 _TRANSLATABLE_SCALAR_FIELDS = ("chief_complaint", "history", "examination", "advice", "follow_up")
 
-_OLLAMA_LANG_NAMES = {"hi": "Hindi", "mr": "Marathi"}
+_OLLAMA_LANG_NAMES = {"en": "English", "hi": "Hindi", "mr": "Marathi"}
+
+# Script ranges used to decide whether a string is already in the requested
+# target script, so target=en never burns an Ollama call translating text
+# that is already Latin-script (identity translation) — same Devanagari
+# range as src/l5_render.py; Arabic range per contract (covers Urdu, a
+# legacy ASR misdetection some sessions carry in Latin-labelled fields).
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+_ARABIC_RE = re.compile(r"[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]")
+
+
+def _needs_translation_to_en(text: str) -> bool:
+    """Whether `text` carries non-Latin script and so needs translating to en."""
+    return bool(_DEVANAGARI_RE.search(text) or _ARABIC_RE.search(text))
 
 
 def _translatable_note_values(note_data: dict[str, Any]) -> dict[str, str]:
@@ -437,6 +450,56 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     return [str(item) for item in translated]
 
 
+def _translate_texts_robust(texts: list[str], lang: str) -> list[str]:
+    """Translate `texts` into `lang`, aligned index-for-index; never raises.
+
+    Tries one batched call first. If the batch call fails outright or comes
+    back misaligned (wrong length — an occasional Qwen JSON-array slip), it
+    falls back to translating each string individually; if an individual
+    item's translation call also fails, that item's ORIGINAL text is kept
+    (never blank, never a crash, never lets one bad item fail the group).
+    """
+    if not texts:
+        return []
+    try:
+        translated = _translate_batch_via_ollama(texts, lang)
+        if len(translated) == len(texts):
+            return translated
+        logger.warning(
+            "Ollama batch translation length mismatch (%d texts, %d results); "
+            "retrying item-by-item",
+            len(texts),
+            len(translated),
+        )
+    except Exception:
+        logger.exception("Ollama batch translation failed; retrying item-by-item")
+
+    results: list[str] = []
+    for text in texts:
+        try:
+            item = _translate_batch_via_ollama([text], lang)
+            results.append(item[0] if item else text)
+        except Exception:
+            logger.exception("Ollama per-item translation failed; keeping original")
+            results.append(text)
+    return results
+
+
+def _translate_needed_indices(texts: list[str], lang: str) -> list[int]:
+    """Indices of `texts` that actually need translating into `lang`.
+
+    For lang="en", skip strings that carry no Devanagari/Arabic script (they
+    are already effectively English/Latin — no point burning a Qwen call on
+    an identity translation). For hi/mr, translate every non-empty string:
+    the source could be English, Devanagari, or (per a legacy ASR
+    misdetection some sessions carry) Arabic script, and script alone can't
+    disambiguate Hindi from Marathi, so there is no cheap skip available.
+    """
+    if lang == "en":
+        return [i for i, text in enumerate(texts) if _needs_translation_to_en(text)]
+    return list(range(len(texts)))
+
+
 def _translations_cache_path(sid: str, lang: str) -> str:
     return os.path.join(OUTPUTS_ROOT, sid, f"translations_{lang}.json")
 
@@ -445,18 +508,19 @@ def _translations_cache_path(sid: str, lang: str) -> str:
 def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
     """Translate the note's free-text values and transcript turns for display.
 
-    Display-only: note.json and transcript.json on disk always keep the
-    source language; this only feeds the review screen's translated view.
-    Results are cached per (session, lang) in `translations_<lang>.json` and
-    served from cache on repeat calls.
+    Target-language-absolute (contract fix): "en" is a real target, not a
+    no-op — selecting English always shows English regardless of the note's
+    source script, and hi/mr always show hi/mr. Display-only: note.json and
+    transcript.json on disk always keep the source language; this only feeds
+    the review screen's translated view. Results are cached per (session,
+    lang) in `translations_<lang>.json` (including lang="en") and served from
+    cache on repeat calls, so repeated en<->hi<->mr switching is idempotent.
     """
     _session_dir(sid)
     if body.lang not in _SUPPORTED_LANGS:
         raise HTTPException(
             status_code=400, detail=f"Unsupported language: {body.lang}"
         )
-    if body.lang == "en":
-        return {"note_values": {}, "transcript": []}
 
     cache_path = _translations_cache_path(sid, body.lang)
     if os.path.exists(cache_path):
@@ -467,17 +531,30 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
 
     note_values = _translatable_note_values(note_data)
     paths = list(note_values)
-    translated_note_texts = _translate_batch_via_ollama(
-        [note_values[p] for p in paths], body.lang
-    )
-    translated_turns = _translate_batch_via_ollama(
-        [turn.text for turn in turns], body.lang
-    )
+    note_texts = [note_values[p] for p in paths]
+    turn_texts = [turn.text for turn in turns]
 
-    result = {
-        "note_values": dict(zip(paths, translated_note_texts)),
-        "transcript": translated_turns,
-    }
+    note_needs = _translate_needed_indices(note_texts, body.lang)
+    translated_note_by_idx = dict(
+        zip(
+            note_needs,
+            _translate_texts_robust([note_texts[i] for i in note_needs], body.lang),
+        )
+    )
+    note_values_out = {paths[i]: text for i, text in translated_note_by_idx.items()}
+
+    turn_needs = _translate_needed_indices(turn_texts, body.lang)
+    translated_turn_by_idx = dict(
+        zip(
+            turn_needs,
+            _translate_texts_robust([turn_texts[i] for i in turn_needs], body.lang),
+        )
+    )
+    translated_turns = [
+        translated_turn_by_idx.get(i, text) for i, text in enumerate(turn_texts)
+    ]
+
+    result = {"note_values": note_values_out, "transcript": translated_turns}
     _write_json(cache_path, result)
     return result
 

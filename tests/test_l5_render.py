@@ -183,6 +183,38 @@ def test_devanagari_symptom_value_renders_without_error(
     assert os.path.exists(path)
 
 
+def test_arabic_script_advice_renders_without_error_and_in_text_layer(
+    tmp_path,
+) -> None:
+    """Bug 4: an Arabic/Urdu-script value (e.g. a legacy ASR misdetection)
+    must render as visible glyphs, not crash and not vanish silently.
+
+    Reportlab has no bidi/shaping engine, so the extracted glyph order is not
+    guaranteed to match the logical reading order (known, documented
+    limitation) — this only asserts that genuine Arabic-range characters
+    made it into the PDF's text layer, not an exact substring match.
+    """
+    note = _simple_note(advice="اس کو دو بار لیں")
+    out = str(tmp_path / "rx_arabic.pdf")
+    path = render(note, out_path=out)
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert any("؀" <= ch <= "ۿ" for ch in text)
+
+
+def test_mixed_devanagari_arabic_latin_string_wraps_each_script_run() -> None:
+    """Each script run gets its own font face; Latin text passes through
+    unwrapped — mixed-script safety in all three directions at once."""
+    arabic_word = "بخار"  # بخار
+    devanagari_word = "बुखार"  # बुखार
+    wrapped = l5_render._wrap_scripts(f"Take {arabic_word} {devanagari_word} now")
+    assert wrapped.count("<font") == 2
+    assert 'face="NotoNaskhArabic"' in wrapped
+    assert 'face="NotoSansDevanagari"' in wrapped
+    assert wrapped.startswith("Take ")
+    assert wrapped.endswith(" now")
+
+
 def test_real_web_translations_module_wires_up_correctly(tmp_path) -> None:
     """Integration proof: web.translations (owned by another agent, built in
     parallel) is picked up as-is, with no monkeypatch, for lang="hi"."""

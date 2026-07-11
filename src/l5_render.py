@@ -29,31 +29,42 @@ _WARN_COLOR = colors.HexColor("#D97706")  # amber — low-confidence flag
 _DRAFT_COLOR = colors.HexColor("#DC2626")  # red — draft watermark
 _SIGNED_COLOR = colors.HexColor("#374151")  # grayscale — signed header/footer
 
-# Vendored Unicode font for Devanagari text runs (hi/mr labels, and any
-# Devanagari values regardless of language). This particular Noto static
-# build has NO Latin glyphs, so it must only ever wrap Devanagari-script
-# substrings, never a whole mixed-script string — see _wrap_devanagari.
-_FONT_NAME = "NotoSansDevanagari"
-_FONT_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "web"
-    / "fonts"
-    / f"{_FONT_NAME}-Regular.ttf"
-)
-_DEVANAGARI_FONT_AVAILABLE = False
-if _FONT_PATH.exists():
-    try:
-        pdfmetrics.registerFont(TTFont(_FONT_NAME, str(_FONT_PATH)))
-        _DEVANAGARI_FONT_AVAILABLE = True
-    except Exception:
-        logger.warning("Could not register Devanagari font at %s", _FONT_PATH)
-else:
-    logger.warning(
-        "Devanagari font not found at %s; hi/mr text will render with missing glyphs",
-        _FONT_PATH,
-    )
+# Vendored Unicode fonts for non-Latin script runs. Both of these Noto static
+# builds have NO Latin glyphs, so each must only ever wrap its own script's
+# substrings, never a whole mixed-script string — see _wrap_scripts.
+_DEVANAGARI_FONT_NAME = "NotoSansDevanagari"
+_ARABIC_FONT_NAME = "NotoNaskhArabic"
+_FONTS_DIR = Path(__file__).resolve().parent.parent / "web" / "fonts"
+_DEVANAGARI_FONT_PATH = _FONTS_DIR / f"{_DEVANAGARI_FONT_NAME}-Regular.ttf"
+_ARABIC_FONT_PATH = _FONTS_DIR / f"{_ARABIC_FONT_NAME}-Regular.ttf"
 
-_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]+")
+
+def _register_font(name: str, path: Path) -> bool:
+    """Register a vendored TTF with reportlab; return whether it is usable."""
+    if not path.exists():
+        logger.warning(
+            "%s font not found at %s; matching text will render with missing glyphs",
+            name,
+            path,
+        )
+        return False
+    try:
+        pdfmetrics.registerFont(TTFont(name, str(path)))
+        return True
+    except Exception:
+        logger.warning("Could not register %s font at %s", name, path)
+        return False
+
+
+_DEVANAGARI_FONT_AVAILABLE = _register_font(_DEVANAGARI_FONT_NAME, _DEVANAGARI_FONT_PATH)
+_ARABIC_FONT_AVAILABLE = _register_font(_ARABIC_FONT_NAME, _ARABIC_FONT_PATH)
+
+# Devanagari: U+0900-U+097F. Arabic script (covers Urdu, which is written in
+# the Arabic script): U+0600-U+06FF, U+0750-U+077F, U+08A0-U+08FF (Arabic
+# Extended-A), U+FB50-U+FDFF and U+FE70-U+FEFF (Arabic Presentation Forms).
+_DEVANAGARI_CHARS = "ऀ-ॿ"
+_ARABIC_CHARS = "؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿"
+_SCRIPT_RUN_RE = re.compile(f"(?P<deva>[{_DEVANAGARI_CHARS}]+)|(?P<arab>[{_ARABIC_CHARS}]+)")
 
 try:
     from web.translations import TRANSLATIONS as LABELS
@@ -157,25 +168,38 @@ def _label(key: str, lang: str) -> str:
     return _EN_FALLBACK.get(key, key)
 
 
-def _wrap_devanagari(text: str) -> str:
-    """Wrap Devanagari-script runs in the vendored Unicode font face.
+def _wrap_scripts(text: str) -> str:
+    """Wrap Devanagari- and Arabic-script runs in their vendored font faces.
 
     Everything else is left untouched (rendered in the paragraph's default
-    Latin-capable font). This is mixed-script safe in both directions: the
-    default font can't render Devanagari, and the vendored Devanagari font
-    has no Latin glyphs — so a run must never be rendered whole in one font.
-    Returns `text` unchanged when there is nothing Devanagari to wrap (the
-    common lang="en" path), which keeps that path byte-for-byte identical to
-    before this function existed.
+    Latin-capable font). This is mixed-script safe in both directions for
+    both scripts: the default font can't render Devanagari or Arabic, and
+    neither vendored font has Latin glyphs — so a run must never be rendered
+    whole in one font. Returns `text` unchanged when there is nothing
+    Devanagari/Arabic to wrap (the common lang="en" path), which keeps that
+    path byte-for-byte identical to before this function existed.
+
+    Reportlab does not shape or bidi-reorder text: an Arabic-script run
+    renders as isolated glyph forms in logical (left-to-right in the source
+    string) order, not the visually-correct joined, right-to-left result a
+    real Arabic text-shaping engine would produce. This is legible but not
+    typographically correct — a known limitation, not something this
+    function (or reportlab, without a shaping engine) can fix.
     """
-    if not text or not _DEVANAGARI_FONT_AVAILABLE or not _DEVANAGARI_RE.search(text):
+    if not text or not _SCRIPT_RUN_RE.search(text):
         return text
     out: list[str] = []
     last = 0
-    for m in _DEVANAGARI_RE.finditer(text):
+    for m in _SCRIPT_RUN_RE.finditer(text):
         if m.start() > last:
             out.append(text[last : m.start()])
-        out.append(f'<font face="{_FONT_NAME}">{_xml_escape(m.group())}</font>')
+        run = m.group()
+        if m.group("deva") is not None and _DEVANAGARI_FONT_AVAILABLE:
+            out.append(f'<font face="{_DEVANAGARI_FONT_NAME}">{_xml_escape(run)}</font>')
+        elif m.group("arab") is not None and _ARABIC_FONT_AVAILABLE:
+            out.append(f'<font face="{_ARABIC_FONT_NAME}">{_xml_escape(run)}</font>')
+        else:
+            out.append(run)
         last = m.end()
     if last < len(text):
         out.append(text[last:])
@@ -264,16 +288,16 @@ def render(
             return []
         s = warn if (field_key and field_key in low_conf) else body
         flag = " ⚑" if (field_key and field_key in low_conf) else ""
-        label_r, value_r = _wrap_devanagari(label), _wrap_devanagari(value)
+        label_r, value_r = _wrap_scripts(label), _wrap_scripts(value)
         return [Paragraph(f"<b>{label_r}:</b> {value_r}{flag}", s), Spacer(1, 1 * mm)]
 
     if signed:
-        doctor_name_label = _wrap_devanagari(_label("doctor_name", lang))
-        reg_no_label = _wrap_devanagari(_label("reg_no", lang))
-        doctor_name = _wrap_devanagari(doctor["name"])
-        reg_no = _wrap_devanagari(doctor["reg_no"])
+        doctor_name_label = _wrap_scripts(_label("doctor_name", lang))
+        reg_no_label = _wrap_scripts(_label("reg_no", lang))
+        doctor_name = _wrap_scripts(doctor["name"])
+        reg_no = _wrap_scripts(doctor["reg_no"])
         story = [
-            Paragraph(_wrap_devanagari(doctor["clinic"]), signed_style),
+            Paragraph(_wrap_scripts(doctor["clinic"]), signed_style),
             Paragraph(
                 f"{doctor_name_label}: {doctor_name}"
                 f"    {reg_no_label}: {reg_no}"
@@ -286,7 +310,7 @@ def render(
         ]
     else:
         story = [
-            Paragraph(_wrap_devanagari(_label("draft_banner", lang)), draft_style),
+            Paragraph(_wrap_scripts(_label("draft_banner", lang)), draft_style),
             Paragraph("CliniScribe — Draft Consultation Note", h1),
             Spacer(1, 3 * mm),
         ]
@@ -297,7 +321,7 @@ def render(
     story += field(_label("history", lang), note.history, "history")
 
     if note.symptoms:
-        story.append(Paragraph(_wrap_devanagari(_label("symptoms", lang)), h2))
+        story.append(Paragraph(_wrap_scripts(_label("symptoms", lang)), h2))
         for s in note.symptoms:
             parts = [s.name]
             if s.finding_status != "Present":
@@ -309,7 +333,7 @@ def render(
             key = f"symptoms.{s.name}"
             p_style = warn if key in low_conf else body
             flag = " ⚑" if key in low_conf else ""
-            line = _wrap_devanagari(", ".join(parts))
+            line = _wrap_scripts(", ".join(parts))
             story.append(Paragraph("• " + line + flag, p_style))
         story.append(Spacer(1, 2 * mm))
 
@@ -320,7 +344,7 @@ def render(
     ordered_names = _VITAL_ORDER + [
         n for n in extracted_vitals if n not in _VITAL_ORDER
     ]
-    story.append(Paragraph(_wrap_devanagari(_label("vitals", lang)), h2))
+    story.append(Paragraph(_wrap_scripts(_label("vitals", lang)), h2))
     data = [["Parameter", "Value"]]
     for name in ordered_names:
         v = extracted_vitals.get(name)
@@ -348,18 +372,18 @@ def render(
     story += field(_label("examination", lang), note.examination, "examination")
 
     if note.diagnosis:
-        story.append(Paragraph(_wrap_devanagari(_label("diagnosis", lang)), h2))
+        story.append(Paragraph(_wrap_scripts(_label("diagnosis", lang)), h2))
         for d in note.diagnosis:
             status = f" [{d.status}]" if d.status else ""
             snomed = f" (SNOMED: {d.snomed_id})" if d.snomed_id else ""
             flag = " ⚑" if f"diagnosis.{d.term}" in low_conf else ""
             p_style = warn if f"diagnosis.{d.term}" in low_conf else body
-            term = _wrap_devanagari(d.term)
+            term = _wrap_scripts(d.term)
             story.append(Paragraph(f"• {term}{status}{snomed}{flag}", p_style))
         story.append(Spacer(1, 2 * mm))
 
     if note.medications:
-        story.append(Paragraph(_wrap_devanagari(_label("medications", lang)), h2))
+        story.append(Paragraph(_wrap_scripts(_label("medications", lang)), h2))
         data = [
             [
                 _label("drug", lang),
@@ -405,17 +429,17 @@ def render(
         story += [t, Spacer(1, 2 * mm)]
 
     if note.investigations:
-        story.append(Paragraph(_wrap_devanagari(_label("investigations", lang)), h2))
+        story.append(Paragraph(_wrap_scripts(_label("investigations", lang)), h2))
         for inv in note.investigations:
-            story.append(Paragraph(f"• {_wrap_devanagari(inv)}", body))
+            story.append(Paragraph(f"• {_wrap_scripts(inv)}", body))
         story.append(Spacer(1, 2 * mm))
 
     if note.diagnostic_results:
         story.append(
-            Paragraph(_wrap_devanagari(_label("diagnostic_results", lang)), h2)
+            Paragraph(_wrap_scripts(_label("diagnostic_results", lang)), h2)
         )
         for res in note.diagnostic_results:
-            story.append(Paragraph(f"• {_wrap_devanagari(res)}", body))
+            story.append(Paragraph(f"• {_wrap_scripts(res)}", body))
         story.append(Spacer(1, 2 * mm))
 
     story += field(_label("advice", lang), note.advice, "advice")
@@ -424,14 +448,14 @@ def render(
     if low_conf:
         story.append(Spacer(1, 4 * mm))
         story.append(
-            Paragraph(f"<b>{_wrap_devanagari(_label('verify', lang))} (⚑):</b>", warn)
+            Paragraph(f"<b>{_wrap_scripts(_label('verify', lang))} (⚑):</b>", warn)
         )
         for flag in sorted(low_conf):
             story.append(Paragraph(f"• {_flag_sentence(flag)}", warn))
 
     if signed:
-        signed_label = _wrap_devanagari(_label("signed", lang))
-        doctor_name = _wrap_devanagari(doctor["name"])
+        signed_label = _wrap_scripts(_label("signed", lang))
+        doctor_name = _wrap_scripts(doctor["name"])
         story.append(Spacer(1, 4 * mm))
         story.append(
             Paragraph(
