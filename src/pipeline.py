@@ -16,14 +16,18 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 
 from dotenv import load_dotenv
 
+import threading
+
+from src import telemetry
 from src.l1_preprocess import preprocess
 from src.l2_diarize import diarize
 from src.l3_asr import transcribe
 from src.l3_5_normalize import normalize
-from src.l4_extract import extract
+from src.l4_extract import extract, warm_llm
 from src.l5_render import render
 from src.types import Turn
 
@@ -43,13 +47,28 @@ def _write_turns(turns: list[Turn], path: str) -> None:
         json.dump([dataclasses.asdict(t) for t in turns], f, ensure_ascii=False, indent=2)
 
 
-def run(in_path: str, session_id: str | None = None) -> str:
+def run(
+    in_path: str,
+    session_id: str | None = None,
+    *,
+    on_stage: Callable[[str, str], None] | None = None,
+    on_progress: Callable[[float, float], None] | None = None,
+) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
     Args:
         in_path: Path to the input audio file.
         session_id: Consultation session ID; generated when omitted. All
             artifacts are written under outputs/<session_id>/.
+        on_stage: Optional callback invoked as `on_stage(name, event)` around
+            each stage, with `event` in `{"start", "end"}` and `name` one of
+            the stage_report keys (e.g. "l3_asr"). Used by the review-frontend
+            backend to mirror progress into status.json. Default None keeps
+            current behavior unchanged.
+        on_progress: Optional callback passed through to L3's `transcribe()`
+            as `on_progress(done_seconds, total_seconds)`, invoked after each
+            segment decodes during L3 ASR. Used by the review-frontend backend
+            for the percent/ETA display. Default None keeps current behavior.
 
     Returns:
         Path to the generated draft prescription PDF
@@ -60,32 +79,70 @@ def run(in_path: str, session_id: str | None = None) -> str:
     os.makedirs(session_dir, exist_ok=True)
     logger.info("Session %s → %s", session_id, session_dir)
 
+    telemetry.reset()
+    stage_report: dict[str, dict[str, float]] = {}
+
+    def _staged(name: str, fn, *args, **kwargs):
+        if on_stage:
+            on_stage(name, "start")
+        t0 = time.perf_counter()
+        result = fn(*args, **kwargs)
+        gc.collect()
+        stage_report[name] = {
+            "wall_s": round(time.perf_counter() - t0, 2),
+            "peak_rss_mb_so_far": telemetry.peak_rss_mb(),
+        }
+        if on_stage:
+            on_stage(name, "end")
+        return result
+
     logger.info("L1: preprocessing %s", in_path)
-    wav_path = preprocess(in_path, out_dir=session_dir)
-    gc.collect()
+    wav_path = _staged("l1_preprocess", preprocess, in_path, out_dir=session_dir)
 
     logger.info("L2: diarizing %s", wav_path)
-    segments = diarize(wav_path)
-    gc.collect()
+    segments = _staged("l2_diarize", diarize, wav_path)
 
     logger.info("L3: transcribing %d segments", len(segments))
-    turns = transcribe(wav_path, segments)
-    gc.collect()
+    turns = _staged("l3_asr", transcribe, wav_path, segments, on_progress=on_progress)
+
+    # Warm the LLM while L3.5 runs on CPU: Whisper was released inside
+    # transcribe(), so only the (small) embedding model and Qwen coexist —
+    # the load-one-release-one discipline holds at its peak.
+    warm_thread = threading.Thread(target=warm_llm, daemon=True)
+    with telemetry.timer("l4.warm_dispatch"):
+        warm_thread.start()
 
     logger.info("L3.5: normalizing %d turns", len(turns))
-    turns = normalize(turns)
-    gc.collect()
+    turns = _staged("l3_5_normalize", normalize, turns)
     _write_turns(turns, os.path.join(session_dir, "transcript.json"))
 
+    with telemetry.timer("l4.warm_join_wait"):
+        warm_thread.join(timeout=180)
+
     logger.info("L4: extracting clinical entities")
-    note = extract(turns)
-    gc.collect()
+    note = _staged("l4_extract", extract, turns)
     with open(os.path.join(session_dir, "note.json"), "w", encoding="utf-8") as f:
         json.dump(dataclasses.asdict(note), f, ensure_ascii=False, indent=2)
 
     logger.info("L5: rendering prescription PDF")
-    pdf_path = render(note, out_path=os.path.join(session_dir, "draft_rx.pdf"))
-    gc.collect()
+    pdf_path = _staged(
+        "l5_render", render, note, out_path=os.path.join(session_dir, "draft_rx.pdf")
+    )
+
+    timings = {
+        "stages": stage_report,
+        "sub_timings": telemetry.snapshot(),  # model loads recorded by stages
+        "total_wall_s": round(sum(s["wall_s"] for s in stage_report.values()), 2),
+        "peak_rss_mb": telemetry.peak_rss_mb(),
+    }
+    with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
+        json.dump(timings, f, indent=2)
+    logger.info(
+        "Timings: total %.1fs, peak RSS %.0f MB — %s",
+        timings["total_wall_s"],
+        timings["peak_rss_mb"],
+        {k: v["wall_s"] for k, v in stage_report.items()},
+    )
 
     logger.info("Done: %s", pdf_path)
     return pdf_path

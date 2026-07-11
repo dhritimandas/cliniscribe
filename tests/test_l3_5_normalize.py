@@ -350,3 +350,48 @@ def test_ghabrahat_maps_to_anxiety() -> None:
     turns = [_turn("bahut ghabrahat ho rahi hai")]
     result = normalize(turns)
     assert "Anxiety" in result[0].text
+
+
+# ── Latin-span drug tier (drug bench fix): distorted Latin drug names ───────
+
+
+def test_latin_distorted_drug_recovered_with_dose() -> None:
+    from src.l3_5_normalize import _normalize_drug_text
+
+    out = _normalize_drug_text("aur gmenti 625 le lena din mein do baar")
+    assert "augmentin" in out.lower()
+    assert "625" in out  # dose must survive substitution
+
+
+def test_latin_substitution_never_deletes_dose() -> None:
+    # "paracetamol 625" fuzzy-matches canonical "paracetamol" — substituting
+    # would DELETE the dose. The digit-preservation guard must refuse.
+    from src.l3_5_normalize import _normalize_drug_text
+
+    out = _normalize_drug_text("paracetamol 625 mg taibli le lo")
+    assert "625" in out and "paracetamol" in out.lower()
+
+
+def test_latin_common_words_never_become_drugs() -> None:
+    from src.l3_5_normalize import _normalize_drug_text
+
+    for text in (
+        "the doctors said take rest",
+        "blood pressure check karo aur test karao",
+        "problem thoda kam hai morning mein",
+    ):
+        assert _normalize_drug_text(text) == text
+
+
+def test_latin_canonical_drug_left_untouched() -> None:
+    from src.l3_5_normalize import _normalize_drug_text
+
+    assert _normalize_drug_text("dolo 650 le lena subah") == "dolo 650 le lena subah"
+
+
+# ── Naxdom lexicon (Urdu-script ASR bug fix) ─────────────────────────────────
+
+
+def test_naxdom_curated_hit_with_dose() -> None:
+    result = _normalize_drug_text("नैक्सडॉम 500 khao")
+    assert "naxdom" in result

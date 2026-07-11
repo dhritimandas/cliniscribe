@@ -2,12 +2,26 @@
 
 import gc
 import logging
+import re
 
 import torch
 from faster_whisper import WhisperModel
 
-from src import config
+from src import config, telemetry
 from src.types import Segment, Turn
+
+# Arabic-script Unicode blocks (Arabic, Supplement, Extended-A, Presentation
+# Forms A/B). We only support hi/en/mr (Latin or Devanagari); any Arabic-script
+# text means Whisper's per-segment auto-detect misclassified Hindi as Urdu.
+_ARABIC_SCRIPT_RE = re.compile(
+    "[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]"
+)
+
+
+def _contains_arabic_script(text: str) -> bool:
+    """True if text contains any Arabic-script character (see module docstring)."""
+    return bool(_ARABIC_SCRIPT_RE.search(text))
+
 
 # Doctor heuristic: bag-of-words score over transcribed text.
 # Doctors tend to use question forms (eliciting symptoms) AND clinical terms
@@ -43,12 +57,26 @@ def _doctor_score(text: str) -> int:
     return sum(1 for t in tokens if t.strip(".,?!।") in _DOCTOR_TOKENS)
 
 
-def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
+def transcribe(
+    wav_path: str,
+    segments: list[Segment],
+    model: WhisperModel | None = None,
+    on_progress=None,
+) -> list[Turn]:
     """Transcribe each diarized segment and assign a speaker role.
 
     Args:
         wav_path: Path to a 16 kHz mono WAV file (output of L1).
         segments: Diarized segments from L2.
+        model: Optional preloaded WhisperModel. When provided it is used as-is
+            and NOT released — for eval harnesses iterating many clips, where
+            per-clip model loading dominates runtime. Production passes None:
+            load, use, release (the 24 GB memory discipline).
+        on_progress: Optional callback(done_seconds, total_seconds) invoked
+            after each segment decodes — real transcription progress (decoded
+            audio seconds over total segment seconds), used by the review
+            frontend for the percent/ETA display. Exceptions are swallowed:
+            progress reporting must never break transcription.
 
     Returns:
         List of Turn(speaker_role, text, start, end) in chronological order.
@@ -62,30 +90,73 @@ def transcribe(wav_path: str, segments: list[Segment]) -> list[Turn]:
         language=None enables per-segment auto-detection for Hindi/English/
         Marathi code-switching. task="transcribe" is explicit to prevent
         translation even if Whisper internally detects a non-English segment.
+        vad_filter (config.ASR_VAD_FILTER) is passed through but is a measured
+        no-op here: faster-whisper ignores vad_filter whenever clip_timestamps
+        is set, and this call always sets clip_timestamps for per-segment
+        decoding. It provides no silence-hallucination protection — kept
+        False (see src.config.ASR_VAD_FILTER for the full explanation).
+        When config.ASR_SCRIPT_GUARD is True (default), a segment whose
+        decode contains Arabic-script characters is re-decoded once with
+        language="hi" forced — we only support hi/en/mr, so Arabic script is
+        always a misdetection (see src.config.ASR_SCRIPT_GUARD).
     """
-    model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
-    logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
+    owns_model = model is None
+    if owns_model:
+        with telemetry.timer("l3.model_load"):
+            model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
+        logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
 
-    raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
-    for seg in segments:
+    def _decode(seg: Segment, language: str | None) -> str:
         gen, _ = model.transcribe(
             wav_path,
-            language=None,
+            language=language,
             task="transcribe",
             clip_timestamps=f"{seg.start},{seg.end}",
             # Read at call time (not import time) so eval studies can override
-            # src.config.ASR_BEAM_SIZE; pipeline and eval share this one value.
+            # src.config.ASR_BEAM_SIZE / ASR_VAD_FILTER; pipeline and eval
+            # share these values.
             beam_size=config.ASR_BEAM_SIZE,
+            vad_filter=config.ASR_VAD_FILTER,
             word_timestamps=False,
         )
-        text = " ".join(chunk.text.strip() for chunk in gen).strip()
+        return " ".join(chunk.text.strip() for chunk in gen).strip()
+
+    total_seconds = sum(max(0.0, s.end - s.start) for s in segments)
+    done_seconds = 0.0
+
+    raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
+    for seg in segments:
+        text = _decode(seg, language=None)
+
+        # Script guard: language=None occasionally misdetects Hindi as Urdu
+        # and decodes the segment in Arabic script. We only support hi/en/mr
+        # (Latin/Devanagari), so Arabic script is always a misdetection —
+        # force a single re-decode with language="hi" (config.ASR_SCRIPT_GUARD).
+        if config.ASR_SCRIPT_GUARD and _contains_arabic_script(text):
+            logger.warning(
+                "L3 script guard: Arabic-script decode at [%.2f, %.2f]s "
+                "('%s') — re-decoding with language=hi",
+                seg.start,
+                seg.end,
+                text[:40],
+            )
+            text = _decode(seg, language="hi")
+
         if text:
             raw_turns.append((seg.speaker, text, seg.start, seg.end))
 
-    del model
-    gc.collect()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+        done_seconds += max(0.0, seg.end - seg.start)
+        if on_progress is not None:
+            try:
+                on_progress(done_seconds, total_seconds)
+            except Exception:
+                logger.debug("on_progress callback failed (ignored)", exc_info=True)
+
+    if owns_model:
+        del model
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     if not raw_turns:
         return []

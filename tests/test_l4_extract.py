@@ -372,6 +372,51 @@ def test_null_crash_regression_i18() -> None:
     assert isinstance(note.low_confidence_fields, list)
 
 
+def test_non_dict_list_item_skipped_not_crashed_idx99() -> None:
+    """Regression for idx=99 (live eval): a raw string mixed into a list field
+    must be skipped, not crash the whole extraction.
+
+    Root cause: on a live sample the model emitted a JSON formatting slip
+    where "vitals" was a list containing genuine vital dicts followed by
+    stray strings (a duplicate-key parsing artifact, e.g. "examination: null").
+    _build_note's list comprehensions called .get() on every item
+    unconditionally, so the first non-dict item raised
+    AttributeError("'str' object has no attribute 'get'"), caught by the
+    generic except-Exception branch in extract() and collapsing the whole
+    note to _empty_note() — losing every genuinely-extracted field, not just
+    the malformed one. Fixed by filtering to dict items before construction.
+    """
+    from src.l4_extract import _build_note
+
+    data = {
+        "chief_complaint": None,
+        "history": "",
+        "symptoms": "",  # garbled: string instead of list — already handled by `or []`
+        "vitals": [
+            {"name": "blood pressure", "value": "137/81"},
+            {"name": "pulse", "value": "71"},
+            "examination: null",  # malformed tail from a duplicate-key parse slip
+            "diagnosis: null",
+            "medications: null",
+        ],
+        "diagnosis": [
+            {"term": "raised total cholesterol", "snomed_id": None, "status": None},
+            "some garbled string",
+        ],
+        "medications": [
+            {"drug": "Tablet Calcirix XT", "dose": None, "frequency": "once daily"},
+            "garbled medication string",
+        ],
+        "investigations": [],
+        "diagnostic_results": [],
+        "low_confidence_fields": [],
+    }
+    note = _build_note(data)
+    assert [v.name for v in note.vitals] == ["blood pressure", "pulse"]
+    assert [d.term for d in note.diagnosis] == ["raised total cholesterol"]
+    assert [m.drug for m in note.medications] == ["Tablet Calcirix XT"]
+
+
 def test_cdsco_tablet_paracetamol_validates() -> None:
     """Regression for i=0: 'Tablet paracetamol' must validate as True.
 
@@ -490,3 +535,184 @@ def test_extract_live_returns_valid_schema() -> None:
     assert isinstance(note.low_confidence_fields, list)
     assert isinstance(note.diagnosis, list)
     assert isinstance(note.medications, list)
+
+
+# ── Generic-term leak (B2): दवाई/"medicine" must never be a drug NAME ──────
+
+
+def test_generic_drug_name_becomes_unnamed_medication() -> None:
+    from src.l4_extract import _build_note
+
+    data = {
+        "medications": [
+            {"drug": "medicine", "dose": None, "frequency": "twice daily"},
+        ]
+    }
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+    assert note.medications[0].frequency == "twice daily"  # info preserved
+    assert "medications.unnamed medication 1.unnamed" in note.low_confidence_fields
+
+
+def test_generic_devanagari_drug_name_becomes_unnamed() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "दवाई", "dose": None}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+
+
+def test_devanagari_generic_head_phrase_is_generic() -> None:
+    # "डायबिटीज की दवाई" = "diabetes medicine" — no identifiable drug.
+    from src.l4_extract import _is_generic_drug_name
+
+    assert _is_generic_drug_name("डायबिटीज की दवाई") is True
+
+
+def test_branded_compound_is_not_generic() -> None:
+    from src.l4_extract import _is_generic_drug_name
+
+    assert _is_generic_drug_name("Benadryl cough syrup") is False
+    assert _is_generic_drug_name("Paracetamol 650") is False
+
+
+def test_bare_form_words_are_generic() -> None:
+    from src.l4_extract import _is_generic_drug_name
+
+    for term in ("cough syrup", "tablet", "injection", "Medicines"):
+        assert _is_generic_drug_name(term) is True, term
+
+
+def test_two_unnamed_medications_get_distinct_flags() -> None:
+    from src.l4_extract import _build_note
+
+    data = {
+        "medications": [
+            {"drug": "medicine", "frequency": "1-0-1"},
+            {"drug": "दवा", "frequency": "0-0-1"},
+        ]
+    }
+    note = _build_note(data)
+    assert [m.drug for m in note.medications] == [
+        "unnamed medication 1",
+        "unnamed medication 2",
+    ]
+    flags = [f for f in note.low_confidence_fields if f.endswith(".unnamed")]
+    assert len(flags) == 2  # no collision
+
+
+def test_unnamed_medication_not_double_flagged_unvalidated() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "medicine"}]}
+    note = _build_note(data)
+    unvalidated = [f for f in note.low_confidence_fields if f.endswith(".unvalidated")]
+    assert unvalidated == []
+
+
+def test_real_drug_name_untouched_by_generic_filter() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "Paracetamol", "dose": "650 mg"}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "Paracetamol"
+
+
+# ── Prompt-example leakage guard ──────────────────────────────────────────────
+
+
+def test_system_prompt_has_no_leaked_example_values() -> None:
+    """Rule 9's old few-shot lab values leaked verbatim into unrelated notes.
+
+    qwen2.5:3b copied "Hb is 9.2", "raised cholesterol", "HbA1c 9.1",
+    "Vitamin D low", "Total IGE 2107" from the prompt into diagnostic_results
+    on 6 of 24 frozen eval samples (idx 121, 131, 44, 49, 24, 140) — fabricated
+    lab results a physician could act on. Tripwire: the prompt must never
+    contain these concrete content-value examples again.
+    """
+    from src.l4_extract import _SYSTEM_PROMPT
+
+    leaked_examples = [
+        "Hb is 9.2",
+        "raised cholesterol",
+        "HbA1c 9.1",
+        "Vitamin D low",
+        "Total IGE 2107",
+    ]
+    for value in leaked_examples:
+        assert value not in _SYSTEM_PROMPT, (
+            f"Leaked example value {value!r} reintroduced into _SYSTEM_PROMPT"
+        )
+
+
+def test_system_prompt_drug_fidelity_rule_has_no_concrete_drug_names() -> None:
+    """Rule 12 (drug name script/spelling fidelity) must stay concrete-value-
+    free, same tripwire spirit as the lab-value leakage guard above — a 3B
+    model treats concrete values in instructions as content to reuse.
+    """
+    from src.l4_extract import _SYSTEM_PROMPT
+
+    for value in ("naxdom", "नक्सडम", "azithral", "paracetamol"):
+        assert value.lower() not in _SYSTEM_PROMPT.lower(), (
+            f"Concrete drug name {value!r} leaked into _SYSTEM_PROMPT"
+        )
+
+
+# ── Drug-name source-fidelity restoration (Bug B backstop) ─────────────────
+#
+# qwen2.5:3b sometimes re-spells a Latin-script drug name spoken in the
+# transcript into Devanagari, or otherwise distorts its spelling, instead of
+# copying it verbatim — CDSCO validation then fails on an invented spelling
+# rather than the drug actually said. The backstop is a source-fidelity
+# restoration (substitute what was actually said), never a lexicon guess, so
+# there is no wrong-drug substitution risk to test for here.
+
+
+def test_devanagari_respelling_restored_to_transcript_latin_spelling() -> None:
+    """Real case (outputs/20260711-161726-201975/): transcript said Latin
+    'naxdom 500'; qwen2.5:3b wrote Devanagari 'नक्सडम 500' — an invented
+    spelling. 'naxdom' is not in the CDSCO list under either spelling, so
+    this asserts the restoration itself (source fidelity), not a validation
+    outcome the drug list cannot provide either way.
+    """
+    from src.cdsco import validate_drug
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: hidek ke liye naxdom 500 recommend kar deta hoon"
+    data = {"medications": [{"drug": "नक्सडम 500", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "naxdom 500"
+    assert validate_drug("naxdom 500") is False
+    assert validate_drug("नक्सडम 500") is False
+
+
+def test_restoration_preserves_dose_digits_glued_to_name() -> None:
+    """Dose-deletion regression guard: a matched window that lacks the LLM
+    string's digit tokens must not silently drop the dose (see LEARNINGS.md
+    Phase B Hardening item 2 — a prior fuzzy-match substitution deleted a
+    dose the same way).
+    """
+    from src.l4_extract import _restore_drug_spelling
+
+    transcript = "[DOCTOR]: aapko azithral chahiye roz ek baar\n[PATIENT]: theek hai"
+    assert _restore_drug_spelling("Azithral500", transcript) == "azithral 500"
+
+
+def test_restoration_skips_when_nothing_similar_in_transcript() -> None:
+    from src.l4_extract import _restore_drug_spelling
+
+    transcript = "[DOCTOR]: aapko azithral chahiye roz ek baar\n[PATIENT]: theek hai"
+    assert _restore_drug_spelling("Xyzqqrandomdrug", transcript) == "Xyzqqrandomdrug"
+
+
+def test_restoration_fixes_latin_latin_distortion() -> None:
+    from src.l4_extract import _restore_drug_spelling
+
+    transcript = "[DOCTOR]: main azithral de raha hoon roz ek baar\n[PATIENT]: theek hai"
+    assert _restore_drug_spelling("Azihral", transcript) == "azithral"
+
+
+def test_restoration_noop_on_empty_transcript() -> None:
+    from src.l4_extract import _restore_drug_spelling
+
+    assert _restore_drug_spelling("नक्सडम 500", "") == "नक्सडम 500"

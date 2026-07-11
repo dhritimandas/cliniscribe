@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CliniScribe</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Mock-mode-only banner (shown by app.js iff window.MOCK; never over http). -->
+<div id="demo-banner" class="demo-banner" hidden>DEMO DATA — no backend connected. Start the server to use real recordings.</div>
+
+<!-- ===================== SCREEN 1 — CAPTURE (Zen) ===================== -->
+<section id="screen-capture" class="screen">
+  <button id="mic-ring" class="mic-ring" aria-label="record">
+    <svg viewBox="0 0 120 120" width="120" height="120">
+      <circle cx="60" cy="60" r="52"></circle>
+      <circle class="dot" cx="60" cy="60" r="8"></circle>
+    </svg>
+  </button>
+  <div id="capture-caption" class="capture-caption"></div>
+  <div id="timer" class="timer" hidden>00:00</div>
+  <div id="silence-notice" class="silence-notice" hidden></div>
+
+  <div id="stage-lines" class="stage-lines" hidden>
+    <div class="stage-line" data-stage="transcribed"><span class="tick">&#10003;</span><span class="text"></span><span class="progress" hidden></span></div>
+    <div class="stage-line" data-stage="speakers"><span class="tick">&#10003;</span><span class="text"></span></div>
+    <div class="stage-line" data-stage="drafting"><span class="tick">&#10003;</span><span class="text"></span></div>
+  </div>
+
+  <div id="live-preview" class="live-preview" hidden>
+    <div class="live-preview-label" id="live-preview-label"></div>
+    <div class="live-preview-text" id="live-preview-text"></div>
+  </div>
+
+  <label id="file-hint" class="file-hint">
+    <span id="file-hint-text"></span>
+    <input type="file" id="file-input" accept=".wav,.mp3,audio/wav,audio/mpeg" hidden>
+  </label>
+</section>
+
+<!-- ===================== SCREEN 2 — REVIEW (Sage editorial) ===================== -->
+<section id="screen-review" class="screen">
+  <header class="topbar">
+    <div class="topbar-title" id="review-title"></div>
+    <div class="topbar-controls">
+      <select id="lang-select" class="lang-select">
+        <option value="en">EN</option>
+        <option value="hi">HI</option>
+        <option value="mr">MR</option>
+      </select>
+      <button id="view-transcript-btn" class="quiet-btn"></button>
+    </div>
+  </header>
+
+  <div class="cell" id="cell-patient">
+    <div class="label" id="label-patient"></div>
+    <input type="text" id="patient-input" class="value patient-input" autocomplete="off">
+  </div>
+
+  <div class="grid" id="note-grid"></div>
+
+  <div class="general-flags" id="general-flags" hidden></div>
+
+  <footer class="reviewbar">
+    <a id="draft-pdf-link" class="quiet-btn" target="_blank" rel="noopener"></a>
+    <button id="save-btn" class="quiet-btn"></button>
+    <button id="sign-btn" class="quiet-btn"></button>
+  </footer>
+
+  <div id="sign-form" class="sign-form" hidden>
+    <div class="field-inline">
+      <label id="label-doctor-name"></label>
+      <input type="text" id="sign-doctor-name">
+    </div>
+    <div class="field-inline">
+      <label id="label-reg-no"></label>
+      <input type="text" id="sign-reg-no">
+    </div>
+    <div class="field-inline">
+      <label id="label-clinic"></label>
+      <input type="text" id="sign-clinic">
+    </div>
+    <button id="sign-submit-btn" class="quiet-btn"></button>
+  </div>
+
+  <div id="signed-panel" class="signed-panel" hidden>
+    <span id="signed-label"></span>
+    <a id="signed-pdf-link" class="quiet-btn" target="_blank" rel="noopener"></a>
+  </div>
+</section>
+
+<!-- Transcript drawer -->
+<aside id="drawer" class="drawer">
+  <div class="drawer-header">
+    <button id="drawer-close-btn" class="drawer-close-btn" aria-label="close">CLOSE</button>
+  </div>
+  <div class="drawer-inner" id="drawer-turns"></div>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>

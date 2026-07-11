@@ -1,8 +1,10 @@
 """L4 — Clinical entity extraction via Qwen2.5-3B-Instruct (Ollama)."""
 
+import difflib
 import json
 import logging
 import re
+import unicodedata
 
 from src import config
 from src.cdsco import validate_drug
@@ -41,10 +43,11 @@ Do not supply a standard or typical dose. null means unknown.
 3. Add the field name to low_confidence_fields whenever you are uncertain about \
 a value or the value is absent but clinically expected.
 4. If the transcript already contains a clinical synonym in parentheses \
-(e.g. "sugar (Type 2 Diabetes Mellitus)"), extract that parenthetical term. \
-Do NOT add parenthetical clinical terms yourself — only use what is explicitly \
-written in the transcript. This rule exists for L3.5-normalised transcripts; \
-if no parenthetical is present, extract only what is said.
+— a lay term followed by its clinical name, e.g. "<lay term> (<clinical term>)" \
+— extract that parenthetical term. Do NOT add parenthetical clinical terms \
+yourself — only use what is explicitly written in the transcript. This rule \
+exists for L3.5-normalised transcripts; if no parenthetical is present, \
+extract only what is said.
 5. Extract only what is spoken. Do not add clinical knowledge not present \
 in the transcript.
 6. Use the language of the transcript for text fields. Do not translate.
@@ -55,10 +58,12 @@ explicitly denied (e.g. "no vomiting"). severity and since are null unless state
 temperature, weight). Only include a vital when a measured value is spoken. \
 Never invent a measurement.
 9. INVESTIGATIONS are tests the doctor ORDERS for later (e.g. "get a CBC"). \
-DIAGNOSTIC_RESULTS are results already available in the consultation \
-(e.g. "Hb is 9.2", "raised cholesterol", "HbA1c 9.1", "Vitamin D low", \
-"Total IGE 2107"). Extract each as a separate string. \
-Do not put ordered tests in diagnostic_results; do not put lab results in history.
+DIAGNOSTIC_RESULTS are results already available in the consultation — a test \
+name paired with its stated value or qualitative finding, exactly as spoken. \
+Extract each as a separate string. Do not put ordered tests in \
+diagnostic_results; do not put lab results in history. Never copy a value \
+from these instructions — only extract values actually spoken in the \
+transcript below.
 10. examination is free text describing physical-exam findings \
 (e.g. "abdomen soft, mild tenderness"). null if no exam is described.
 11. FREQUENCY is the dosing schedule — how often and when during the day: \
@@ -66,7 +71,11 @@ Do not put ordered tests in diagnostic_results; do not put lab results in histor
 "once in the morning", "1-0-1". Extract it whenever a dosing schedule is stated. \
 TIMING is ONLY for meal-relative context: "before food", "after food", "with food". \
 Time-of-day phrases ("at night", "SOS", "in the morning") and dosing notation \
-("1-0-0", "BD/SOS") belong in frequency, not timing.\
+("1-0-0", "BD/SOS") belong in frequency, not timing.
+12. DRUG names must be copied EXACTLY as written in the transcript — the same \
+characters, in the same script. Never transliterate, translate, or re-spell a \
+drug name into a different script or a different spelling than what appears \
+in the transcript.\
 """
 
 
@@ -88,6 +97,38 @@ def _strip_fences(raw: str) -> str:
 
 def _parse(raw: str) -> dict:
     return json.loads(_strip_fences(raw))
+
+
+# Generic terms that must never populate a drug NAME on a prescription:
+# "the doctor gave medicine" is not a prescribable entry. Matching is
+# whole-string after normalisation ("syrup" is generic; "Benadryl cough
+# syrup" is not). Devanagari "X की दवा(ई)" phrases are caught by the
+# generic-head rule in _is_generic_drug_name.
+_GENERIC_DRUG_TERMS: frozenset[str] = frozenset(
+    {
+        "medicine", "medicines", "medication", "medications",
+        "tablet", "tablets", "capsule", "capsules",
+        "syrup", "cough syrup", "injection", "gel", "cream",
+        "ointment", "drops", "painkiller", "pain killer",
+        "dawai", "dawa",
+        "दवाई", "दवा", "दवाइयां", "टैबलेट", "जेल", "इंजेक्शन", "सिरप",
+    }
+)
+# Devanagari generic head nouns: a name ENDING in one of these ("डायबिटीज की
+# दवाई" = "diabetes medicine") is generic unless some token validates in CDSCO.
+_GENERIC_HEAD_TOKENS: frozenset[str] = frozenset({"दवाई", "दवा", "दवाइयां"})
+
+
+def _is_generic_drug_name(drug: str) -> bool:
+    """Return True if the extracted drug string names no identifiable drug."""
+    norm = " ".join(drug.lower().split())
+    if norm in _GENERIC_DRUG_TERMS:
+        return True
+    tokens = norm.split()
+    if tokens and tokens[-1] in _GENERIC_HEAD_TOKENS:
+        # "X की दवाई" — generic unless any token is a real CDSCO drug.
+        return not any(validate_drug(t) for t in tokens if len(t) >= 4)
+    return False
 
 
 _TOKEN_RE = re.compile(r"[a-z]+", re.IGNORECASE)
@@ -121,6 +162,120 @@ def _diagnosis_has_overlap(term: str, transcript_tokens: set[str]) -> bool:
     return bool(term_tokens & transcript_tokens)
 
 
+# ── Drug-name source-fidelity restoration (deterministic backstop) ─────────
+# qwen2.5:3b sometimes re-spells a Latin-script drug name spoken in the
+# transcript into Devanagari, or otherwise distorts its spelling, instead of
+# copying it verbatim (real case: transcript "naxdom 500" -> LLM "नक्सडम 500").
+# CDSCO validation then fails on an invented spelling. This is a source-
+# fidelity restoration, not a lexicon lookup: we only ever substitute text
+# that was actually said in the transcript, so there is no wrong-drug
+# substitution risk the way there would be with a fuzzy drug-list match.
+
+# Adapted from eval/drug_bench.py's _fold (reimplemented here, not imported —
+# eval/ and src/ are separate module boundaries). "क्स"/"क्श" are common
+# Devanagari digraphs for the English "x" sound in loanwords (टैक्स, बॉक्स,
+# एक्स-रे); folded to "x" before the per-character pass, since the
+# per-character map alone renders them as "ks", which folds far from the
+# Latin spelling of names that use "x".
+_DRUG_FOLD_DIGRAPHS: tuple[tuple[str, str], ...] = (("क्स", "x"), ("क्श", "x"))
+_DRUG_FOLD_MAP: dict[str, str] = {
+    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
+    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
+    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
+    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
+    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
+    "ज़": "z", "फ़": "f", "ा": "a", "ि": "i", "ी": "i", "ु": "u",
+    "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
+    "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
+    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+}
+_DRUG_FOLD_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
+_DRUG_WINDOW_SIZES: tuple[int, ...] = (1, 2, 3, 4)
+_DRUG_RESTORE_MIN_SIMILARITY = 0.80
+_ROLE_TAG_RE = re.compile(r"\[(?:DOCTOR|PATIENT|UNKNOWN)\]:\s*")
+
+
+def _fold_drug(text: str) -> str:
+    """Coarse phonetic fold: Devanagari→Latin, lowercase, alnum+space only."""
+    text = unicodedata.normalize("NFC", text)
+    for digraph, latin in _DRUG_FOLD_DIGRAPHS:
+        text = text.replace(digraph, latin)
+    folded = "".join(_DRUG_FOLD_MAP.get(ch, ch) for ch in text)
+    return _DRUG_FOLD_NON_ALNUM_RE.sub("", folded.lower())
+
+
+def _transcript_word_windows(transcript: str) -> list[str]:
+    """Return every contiguous window (sizes 1-4) of transcript surface words.
+
+    Role-tag prefixes ("[DOCTOR]: ") are stripped first so they never enter a
+    window's surface text.
+    """
+    words = _ROLE_TAG_RE.sub("", transcript).split()
+    windows: list[str] = []
+    for n in _DRUG_WINDOW_SIZES:
+        for i in range(len(words) - n + 1):
+            windows.append(" ".join(words[i : i + n]))
+    return windows
+
+
+def _restore_drug_spelling(drug: str, transcript: str) -> str:
+    """Replace an LLM-re-spelled drug string with the transcript's own spelling.
+
+    Returns `drug` unchanged when it already fold-matches a transcript window
+    exactly, or when no window reaches fold-similarity >= 0.80 (nothing safe
+    to substitute). Otherwise returns the transcript's own surface text for
+    the best-matching window. Digits in `drug` (a dose glued onto the drug
+    name) are always preserved, even if the matched window doesn't include
+    them — never lose dose info to a restoration.
+    """
+    windows = _transcript_word_windows(transcript)
+    if not windows:
+        return drug
+
+    drug_fold_despaced = _fold_drug(drug).replace(" ", "")
+    if drug_fold_despaced and any(
+        _fold_drug(w).replace(" ", "") == drug_fold_despaced for w in windows
+    ):
+        return drug  # already an exact fold match — nothing to restore
+
+    best_window, best_ratio = "", 0.0
+    drug_fold = _fold_drug(drug)
+    for window in windows:
+        ratio = difflib.SequenceMatcher(None, drug_fold, _fold_drug(window)).ratio()
+        if ratio > best_ratio:
+            best_window, best_ratio = window, ratio
+
+    if best_ratio < _DRUG_RESTORE_MIN_SIMILARITY:
+        return drug  # nothing close enough in the transcript — keep as-is
+
+    digit_tokens = re.findall(r"\d+", drug)
+    missing_digits = [d for d in digit_tokens if d not in re.findall(r"\d+", best_window)]
+    if missing_digits:
+        return f"{best_window} {' '.join(missing_digits)}".strip()
+    return best_window
+
+
+def _iter_dicts(items: list, field_name: str) -> list[dict]:
+    """Filter a list field to well-formed dict items, skipping malformed ones.
+
+    A malformed model response (e.g. a raw string mixed into a structured list
+    field — observed on a live sample where "vitals" contained a garbled
+    ["...", "examination: null", "diagnosis: null", ...] tail from a JSON
+    formatting slip) must degrade to a partial note, never crash the whole
+    extraction. Mirrors the tolerance investigations/diagnostic_results
+    already get via _coerce_str.
+    """
+    valid: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            valid.append(item)
+        else:
+            logger.warning(
+                "L4: non-dict item in %s skipped: %s", field_name, repr(item)[:80]
+            )
+    return valid
+
+
 def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     # Guard with `or []`: model may emit null for list fields (e.g. "symptoms": null).
     # data.get("symptoms", []) returns None when the key is present with value null,
@@ -132,13 +287,13 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             severity=s.get("severity") or None,
             since=s.get("since") or None,
         )
-        for s in (data.get("symptoms") or [])
+        for s in _iter_dicts(data.get("symptoms") or [], "symptoms")
         if s.get("name", "").strip()
     ]
 
     vitals = [
         Vital(name=v.get("name", "").strip(), value=str(v.get("value") or "").strip())
-        for v in (data.get("vitals") or [])
+        for v in _iter_dicts(data.get("vitals") or [], "vitals")
         if v.get("name", "").strip() and str(v.get("value") or "").strip()
     ]
 
@@ -148,15 +303,39 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             snomed_id=d.get("snomed_id"),
             status=d.get("status") or None,
         )
-        for d in (data.get("diagnosis") or [])
+        for d in _iter_dicts(data.get("diagnosis") or [], "diagnosis")
         if d.get("term", "").strip()
     ]
 
     medications: list[Medication] = []
-    for m in (data.get("medications") or []):
+    low_conf: list[str] = list(data.get("low_confidence_fields") or [])
+    n_unnamed = 0
+    for m in _iter_dicts(data.get("medications") or [], "medications"):
         drug = (m.get("drug") or "").strip()
         if not drug:
             continue
+        if _is_generic_drug_name(drug):
+            # A generic term ("medicine", "दवाई") must never appear as a drug
+            # NAME on a prescription. Keep the row — its dose/frequency/
+            # duration may be real — but mark it unnamed and low-confidence.
+            # Numbered so multiple unnamed rows get distinct flags.
+            n_unnamed += 1
+            label = f"unnamed medication {n_unnamed}"
+            logger.warning(
+                "L4: generic drug name %r converted to %r", drug, label
+            )
+            flag = f"medications.{label}.unnamed"
+            if flag not in low_conf:
+                low_conf.append(flag)
+            drug = label
+        else:
+            restored = _restore_drug_spelling(drug, transcript)
+            if restored != drug:
+                logger.info(
+                    "L4: restored drug spelling %r -> %r (source-fidelity backstop)",
+                    drug, restored,
+                )
+                drug = restored
         medications.append(
             Medication(
                 drug=drug,
@@ -167,8 +346,6 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 validated=validate_drug(drug),
             )
         )
-
-    low_conf: list[str] = list(data.get("low_confidence_fields") or [])
 
     # Hallucination calibration: flag any diagnosis whose term shares no word
     # with the transcript. This catches the most egregious fabrications (e.g.
@@ -193,7 +370,9 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 )
 
     for med in medications:
-        if not med.validated:
+        if not med.validated and not med.drug.startswith("unnamed medication"):
+            # unnamed rows already carry a .unnamed flag; .unvalidated would
+            # double-flag the same problem.
             flag = f"medications.{med.drug}.unvalidated"
             if flag not in low_conf:
                 low_conf.append(flag)
@@ -242,6 +421,28 @@ def _empty_note() -> ClinicalNote:
     )
 
 
+def warm_llm() -> None:
+    """Preload the extraction model into the Ollama server (non-fatal).
+
+    Called on a background thread during L3.5 — after L3 has released
+    Whisper, so the load-one-release-one memory discipline holds. The
+    options MUST match extract()'s: Ollama restarts the model runner when
+    num_ctx changes, which would waste the warm-up.
+    """
+    import ollama
+
+    try:
+        ollama.generate(
+            model=config.EXTRACT_MODEL,
+            prompt="",
+            keep_alive=config.EXTRACT_KEEP_ALIVE,
+            options={"num_ctx": config.EXTRACT_NUM_CTX},
+        )
+        logger.info("L4: model warmed (%s)", config.EXTRACT_MODEL)
+    except Exception as exc:
+        logger.warning("L4: warm-up failed (non-fatal): %s", exc)
+
+
 def extract(turns: list[Turn]) -> ClinicalNote:
     """Extract a structured ClinicalNote from normalized transcript turns.
 
@@ -273,7 +474,14 @@ def extract(turns: list[Turn]) -> ClinicalNote:
                 model=config.EXTRACT_MODEL,
                 messages=messages,
                 format="json",
-                options={"temperature": 0},
+                keep_alive=config.EXTRACT_KEEP_ALIVE,
+                options={
+                    "temperature": 0,
+                    # Without num_ctx, Ollama's default truncates long HI/MR
+                    # transcripts → empty {} notes (see config.EXTRACT_NUM_CTX).
+                    "num_ctx": config.EXTRACT_NUM_CTX,
+                    "num_predict": config.EXTRACT_NUM_PREDICT,
+                },
             )
             raw = (
                 response.message.content
