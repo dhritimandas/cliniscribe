@@ -206,6 +206,19 @@ def _wrap_scripts(text: str) -> str:
     return "".join(out)
 
 
+def _cell_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
+    """Build a table-cell Paragraph with XML-escaping and script-run wrapping.
+
+    Reportlab Table cells given as plain strings are drawn in a single font
+    (the TableStyle's FONTNAME/FONTSIZE), so Devanagari/Arabic content in
+    them renders as tofu — a Latin-only font has no glyphs for those
+    scripts, and a plain string can't switch fonts mid-run. Wrapping the
+    cell in a Paragraph routes it through _wrap_scripts' per-script-run font
+    switching, same as every other user-facing text field in this module.
+    """
+    return Paragraph(_wrap_scripts(_xml_escape(text)), style)
+
+
 def render(
     note: ClinicalNote,
     out_path: str | None = None,
@@ -345,12 +358,25 @@ def render(
         n for n in extracted_vitals if n not in _VITAL_ORDER
     ]
     story.append(Paragraph(_wrap_scripts(_label("vitals", lang)), h2))
-    data = [["Parameter", "Value"]]
+    vital_cell_style = ParagraphStyle(
+        "VitalCell", parent=styles["Normal"], fontSize=9, leading=9 * 1.2
+    )
+    data = [
+        [
+            _cell_paragraph("Parameter", vital_cell_style),
+            _cell_paragraph("Value", vital_cell_style),
+        ]
+    ]
     for name in ordered_names:
         v = extracted_vitals.get(name)
         flag = " ⚑" if f"vitals.{name}" in low_conf else ""
         value = v.value if v else "—"
-        data.append([name + flag, value])
+        data.append(
+            [
+                _cell_paragraph(name + flag, vital_cell_style),
+                _cell_paragraph(value, vital_cell_style),
+            ]
+        )
     t = Table(data, colWidths=[60 * mm, 80 * mm])
     t.setStyle(
         TableStyle(
@@ -384,26 +410,32 @@ def render(
 
     if note.medications:
         story.append(Paragraph(_wrap_scripts(_label("medications", lang)), h2))
+        med_cell_style = ParagraphStyle(
+            "MedCell", parent=styles["Normal"], fontSize=8, leading=8 * 1.2
+        )
+        med_val_style = ParagraphStyle(
+            "MedVal", parent=med_cell_style, textColor=_WARN_COLOR
+        )
         data = [
             [
-                _label("drug", lang),
-                _label("dose", lang),
-                _label("frequency", lang),
-                _label("timing", lang),
-                _label("duration", lang),
-                "Validated",
+                _cell_paragraph(_label("drug", lang), med_cell_style),
+                _cell_paragraph(_label("dose", lang), med_cell_style),
+                _cell_paragraph(_label("frequency", lang), med_cell_style),
+                _cell_paragraph(_label("timing", lang), med_cell_style),
+                _cell_paragraph(_label("duration", lang), med_cell_style),
+                _cell_paragraph("Validated", med_cell_style),
             ]
         ]
         for m in note.medications:
             val_flag = "✓" if m.validated else "⚑ No"
             data.append(
                 [
-                    m.drug,
-                    m.dose or "—",
-                    m.frequency or "—",
-                    m.timing or "—",
-                    m.duration or "—",
-                    val_flag,
+                    _cell_paragraph(m.drug, med_cell_style),
+                    _cell_paragraph(m.dose or "—", med_cell_style),
+                    _cell_paragraph(m.frequency or "—", med_cell_style),
+                    _cell_paragraph(m.timing or "—", med_cell_style),
+                    _cell_paragraph(m.duration or "—", med_cell_style),
+                    _cell_paragraph(val_flag, med_val_style),
                 ]
             )
         t = Table(
@@ -422,7 +454,6 @@ def render(
                         (-1, -1),
                         [colors.white, colors.HexColor("#F9FAFB")],
                     ),
-                    ("TEXTCOLOR", (-1, 1), (-1, -1), _WARN_COLOR),
                 ]
             )
         )
@@ -451,7 +482,7 @@ def render(
             Paragraph(f"<b>{_wrap_scripts(_label('verify', lang))} (⚑):</b>", warn)
         )
         for flag in sorted(low_conf):
-            story.append(Paragraph(f"• {_flag_sentence(flag)}", warn))
+            story.append(Paragraph(f"• {_wrap_scripts(_flag_sentence(flag))}", warn))
 
     if signed:
         signed_label = _wrap_scripts(_label("signed", lang))
