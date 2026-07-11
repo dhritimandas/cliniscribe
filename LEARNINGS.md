@@ -1017,3 +1017,60 @@ is the future fine-tuning dataset this project has been missing: it captures
 exactly the model-output → clinician-accepted-truth pairs, per field, in the
 source language, with provenance back to the transcript — accumulating
 passively during real use, at zero annotation cost.
+
+---
+
+## Deployment Latency Phase — Four negative results and the lever that remained (2026-07-11)
+
+### (a) What this phase does
+This phase attacked the deployment-killing fact that transcription runs ten to
+twenty times slower than the audio it processes, under a hard rule: the
+patient-safety keyword metric may not regress. Four escalating attempts to
+speed up decoding — faster engines, merged decode windows, anti-hallucination
+decode parameters, and voice-activity pre-slicing — were each measured on the
+frozen bench and each failed the gate, together proving the slowness is not a
+configuration problem. What shipped instead: honest progress ("42% · ~2 min
+left") computed from real per-segment completion, and a live in-recording
+transcript preview on the fast-but-ungated engine, walled off from all
+clinical content by contract.
+
+### (b) Hardest bugs
+
+1. **The same clips broke every fast engine, and every knob, for the same
+   reason.** Lighter decoders (large-v3-turbo, MLX builds) hallucinate
+   repetition loops ("झाल झाल झाल…") on short or acoustically hard Hindi
+   segments. Root-caused past the point of doubt: on the worst window the
+   decoder escalated through its entire temperature ladder to 1.0 and still
+   looped with high confidence (avg logprob −0.16) on audio that voice-activity
+   detection confirms is 100% speech. Not silence-triggered, not
+   threshold-fixable, not sampling-fixable — a property of the acoustic model
+   itself on this audio class. And the structural alternatives are already
+   closed: long windows absorb code-switched clinical terms into the dominant
+   script (whole-file AND merged-window results, including the same-model
+   control), so the slow per-segment baseline sits at the only measured point
+   that protects drug-name accuracy. Lesson: when independent fixes keep
+   failing on the same inputs, the inputs are telling you the failure lives
+   below every layer you can configure — the honest next lever is the model,
+   not another knob.
+
+2. **A one-word async mistake froze the whole application, invisibly.** The
+   live-preview route was declared `async def` with a blocking 10-second model
+   decode inside — which stalls FastAPI's single event loop, freezing every
+   concurrent request (including the status polling that tells the doctor the
+   system is alive) for the duration of each preview. Nothing crashed; nothing
+   logged; the app just went unresponsive in exactly the moments it was doing
+   the most work. Found only because the debounce test could never produce a
+   real overlap. Fix: a plain `def` route, which the framework dispatches to a
+   worker thread. Lesson: in async servers, blocking work inside an async
+   handler is a silent, total outage — and it is undetectable unless a test
+   genuinely exercises concurrency.
+
+### (c) Fine-tuning hook
+The four negative results convert the ASR fine-tuning argument from "would be
+nice" to "is the only remaining accuracy-safe speed lever." The target is now
+precise: a distilled or fine-tuned model must fix confident repetition-loop
+degeneration on short Hindi clinical segments — the bench clips that break
+every stock engine (f2096fbd, 1ae62262) are the acceptance test, the frozen
+bench is the gate, and the live-preview architecture means even a modest
+fine-tuned model that clears the gate can slot into BOTH the preview and the
+final pass, collapsing stop-to-note latency to near the extraction floor.
