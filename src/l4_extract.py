@@ -110,6 +110,7 @@ _GENERIC_DRUG_TERMS: frozenset[str] = frozenset(
         "tablet", "tablets", "capsule", "capsules",
         "syrup", "cough syrup", "injection", "gel", "cream",
         "ointment", "drops", "painkiller", "pain killer",
+        "nasal spray", "spray",
         "dawai", "dawa",
         "दवाई", "दवा", "दवाइयां", "टैबलेट", "जेल", "इंजेक्शन", "सिरप",
     }
@@ -255,6 +256,62 @@ def _restore_drug_spelling(drug: str, transcript: str) -> str:
     return best_window
 
 
+# ── Grounding guard + dose-provenance flag (invented-drug-name backstop) ────
+# _restore_drug_spelling recovers a drug name the LLM MIS-spelled but actually
+# said (source-fidelity restoration). This guard catches the other failure
+# mode: the LLM INVENTING a drug name with no plausible source in the
+# transcript at all (real case: transcript never says "nasal spray"; the LLM
+# fabricated it after failing to normalize a distorted brand name). No
+# restoration is safe here — there is nothing in the transcript to restore
+# from — so the row is converted to the numbered "unnamed medication N" form
+# instead, the same machinery the generic-term guard already uses.
+_DRUG_GROUND_MIN_SIMILARITY = 0.60
+_DOSE_PROXIMITY_TOKENS = 6
+_DOSE_DIGIT_RE = re.compile(r"\d+")
+
+
+def _transcript_words(transcript: str) -> list[str]:
+    """Role-tag-stripped surface word tokens of a transcript string."""
+    return _ROLE_TAG_RE.sub("", transcript).split()
+
+
+def _best_fold_match(drug: str, words: list[str]) -> tuple[int, int, float]:
+    """Return (start, end, ratio) of the words[]-window (sizes 1-4, see
+    _DRUG_WINDOW_SIZES) with the highest fold-similarity to `drug`.
+
+    Returns (0, 0, 0.0) when `words` is empty — no plausible match to report.
+    """
+    best_start, best_end, best_ratio = 0, 0, 0.0
+    drug_fold = _fold_drug(drug)
+    for n in _DRUG_WINDOW_SIZES:
+        for i in range(len(words) - n + 1):
+            ratio = difflib.SequenceMatcher(
+                None, drug_fold, _fold_drug(" ".join(words[i : i + n]))
+            ).ratio()
+            if ratio > best_ratio:
+                best_start, best_end, best_ratio = i, i + n, ratio
+    return best_start, best_end, best_ratio
+
+
+def _dose_digits_near_drug(dose: str, drug: str, words: list[str]) -> bool:
+    """Return True if a digit token of `dose` appears in `words` within
+    _DOSE_PROXIMITY_TOKENS of the drug's best fold-match span.
+
+    Real case: transcript never states a paracetamol dose, but the LLM glued
+    a neighbouring drug's dose onto it ("naxdom 500" -> paracetamol dose
+    "500 mg"). Returns True (no flag) when `dose` has no digits or `words` is
+    empty — nothing to check, never a false positive.
+    """
+    digit_tokens = _DOSE_DIGIT_RE.findall(dose)
+    if not digit_tokens or not words:
+        return True
+    start, end, _ = _best_fold_match(drug, words)
+    lo = max(0, start - _DOSE_PROXIMITY_TOKENS)
+    hi = min(len(words), end + _DOSE_PROXIMITY_TOKENS)
+    nearby = words[lo:hi]
+    return any(digit in w for digit in digit_tokens for w in nearby)
+
+
 def _iter_dicts(items: list, field_name: str) -> list[dict]:
     """Filter a list field to well-formed dict items, skipping malformed ones.
 
@@ -310,6 +367,7 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     medications: list[Medication] = []
     low_conf: list[str] = list(data.get("low_confidence_fields") or [])
     n_unnamed = 0
+    transcript_words = _transcript_words(transcript)
     for m in _iter_dicts(data.get("medications") or [], "medications"):
         drug = (m.get("drug") or "").strip()
         if not drug:
@@ -336,6 +394,27 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                     drug, restored,
                 )
                 drug = restored
+            # Grounding guard: an invented drug name matches nothing in the
+            # transcript, however loosely. _restore_drug_spelling only fixes
+            # MIS-spellings of something actually said — a full invention
+            # (real case: LLM fabricated "nasal spray" out of thin air) has
+            # no transcript source to restore from, so it must never render
+            # as a real drug name. Skipped when transcript is empty (tests/
+            # eval call _build_note without one).
+            if transcript_words:
+                _, _, ground_ratio = _best_fold_match(drug, transcript_words)
+                if ground_ratio < _DRUG_GROUND_MIN_SIMILARITY:
+                    n_unnamed += 1
+                    label = f"unnamed medication {n_unnamed}"
+                    logger.warning(
+                        "L4: ungrounded drug name %r (best transcript "
+                        "similarity %.2f) converted to %r",
+                        drug, ground_ratio, label,
+                    )
+                    flag = f"medications.{label}.ungrounded"
+                    if flag not in low_conf:
+                        low_conf.append(flag)
+                    drug = label
         medications.append(
             Medication(
                 drug=drug,
@@ -378,6 +457,18 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 low_conf.append(flag)
         if med.dose is None:
             flag = f"medications.{med.drug}.dose_unknown"
+            if flag not in low_conf:
+                low_conf.append(flag)
+        elif not med.drug.startswith("unnamed medication") and not _dose_digits_near_drug(
+            med.dose, med.drug, transcript_words
+        ):
+            # Dose-provenance flag (never alters the extracted value): a dose
+            # far from every mention of its own drug is likely cross-
+            # attributed from a neighbouring medication (real case: a
+            # "naxdom 500" dose glued onto "paracetamol"). unnamed rows are
+            # skipped — there is no drug mention in the transcript to be
+            # "near" once the name itself is a fabrication.
+            flag = f"medications.{med.drug}.dose_unattributed"
             if flag not in low_conf:
                 low_conf.append(flag)
 
