@@ -90,3 +90,48 @@ DEGEN_EMPTY_ON_VOICED_MIN_S = 1.0  # empty decode on a segment this long+ is sus
 # the other cheap lever tried before escalating to a bigger model in step3.
 RETRY_BOUNDARY_SHIFT_S = 0.4
 RETRY_TEMP_STEP2 = 0.2
+
+# ── L3-fast v2, Fix 1: language-allowlist guard ──────────────────────────────
+# mlx-whisper's per-window language auto-detection occasionally locks onto a
+# WRONG but fluent language -- not a repetition loop, so looks_degenerate()
+# cannot see it. Observed on the v1 frozen-bench gate (outputs/fast_asr_gate.json):
+# "Obrigada" (Portuguese), "işte sulta" / "Bu, sayıda" (Turkish), "saya
+# menikmati" (Indonesian) decoded confidently over Hindi speech. We only
+# support hi/en/mr; any other detected language token is always a
+# misdetection. Checked on every decode, belt-and-braces alongside
+# ASR_SCRIPT_GUARD (which only catches the Arabic-script case) -- see
+# src/fast_asr.py::_decode_with_script_guard.
+ASR_LANGUAGE_ALLOWLIST = frozenset({"hi", "en", "mr"})
+
+# ── L3-fast v2, Fix 2: window-packed decoding ────────────────────────────────
+# Measured root cause of the ~10-20x-realtime slowdown: mlx-whisper pads every
+# input to a 30s window before encoding regardless of content length (its
+# transcribe() always calls pad_or_trim(mel, N_FRAMES, ...) where N_FRAMES is
+# a fixed 30s), so one decode call costs a near-constant ~7-9s whether it
+# decodes 2s or 25s of audio -- cost is per WINDOW, not per second (measured
+# directly on warm calls; see LEARNINGS.md). fast_transcribe_windowed() packs
+# diarized segments into <= WINDOW_MAX_SPAN_S windows and decodes each ONCE,
+# cutting call count from one-per-segment to one-per-window.
+WINDOW_MAX_SPAN_S = 28.0
+# Minimum silence gap -- or any speaker change -- preferred as a window break
+# point when a window must close before reaching the cap (see
+# src/fast_asr.py::_pack_segments_into_windows).
+WINDOW_MIN_BREAK_GAP_S = 0.8
+
+# Which fast-ASR entry point to use once FAST_ASR_ENABLED flips True: either
+# "per_segment" (src.fast_asr.fast_transcribe) or "windowed"
+# (src.fast_asr.fast_transcribe_windowed) -- whichever passes
+# eval/fast_asr_gate.py's frozen-bench gate fastest. NEITHER passed the v2
+# gate (outputs/fast_asr_gate_v2.json, both engines run 2026-07-11):
+# per_segment  corpus_wer 0.6613 > 0.5388, keyword_wer 0.6429 > 0.5814
+#              (drug_wer_folded 0.5714 <= 0.8571 -- the only metric that passed)
+# windowed     corpus_wer 0.9059 > 0.5388, keyword_wer 0.6905 > 0.5814
+#              (drug_wer_folded 0.7143 <= 0.8571 -- also passed)
+# windowed's much worse corpus_wer traces to whole-clip windows drifting into
+# English PARAPHRASE/translation of code-switched Hindi speech rather than
+# transcription (e.g. "सर दर्द" -> "How severe is your heart?"), a distinct
+# and worse failure mode than the anticipated Devanagari-absorption risk (zero
+# absorption candidates were found -- see eval/fast_asr_gate.py). This value
+# is a placeholder, inert until a future attempt clears the gate; no caller
+# reads it while FAST_ASR_ENABLED is False.
+FAST_ASR_MODE = "per_segment"
