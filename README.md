@@ -76,17 +76,71 @@ pytest tests/ -v
 Datasets (EkaCare, open access on HuggingFace) are pulled into `data/` on first use;
 both `data/` and `outputs/` are gitignored.
 
-## Review frontend (offline web app)
+## Review frontend (offline web app) — step-by-step
 
 A fully offline FastAPI + single-page app for the record → review → edit →
 sign → PDF workflow (`docs/frontend_contracts.md` documents the API and data
-contracts):
+contracts). Follow these steps exactly; each one matters.
+
+**Step 0 — one-time setup.** Complete the Installation section above
+(venv, `pip install -r requirements.txt`, `.env` with your `HF_TOKEN`,
+`ollama pull qwen2.5:3b-instruct`). On Apple Silicon, make sure your
+`ollama` is a native arm64 build (`file $(which ollama)` should say `arm64`
+— an x86_64 build under Rosetta runs the extraction model ~15x slower).
+The first-ever run also downloads the ASR and embedding models from
+HuggingFace (~3 GB total) — allow time and disk for that once.
+
+**Step 1 — start Ollama** (terminal 1, leave it running):
 
 ```bash
-# Ollama must be running (L4 extraction + translation)
-uvicorn web.app:app --host 127.0.0.1 --port 8000
-# then open http://127.0.0.1:8000/ in a browser
+ollama serve
 ```
+
+**Step 2 — start the app** (terminal 2):
+
+```bash
+cd cliniscribe
+source .venv/bin/activate
+uvicorn web.app:app --host 127.0.0.1 --port 8000
+```
+
+Wait for `Uvicorn running on http://127.0.0.1:8000`.
+
+**Step 3 — open http://127.0.0.1:8000/ in a browser.** You should see a
+dark screen with a circular mic button. If you instead see an amber
+"DEMO DATA — no backend connected" banner, you opened the HTML file
+directly from disk — that mode shows fake fixture data; use the URL.
+
+**Step 4 — record or upload.**
+- *Record*: tap the mic ring (allow microphone access). While you speak, a
+  quiet live transcript preview appears below the timer (refreshes ~10 s;
+  it is a capture check only — the final transcript is produced after you
+  stop). Tap the ring again to stop, or simply stop talking: recording
+  auto-stops after 28 s of silence, with a visible countdown any speech
+  cancels.
+- *Upload*: click "use audio file instead" at the bottom and pick a
+  wav/mp3 (e.g. `data/sample_00.mp3` for a known-good demo).
+
+**Step 5 — wait, informed.** Three stage lines light up as real pipeline
+stages finish, and the transcription line shows live progress:
+`TRANSCRIBING SPEECH · 38% · ~2 min left`. On a MacBook Air M-series,
+expect roughly **5–10 minutes for a 30-second consultation** — the
+accuracy-safe ASR model is the bottleneck (see LEARNINGS.md for why the
+faster engines were measured and rejected).
+
+**Step 6 — review.** Edit any field inline (every edit is logged to
+`outputs/<session>/corrections.jsonl` as a structured diff). Click a
+field's "source" tag to see the transcript sentence it came from; "View
+transcript" opens the full speaker-attributed conversation in a drawer
+(CLOSE button or Escape to exit). The language dropdown (en/hi/mr)
+translates labels, note text, and the transcript — drug names and doses
+are never machine-translated, and the original text is always one tap
+away. Amber "VERIFY" tags mark fields the physician must confirm.
+
+**Step 7 — sign.** Click SIGN, fill doctor name / registration no. /
+clinic, submit, then download the PDF in any of the three languages.
+All artifacts live in `outputs/<session-id>/`; reopen a finished session
+any time at `http://127.0.0.1:8000/#session=<session-id>`.
 
 | Capture (Zen) | Processing |
 |---|---|
