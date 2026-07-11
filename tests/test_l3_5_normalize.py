@@ -387,3 +387,11 @@ def test_latin_canonical_drug_left_untouched() -> None:
     from src.l3_5_normalize import _normalize_drug_text
 
     assert _normalize_drug_text("dolo 650 le lena subah") == "dolo 650 le lena subah"
+
+
+# ── Naxdom lexicon (Urdu-script ASR bug fix) ─────────────────────────────────
+
+
+def test_naxdom_curated_hit_with_dose() -> None:
+    result = _normalize_drug_text("नैक्सडॉम 500 khao")
+    assert "naxdom" in result

@@ -30,6 +30,15 @@ ASR_BEAM_SIZE = 5
 # per-segment clip_timestamps decoding is in place.
 ASR_VAD_FILTER = False
 
+# Whisper's per-segment language auto-detection (language=None) occasionally
+# misclassifies spoken Hindi as Urdu and writes the segment in Arabic script
+# (observed in production session 20260710-230150-cef13a: "نیکس ڈوم فائیو
+# ہنڈریڈ" for "Naxdom five hundred"). We only support hi/en/mr — all Latin or
+# Devanagari — so any Arabic-script output is always a misdetection. When
+# True, transcribe() re-decodes the affected segment once with language="hi"
+# forced. See src/l3_asr.py::_contains_arabic_script.
+ASR_SCRIPT_GUARD = True
+
 # ── L3.5 concept matching (E5 study: hard-negative gate) ─────────────────────
 COSINE_THRESHOLD = 0.65  # min cosine similarity for a lay→clinical concept match
 HARDNEG_MARGIN = 0.05  # span must beat its hardest hard-negative by this margin

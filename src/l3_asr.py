@@ -2,12 +2,26 @@
 
 import gc
 import logging
+import re
 
 import torch
 from faster_whisper import WhisperModel
 
 from src import config, telemetry
 from src.types import Segment, Turn
+
+# Arabic-script Unicode blocks (Arabic, Supplement, Extended-A, Presentation
+# Forms A/B). We only support hi/en/mr (Latin or Devanagari); any Arabic-script
+# text means Whisper's per-segment auto-detect misclassified Hindi as Urdu.
+_ARABIC_SCRIPT_RE = re.compile(
+    "[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]"
+)
+
+
+def _contains_arabic_script(text: str) -> bool:
+    """True if text contains any Arabic-script character (see module docstring)."""
+    return bool(_ARABIC_SCRIPT_RE.search(text))
+
 
 # Doctor heuristic: bag-of-words score over transcribed text.
 # Doctors tend to use question forms (eliciting symptoms) AND clinical terms
@@ -73,6 +87,10 @@ def transcribe(
         is set, and this call always sets clip_timestamps for per-segment
         decoding. It provides no silence-hallucination protection — kept
         False (see src.config.ASR_VAD_FILTER for the full explanation).
+        When config.ASR_SCRIPT_GUARD is True (default), a segment whose
+        decode contains Arabic-script characters is re-decoded once with
+        language="hi" forced — we only support hi/en/mr, so Arabic script is
+        always a misdetection (see src.config.ASR_SCRIPT_GUARD).
     """
     owns_model = model is None
     if owns_model:
@@ -80,11 +98,10 @@ def transcribe(
             model = WhisperModel(config.ASR_MODEL, device="cpu", compute_type="int8")
         logger.info("L3: loaded faster-whisper %s", config.ASR_MODEL)
 
-    raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
-    for seg in segments:
+    def _decode(seg: Segment, language: str | None) -> str:
         gen, _ = model.transcribe(
             wav_path,
-            language=None,
+            language=language,
             task="transcribe",
             clip_timestamps=f"{seg.start},{seg.end}",
             # Read at call time (not import time) so eval studies can override
@@ -94,7 +111,26 @@ def transcribe(
             vad_filter=config.ASR_VAD_FILTER,
             word_timestamps=False,
         )
-        text = " ".join(chunk.text.strip() for chunk in gen).strip()
+        return " ".join(chunk.text.strip() for chunk in gen).strip()
+
+    raw_turns: list[tuple[str, str, float, float]] = []  # (speaker, text, start, end)
+    for seg in segments:
+        text = _decode(seg, language=None)
+
+        # Script guard: language=None occasionally misdetects Hindi as Urdu
+        # and decodes the segment in Arabic script. We only support hi/en/mr
+        # (Latin/Devanagari), so Arabic script is always a misdetection —
+        # force a single re-decode with language="hi" (config.ASR_SCRIPT_GUARD).
+        if config.ASR_SCRIPT_GUARD and _contains_arabic_script(text):
+            logger.warning(
+                "L3 script guard: Arabic-script decode at [%.2f, %.2f]s "
+                "('%s') — re-decoding with language=hi",
+                seg.start,
+                seg.end,
+                text[:40],
+            )
+            text = _decode(seg, language="hi")
+
         if text:
             raw_turns.append((seg.speaker, text, seg.start, seg.end))
 
