@@ -24,9 +24,14 @@
   <div id="silence-notice" class="silence-notice" hidden></div>
 
   <div id="stage-lines" class="stage-lines" hidden>
-    <div class="stage-line" data-stage="transcribed"><span class="tick">&#10003;</span><span class="text"></span></div>
+    <div class="stage-line" data-stage="transcribed"><span class="tick">&#10003;</span><span class="text"></span><span class="progress" hidden></span></div>
     <div class="stage-line" data-stage="speakers"><span class="tick">&#10003;</span><span class="text"></span></div>
     <div class="stage-line" data-stage="drafting"><span class="tick">&#10003;</span><span class="text"></span></div>
+  </div>
+
+  <div id="live-preview" class="live-preview" hidden>
+    <div class="live-preview-label" id="live-preview-label"></div>
+    <div class="live-preview-text" id="live-preview-text"></div>
   </div>
 
   <label id="file-hint" class="file-hint">

@@ -83,13 +83,64 @@ def test_create_session_rejects_unsupported_audio_type(client) -> None:
     assert response.status_code == 400
 
 
+def test_create_session_releases_live_preview_model(client, monkeypatch) -> None:
+    """Memory discipline: a finished recording upload must release any
+    resident live-preview model before production models load (web/live_asr.py)."""
+    calls = []
+    monkeypatch.setattr(app_module.live_asr, "release_model", lambda: calls.append(1))
+
+    _create_session(client)
+
+    assert calls == [1]
+
+
+# ── live preview (UI-display-only, gate-exempt) ───────────────────────────
+
+
+def test_live_preview_returns_text_when_model_available(client, monkeypatch) -> None:
+    monkeypatch.setattr(app_module.live_asr, "available", lambda: True)
+    monkeypatch.setattr(app_module.live_asr, "try_acquire", lambda: True)
+    monkeypatch.setattr(app_module.live_asr, "release", lambda: None)
+    monkeypatch.setattr(
+        app_module.live_asr,
+        "transcribe_preview",
+        lambda wav_bytes: "fever since three days",
+    )
+
+    response = client.post(
+        "/api/live/preview",
+        files={"audio": ("live.wav", b"RIFF-fake-wav-bytes", "audio/wav")},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"text": "fever since three days"}
+
+
+def test_live_preview_is_503_when_model_unavailable(client, monkeypatch) -> None:
+    monkeypatch.setattr(app_module.live_asr, "available", lambda: False)
+
+    response = client.post(
+        "/api/live/preview", files={"audio": ("live.wav", b"junk", "audio/wav")}
+    )
+    assert response.status_code == 503
+
+
+def test_live_preview_rejects_overlapping_calls_with_429(client, monkeypatch) -> None:
+    monkeypatch.setattr(app_module.live_asr, "available", lambda: True)
+    monkeypatch.setattr(app_module.live_asr, "try_acquire", lambda: False)
+
+    response = client.post(
+        "/api/live/preview", files={"audio": ("live.wav", b"junk", "audio/wav")}
+    )
+    assert response.status_code == 429
+
+
 # ── process / status state machine ────────────────────────────────────────
 
 
 def test_process_advances_status_through_stages_to_review(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None):
         for stage in ("l1_preprocess", "l2_diarize", "l3_asr"):
             on_stage(stage, "start")
             on_stage(stage, "end")
@@ -117,7 +168,7 @@ def test_process_advances_status_through_stages_to_review(client, monkeypatch) -
 def test_process_records_error_state_on_pipeline_failure(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def failing_run(in_path, session_id=None, *, on_stage=None):
+    def failing_run(in_path, session_id=None, *, on_stage=None, on_progress=None):
         on_stage("l1_preprocess", "start")
         raise RuntimeError("boom")
 
@@ -145,6 +196,55 @@ def test_process_unknown_session_is_404(client) -> None:
 def test_status_unknown_session_is_404(client) -> None:
     response = client.get("/api/sessions/does-not-exist/status")
     assert response.status_code == 404
+
+
+# ── L3 transcription progress / ETA (status.json "progress"/"eta_seconds") ──
+
+
+def test_progress_callbacks_compute_eta_throttle_and_clear_on_stage_end(
+    tmp_path, monkeypatch
+) -> None:
+    """Unit test of _make_progress_callbacks's math, in isolation from the
+    daemon thread — deterministic control of time.monotonic() throughout."""
+    monkeypatch.chdir(tmp_path)
+    sid = "progress-test"
+    os.makedirs(os.path.join("outputs", sid))
+    app_module._write_json(
+        app_module._status_path(sid),
+        {"state": "idle", "stage": None, "stages_done": [], "error": None},
+    )
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: clock["t"])
+
+    on_stage, on_progress = app_module._make_progress_callbacks(sid)
+
+    on_stage("l3_asr", "start")  # l3_start = 1000.0
+    clock["t"] = 1010.0  # 10s of "decoding" elapsed
+    on_progress(5.0, 10.0)  # 50% done -> eta = 10 * (1-0.5)/0.5 = 10.0
+
+    status = app_module._read_json(app_module._status_path(sid))
+    assert status["progress"] == 0.5
+    assert status["eta_seconds"] == 10.0
+
+    # Throttle: within 1s of the last write, a new datum must not overwrite.
+    clock["t"] = 1010.5
+    on_progress(9.0, 10.0)
+    status_throttled = app_module._read_json(app_module._status_path(sid))
+    assert status_throttled["progress"] == 0.5
+
+    # >=1s later, the next datum writes fresh values.
+    clock["t"] = 1012.0
+    on_progress(9.0, 10.0)  # 90% done -> eta = 12 * (1-0.9)/0.9
+    status_updated = app_module._read_json(app_module._status_path(sid))
+    assert status_updated["progress"] == 0.9
+    assert status_updated["eta_seconds"] == round(12.0 * 0.1 / 0.9, 1)
+
+    # Stage end clears both fields — the SPA's %/ETA suffix must disappear.
+    on_stage("l3_asr", "end")
+    status_final = app_module._read_json(app_module._status_path(sid))
+    assert "progress" not in status_final
+    assert "eta_seconds" not in status_final
 
 
 # ── GET note (note + transcript + provenance + flags) ────────────────────

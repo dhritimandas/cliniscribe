@@ -145,6 +145,43 @@ html, body {
 .stage-line.done .tick { display: inline; }
 .stage-line.active { color: var(--teal); opacity: 0.55; }
 
+/* Real transcription %/ETA suffix on the "transcribed" line — always gray,
+   never the teal/amber accents, regardless of the line's own state color. */
+.stage-line .progress {
+  color: var(--gray-400);
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* ---------- Live preview (UI-display-only; see web/live_asr.py) ----------
+   Running text only, quiet gray, max ~4 lines with a top fade so newest
+   text is the one that stays visible as the buffer grows. */
+.live-preview {
+  margin-top: 1.5rem;
+  max-width: 26rem;
+  text-align: center;
+}
+
+.live-preview-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--gray-400);
+  margin-bottom: 0.3rem;
+}
+
+.live-preview-text {
+  max-height: 5.6em;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.4em;
+  color: var(--gray-400);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, black 25%);
+  mask-image: linear-gradient(to bottom, transparent, black 25%);
+}
+
 .file-hint {
   position: fixed;
   bottom: 2rem;

@@ -77,6 +77,7 @@ const UI_STRINGS = {
   download_pdf: "download pdf",
   original: "original",
   editing_original: "editing original",
+  live_preview_label: "LIVE PREVIEW — final transcript follows",
 };
 function u(key) { return UI_STRINGS[key]; }
 
@@ -323,6 +324,9 @@ const silenceNoticeEl = document.getElementById("silence-notice");
 const stageLinesEl = document.getElementById("stage-lines");
 const fileInput = document.getElementById("file-input");
 const fileHintText = document.getElementById("file-hint-text");
+const livePreviewEl = document.getElementById("live-preview");
+const livePreviewLabelEl = document.getElementById("live-preview-label");
+const livePreviewTextEl = document.getElementById("live-preview-text");
 
 let captureState = "idle"; // idle | recording | uploading | processing
 
@@ -334,6 +338,17 @@ let recordedChunks = []; // Float32Array chunks at 16kHz mono
 
 let silenceStartedAt = null; // ms timestamp when continuous silence began, or null
 let autoStopping = false;    // guards against re-entrant auto-stop while stopping
+
+/* ---------- Live in-recording transcript preview (UI-display-only) ----------
+ * Every LIVE_PREVIEW_INTERVAL_MS, POST the full recorded-so-far WAV to
+ * /api/live/preview and render the returned running text. Gate-exempt: this
+ * text NEVER feeds the note or the review screen (web/live_asr.py contract).
+ * Graceful degradation: any failure (mlx_whisper missing, 429 debounce, a
+ * transient network error) is swallowed silently — capture must work with
+ * or without the preview. */
+const LIVE_PREVIEW_INTERVAL_MS = 10000;
+let livePreviewTimerHandle = null;
+let livePreviewInFlight = false; // client-side debounce, mirrors the server's
 
 function rms(buffer) {
   let sumSquares = 0;
@@ -424,6 +439,40 @@ function encodeWav(samples, sampleRate) {
 
 const TARGET_SAMPLE_RATE = 16000;
 
+function buildCurrentWavBlob() {
+  const totalLength = recordedChunks.reduce((n, c) => n + c.length, 0);
+  const samples = new Float32Array(totalLength);
+  let off = 0;
+  for (const chunk of recordedChunks) { samples.set(chunk, off); off += chunk.length; }
+  return encodeWav(samples, TARGET_SAMPLE_RATE);
+}
+
+function renderLivePreview(text) {
+  if (!text) return;
+  livePreviewTextEl.textContent = text;
+  livePreviewEl.hidden = false;
+  livePreviewTextEl.scrollTop = livePreviewTextEl.scrollHeight; // newest stays visible
+}
+
+async function pollLivePreview() {
+  if (livePreviewInFlight || !recordedChunks.length) return;
+  livePreviewInFlight = true;
+  try {
+    const form = new FormData();
+    form.append("audio", buildCurrentWavBlob(), "live.wav");
+    const res = await api("/api/live/preview", { method: "POST", body: form });
+    if (res.ok) {
+      const data = await res.json();
+      renderLivePreview(data.text);
+    }
+  } catch (err) {
+    // Graceful degradation (spec): live preview never surfaces a failure —
+    // capture must keep working with or without mlx-whisper installed.
+  } finally {
+    livePreviewInFlight = false;
+  }
+}
+
 async function startRecording() {
   mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -451,6 +500,10 @@ async function startRecording() {
   silenceStartedAt = null;
   autoStopping = false;
   hideSilenceCountdown();
+
+  livePreviewTextEl.textContent = "";
+  livePreviewEl.hidden = true;
+  livePreviewTimerHandle = setInterval(pollLivePreview, LIVE_PREVIEW_INTERVAL_MS);
 }
 
 function updateTimer() {
@@ -466,6 +519,9 @@ function stopRecordingTracks() {
   if (mediaStream) { mediaStream.getTracks().forEach((tr) => tr.stop()); mediaStream = null; }
   if (audioContext) { audioContext.close(); audioContext = null; }
   clearInterval(timerHandle);
+  clearInterval(livePreviewTimerHandle);
+  livePreviewTimerHandle = null;
+  livePreviewEl.hidden = true;
 }
 
 async function stopRecordingAndUpload() {
@@ -507,12 +563,36 @@ function setStageLine(stageKey, state) {
   if (state) el.classList.add(state);
 }
 
+// Real transcription %/ETA suffix on the "transcribed" line (spec: appears
+// only once the first progress datum arrives, disappears when l3_asr ends —
+// status.json's "progress"/"eta_seconds" are absent outside that window).
+function formatEtaSuffix(etaSeconds) {
+  if (typeof etaSeconds !== "number") return "";
+  const rounded = etaSeconds < 60
+    ? `~${Math.round(etaSeconds)}s left`
+    : `~${Math.round(etaSeconds / 60)} min left`;
+  return ` · ${rounded}`;
+}
+
+function updateTranscribeProgress(status) {
+  const el = stageLinesEl.querySelector('[data-stage="transcribed"] .progress');
+  if (status.stage !== "l3_asr" || typeof status.progress !== "number") {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  const pct = Math.round(status.progress * 100);
+  el.textContent = ` · ${pct}%${formatEtaSuffix(status.eta_seconds)}`;
+  el.hidden = false;
+}
+
 function applyStatus(status) {
   const done = new Set(status.stages_done || []);
   const stage = status.stage;
 
   const transcribedDone = done.has("l1_preprocess") && done.has("l2_diarize") && done.has("l3_asr");
   setStageLine("transcribed", transcribedDone ? "done" : (stage && ["l1_preprocess", "l2_diarize", "l3_asr"].includes(stage) ? "active" : ""));
+  updateTranscribeProgress(status);
 
   const speakersDone = done.has("l3_5_normalize");
   setStageLine("speakers", speakersDone ? "done" : (stage === "l3_5_normalize" ? "active" : ""));
@@ -1063,6 +1143,7 @@ async function init() {
   captureCaption.textContent = t("capture_hint");
   micRing.setAttribute("aria-label", t("record"));
   fileHintText.textContent = u("use_audio_file");
+  livePreviewLabelEl.textContent = u("live_preview_label");
   stageLinesEl.setAttribute("aria-label", t("processing"));
   document.getElementById("lang-select").setAttribute("aria-label", t("language"));
   const stageKeyToText = { transcribed: "stage_transcribed", speakers: "stage_speakers", drafting: "stage_drafting" };
