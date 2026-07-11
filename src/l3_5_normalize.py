@@ -1,8 +1,9 @@
 """L3.5 — Post-ASR normalization: drug-term transliteration + concept glossing.
 
 Two passes in sequence:
-1. Drug normalization (no model): 3-tier Devanagari→Latin pipeline
-   (curated table → exact CDSCO → length-guarded fuzzy match).
+1. Drug normalization (no model): 4-tier Devanagari→Latin pipeline (curated
+   table → expanded-lexicon fold match → exact CDSCO → length-guarded fuzzy
+   match).
 2. Concept normalization (parrotlet-e): lay symptom/condition terms glossed
    with canonical clinical names + SNOMED IDs.
 """
@@ -19,6 +20,7 @@ import numpy as np
 from src import config
 from src.cdsco import _APPROVED_DRUGS
 from src.concepts import CONCEPTS
+from src.drug_lexicon import canonicalize_drug_span
 from src.types import Turn
 
 logger = logging.getLogger(__name__)
@@ -253,17 +255,39 @@ _LATIN_CURATED: dict[str, str] = {
 }
 
 
+def _lexicon_hit(span: list[str], span_text: str) -> str | None:
+    """Try the expanded-lexicon fold matcher for one span, digit-guarded.
+
+    Returns the canonical drug name only if canonicalize_drug_span() found
+    an unambiguous match AND every digit token in the span survives in that
+    canonical (same dose-preservation invariant as the other tiers). None
+    otherwise — the caller falls through to the next tier.
+    """
+    hit = canonicalize_drug_span(span_text)
+    if hit is None:
+        return None
+    canonical, _confidence = hit
+    span_digits = [t for t in span if any(ch.isdigit() for ch in t)]
+    if any(d not in canonical for d in span_digits):
+        return None
+    return canonical
+
+
 def _normalize_drug_text(text: str) -> str:
-    """Apply 3-tier drug normalization to a single string.
+    """Apply 4-tier drug normalization to a single string.
 
     Processes windows of 3, 2, 1 tokens (longest match wins). Windows with
-    Devanagari tokens go through curated-table → ITRANS+CDSCO-exact →
-    CDSCO-fuzzy. All-Latin windows that look drug-like (see
-    _latin_span_candidate) go through curated-table (_LATIN_CURATED) →
-    CDSCO-exact → CDSCO-fuzzy with the same thresholds — Whisper distorts
-    Latin drug names too, and brands absent from CDSCO (e.g. naxdom) can only
-    ever be recovered via the curated table. Already-covered positions are
-    skipped.
+    Devanagari tokens go through curated-table → expanded-lexicon fold match
+    (_lexicon_hit) → ITRANS+CDSCO-exact → CDSCO-fuzzy. All-Latin windows that
+    look drug-like (see _latin_span_candidate) go through curated-table
+    (_LATIN_CURATED) → expanded-lexicon fold match → CDSCO-exact →
+    CDSCO-fuzzy with the same thresholds — Whisper distorts Latin drug names
+    too, and brands absent from CDSCO (e.g. naxdom) can only ever be
+    recovered via the curated table or the expanded lexicon. The lexicon
+    tier absorbs spelling variants the curated tables have never seen
+    (fold-key match, ambiguity-guarded — see src/drug_lexicon.py); the
+    curated tables stay as the zero-risk fast path for known distortions.
+    Already-covered positions are skipped.
 
     Args:
         text: Raw ASR hypothesis string.
@@ -288,6 +312,11 @@ def _normalize_drug_text(text: str) -> str:
                     hits[(i, i + window)] = latin
                     continue
 
+                latin = _lexicon_hit(span, span_text)
+                if latin:
+                    hits[(i, i + window)] = latin
+                    continue
+
                 roman = _itrans_romanize(span_text)
                 latin = _cdsco_exact(roman)
                 if latin:
@@ -302,6 +331,8 @@ def _normalize_drug_text(text: str) -> str:
             if _latin_span_candidate(span):
                 roman = span_text.lower()
                 latin = _LATIN_CURATED.get(roman)
+                if latin is None:
+                    latin = _lexicon_hit(span, span_text)
                 if latin is None:
                     latin = _cdsco_exact(roman)
                 if latin is None:

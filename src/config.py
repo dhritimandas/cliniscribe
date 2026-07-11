@@ -56,3 +56,37 @@ EXTRACT_NUM_PREDICT = 2048
 # session) instead of Ollama's default unload; also enables the L3.5-time
 # preload. Whisper is always released before the LLM loads (pipeline order).
 EXTRACT_KEEP_ALIVE = "15m"
+
+# ── L3-fast ASR (mlx-whisper, gated) ─────────────────────────────────────────
+# Chunk-local detect+retry engine (src/fast_asr.py), built to answer the
+# Deployment Latency Phase's four negative results (see LEARNINGS.md): faster
+# engines/merged windows/decode-param tweaks/VAD pre-slicing all failed the
+# frozen-bench gate outright. This flag stays False — the production path
+# keeps using src.l3_asr.transcribe — until eval/fast_asr_gate.py reports a
+# PASS; the caller (src/pipeline.py) flips it, this file does not.
+FAST_ASR_ENABLED = False
+
+FAST_ASR_MODEL = "mlx-community/whisper-large-v3-turbo"  # per-segment primary decode
+FAST_ASR_FALLBACK_MODEL = "mlx-community/whisper-large-v3-mlx"  # retry-ladder step3
+# temperature=0.0 (scalar, not the 6-rung fallback ladder) + no conditioning:
+# measured no worse than the stock ladder on the known-bad clips (both still
+# loop either way — see eval/engine_study.py probe_antihallu), and faster.
+FAST_ASR_DECODE_KWARGS: dict = {"temperature": 0.0, "condition_on_previous_text": False}
+
+# Degeneration-detector thresholds (src/fast_asr.py::looks_degenerate), tuned
+# against the real repetition-loop hallucinations cached in
+# outputs/engine_study.json ("college college college...", "झाल झाल झाल...")
+# with zero false positives across all 20 fw-large-v3 hypotheses in
+# outputs/beam_study.json (see tests/test_fast_asr.py for the sweep).
+DEGEN_COMPRESSION_RATIO = 2.4  # zlib text-compression ratio above this = looping
+DEGEN_MIN_LEN_FOR_RATIO = 20  # chars; below this, zlib overhead makes the ratio noisy
+DEGEN_NGRAM_SIZES = (1, 2, 3, 4)  # phrase lengths checked for back-to-back repetition
+DEGEN_NGRAM_MIN_REPEAT = 4  # same phrase repeated >= this many times consecutively
+DEGEN_MAX_CHARS_PER_SECOND = 30.0  # implausible decode density for hi/en/mr speech
+DEGEN_EMPTY_ON_VOICED_MIN_S = 1.0  # empty decode on a segment this long+ is suspect
+
+# Retry-ladder step knobs (src/fast_asr.py::_retry_ladder). Step1's boundary
+# shift is a measured loop-breaker; step2's temperature/conditioning change is
+# the other cheap lever tried before escalating to a bigger model in step3.
+RETRY_BOUNDARY_SHIFT_S = 0.4
+RETRY_TEMP_STEP2 = 0.2
