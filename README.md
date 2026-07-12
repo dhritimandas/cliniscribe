@@ -4,6 +4,21 @@ On-device clinical scribe for Indian tier-2/tier-3 clinics. It turns a recorded
 consultation — Hindi, English, and Marathi, code-switched mid-sentence — into a
 structured clinical note and a prescription PDF for the physician to review and sign.
 
+| 1 · Record | 2 · Live progress |
+|---|---|
+| ![Capture screen — tap to record](docs/screenshots/capture-idle.png) | ![Processing — real per-stage progress with time remaining](docs/screenshots/processing-progress.png) |
+
+| 3 · Review the note | 4 · Trace every field to its source |
+|---|---|
+| ![Review — editable note, VERIFY flags, background-check banner](docs/screenshots/review-note.png) | ![Transcript drawer — speaker-attributed turns with timestamps](docs/screenshots/transcript-drawer.png) |
+
+Tap the mic, talk normally (Hindi/English/Marathi mixed is fine), stop — a
+structured note appears in about a minute with live progress the whole way.
+Every field links back to the exact sentence and timestamp it came from; a
+background "second listen" re-checks the safety-critical spans (drugs, doses,
+vitals, diagnosis) within ~60–90 seconds and flags any disagreement; edit
+inline, switch the display language, sign, and print the prescription.
+
 Everything runs locally on a MacBook Air (M-series, 24 GB RAM). No cloud APIs are in
 the production path: patient privacy, cost, and unreliable rural connectivity rule them
 out.
@@ -142,21 +157,18 @@ clinic, submit, then download the PDF in any of the three languages.
 All artifacts live in `outputs/<session-id>/`; reopen a finished session
 any time at `http://127.0.0.1:8000/#session=<session-id>`.
 
-| Capture (Zen) | Processing |
-|---|---|
-| ![Capture screen](docs/screenshots/capture-zen.png) | ![Processing stages](docs/screenshots/processing-stages.png) |
-
-| Review (Sage) | Transcript drawer |
-|---|---|
-| ![Review card](docs/screenshots/review-sage.png) | ![Transcript drawer](docs/screenshots/transcript-drawer.png) |
-
-Record in the browser (or upload a file), watch real per-stage progress, review
-the extracted note with per-field provenance ("source" links into the
-speaker-attributed transcript), edit inline (every edit is logged to
-`outputs/<session>/corrections.jsonl` as a structured diff), switch the UI and
-note text between English/Hindi/Marathi (drug names and doses are never
-machine-translated), then sign to produce the final PDF. Flagged fields carry a
-text "VERIFY" badge — uncertainty is never conveyed by color alone.
+Record in the browser (or upload a file), watch real per-stage progress with
+time remaining on every stage, review the extracted note with per-field
+provenance ("source" links into the speaker-attributed transcript), edit
+inline (every edit is logged to `outputs/<session>/corrections.jsonl` as a
+structured diff), switch the UI and note text between English/Hindi/Marathi
+(drug names and doses are never machine-translated), then sign — or use
+DRAFT PDF AND PRINT, which opens the print dialog over the review page.
+A background "second listen" re-decodes the safety-critical audio spans with
+a larger model within ~60–90s and flags disagreements
+(![banner](docs/screenshots/verification-banner.png) shows the all-clear
+state). Flagged fields carry a text "VERIFY" badge — uncertainty is never
+conveyed by color alone.
 
 ## Repository structure
 
