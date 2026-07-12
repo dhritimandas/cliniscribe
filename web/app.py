@@ -15,6 +15,7 @@ import re
 import statistics
 import threading
 import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -27,7 +28,7 @@ from pydantic import BaseModel
 from src import config, pipeline
 from src.l5_render import render
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
-from web import live_asr, verification
+from web import drug_mask, live_asr, verification
 from web.provenance import flags_by_path, provenance_for_note
 from web.translations import TRANSLATIONS
 
@@ -442,6 +443,52 @@ def _run_verification_thread(sid: str) -> None:
         _write_json(_status_path(sid), status)
 
 
+# Warmed sequentially (one Ollama call in flight at a time) once note.json
+# is ready — see `_run_translation_warm_thread`.
+_TRANSLATION_WARM_LANGS = ("en", "hi", "mr")
+
+
+def _run_translation_warm_thread(sid: str) -> None:
+    """Pre-populate the /translate cache for every supported language.
+
+    Started right after a session reaches "review" (note.json ready) so the
+    doctor's first language switch in the review UI is instant instead of
+    paying a cold 30-120s Ollama call. Calls `translate_session` directly —
+    the exact POST /api/sessions/{sid}/translate code path — so cache keys,
+    cache invalidation, and drug-name masking (web/drug_mask.py) are
+    identical to an on-demand call; a language already cached (or requiring
+    no translation, e.g. an English-source field for lang="en") is cheap and
+    skipped internally by that same code path.
+
+    Runs on its own daemon thread, sequentially: only one Ollama call is ever
+    in flight, so this never competes with itself, and it never blocks
+    review or signing. Verification (web/verification.py) uses MLX, not
+    Ollama, so the two threads may safely overlap. Never raises — a warm
+    failure is logged and skipped, never surfaced to the session.
+    """
+    for lang in _TRANSLATION_WARM_LANGS:
+        t0 = time.monotonic()
+        try:
+            translate_session(sid, TranslateRequest(lang=lang))
+        except Exception:
+            logger.exception(
+                "Session %s: translation warm failed for lang=%s", sid, lang
+            )
+            continue
+        elapsed_s = round(time.monotonic() - t0, 2)
+        try:
+            with _status_lock:
+                status = _read_json(_status_path(sid))
+                status.setdefault("translation_warm", {})[lang] = elapsed_s
+                _write_json(_status_path(sid), status)
+        except Exception:
+            logger.exception(
+                "Session %s: failed to record translation warm timing for lang=%s",
+                sid,
+                lang,
+            )
+
+
 def _run_pipeline_thread(sid: str, in_path: str) -> None:
     on_stage, on_progress = _make_progress_callbacks(sid)
     asr_engine = "fast" if config.FAST_ASR_ENABLED else "accurate"
@@ -466,6 +513,9 @@ def _run_pipeline_thread(sid: str, in_path: str) -> None:
             status = _read_json(_status_path(sid))
             status.update(state="review", stage=None, error=None)
             _write_json(_status_path(sid), status)
+        threading.Thread(
+            target=_run_translation_warm_thread, args=(sid,), daemon=True
+        ).start()
         if asr_engine == "fast":
             # Background verification (web/verification.py) only ever makes
             # sense for the fast engine — the accurate engine's own L3 output
@@ -611,6 +661,27 @@ def patch_note(sid: str, body: PatchNoteRequest) -> dict[str, Any]:
     meta_path = _note_meta_path(sid)
     if os.path.exists(meta_path):
         os.remove(meta_path)
+    # Invalidate the edited paths in every warmed translation cache: a stale
+    # entry would keep showing the pre-edit translation after a language
+    # switch. Only the edited paths are dropped (a full-cache invalidation
+    # would force a 30s+ cold re-translate of the whole note on the next
+    # switch); an absent path falls back to the source value in the client —
+    # i.e. the doctor's edit is shown verbatim in every language view, which
+    # is the safe behavior (never machine-translate what the doctor typed).
+    edited_paths = {edit.field for edit in body.edits}
+    for lang in _SUPPORTED_LANGS:
+        cache_path = _translations_cache_path(sid, lang)
+        if not os.path.exists(cache_path):
+            continue
+        cached = _read_json(cache_path)
+        kept = {
+            path: text
+            for path, text in cached.get("note_values", {}).items()
+            if path not in edited_paths
+        }
+        if kept != cached.get("note_values"):
+            cached["note_values"] = kept
+            _write_json(cache_path, cached)
     return note_data
 
 
@@ -726,7 +797,12 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     Returns translations aligned index-for-index with `texts`. Numbers, units,
     and Latin-script drug names embedded in a sentence are instructed to
     survive verbatim — this function is never called with drug/dose/vitals
-    fields in the first place (see `_translatable_note_values`).
+    fields in the first place (see `_translatable_note_values`). Drug names
+    that DO appear in free text (advice, transcript turns) arrive here
+    already replaced by `DRUGSPANn` placeholders (see `web/drug_mask.py`) —
+    the prompt instruction below is a second, best-effort layer; the actual
+    safety guarantee is `_translate_texts_robust`'s placeholder-survival
+    check, not this instruction.
     """
     if not texts:
         return []
@@ -735,8 +811,10 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     system = (
         f"Translate each string in the JSON array into {_OLLAMA_LANG_NAMES[lang]}. "
         "Preserve numbers, units, and any Latin-script drug names verbatim within "
-        "each translated sentence. Output ONLY a JSON array of translated strings, "
-        "same length and order as the input, no extra commentary."
+        "each translated sentence. Any token of the form DRUGSPAN0, DRUGSPAN1, etc. "
+        "is a placeholder — copy each one through EXACTLY as-is, unchanged, do not "
+        "translate, reword, or drop it. Output ONLY a JSON array of translated "
+        "strings, same length and order as the input, no extra commentary."
     )
     response = ollama.chat(
         model=config.EXTRACT_MODEL,
@@ -758,38 +836,64 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     return [str(item) for item in translated]
 
 
-def _translate_texts_robust(texts: list[str], lang: str) -> list[str]:
+def _translate_texts_robust(
+    texts: list[str], lang: str, medication_drugs: Sequence[str] = ()
+) -> list[str]:
     """Translate `texts` into `lang`, aligned index-for-index; never raises.
+
+    Every string is masked (see `web/drug_mask.py`) before it reaches Ollama
+    and restored afterwards — this is the ONE seam both note free-text
+    fields and transcript turns pass through, so it is where the drug-name
+    masking is applied regardless of caller.
 
     Tries one batched call first. If the batch call fails outright or comes
     back misaligned (wrong length — an occasional Qwen JSON-array slip), it
     falls back to translating each string individually; if an individual
-    item's translation call also fails, that item's ORIGINAL text is kept
-    (never blank, never a crash, never lets one bad item fail the group).
+    item's translation call also fails, that item's ORIGINAL (unmasked,
+    untranslated) text is kept (never blank, never a crash, never lets one
+    bad item fail the group). A string whose translation comes back but
+    fails the placeholder-survival check (a dropped or duplicated
+    `DRUGSPANn`) falls back the same way — never a guessed drug name.
     """
     if not texts:
         return []
+    masked = [drug_mask.mask(text, medication_drugs) for text in texts]
+    masked_texts = [m.masked for m in masked]
+
+    translated_masked: list[str | None] | None
     try:
-        translated = _translate_batch_via_ollama(texts, lang)
-        if len(translated) == len(texts):
-            return translated
-        logger.warning(
-            "Ollama batch translation length mismatch (%d texts, %d results); "
-            "retrying item-by-item",
-            len(texts),
-            len(translated),
-        )
+        translated_masked = _translate_batch_via_ollama(masked_texts, lang)
+        if len(translated_masked) != len(masked_texts):
+            logger.warning(
+                "Ollama batch translation length mismatch (%d texts, %d results); "
+                "retrying item-by-item",
+                len(masked_texts),
+                len(translated_masked),
+            )
+            translated_masked = None
     except Exception:
         logger.exception("Ollama batch translation failed; retrying item-by-item")
+        translated_masked = None
+
+    if translated_masked is None:
+        translated_masked = []
+        for masked_text in masked_texts:
+            try:
+                item = _translate_batch_via_ollama([masked_text], lang)
+                translated_masked.append(item[0] if item else None)
+            except Exception:
+                logger.exception("Ollama per-item translation failed; keeping original")
+                translated_masked.append(None)
 
     results: list[str] = []
-    for text in texts:
-        try:
-            item = _translate_batch_via_ollama([text], lang)
-            results.append(item[0] if item else text)
-        except Exception:
-            logger.exception("Ollama per-item translation failed; keeping original")
-            results.append(text)
+    for original, m, translated_item in zip(
+        texts, masked, translated_masked, strict=True
+    ):
+        if translated_item is None:
+            results.append(original)
+            continue
+        restored = drug_mask.restore(translated_item, m.spans)
+        results.append(restored if restored is not None else original)
     return results
 
 
@@ -836,6 +940,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
 
     note_data = _read_json(_note_path(sid))
     turns = _read_turns(sid)
+    medication_drugs = [
+        m["drug"] for m in note_data.get("medications", []) if m.get("drug")
+    ]
 
     note_values = _translatable_note_values(note_data)
     paths = list(note_values)
@@ -846,7 +953,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
     translated_note_by_idx = dict(
         zip(
             note_needs,
-            _translate_texts_robust([note_texts[i] for i in note_needs], body.lang),
+            _translate_texts_robust(
+                [note_texts[i] for i in note_needs], body.lang, medication_drugs
+            ),
         )
     )
     note_values_out = {paths[i]: text for i, text in translated_note_by_idx.items()}
@@ -855,7 +964,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
     translated_turn_by_idx = dict(
         zip(
             turn_needs,
-            _translate_texts_robust([turn_texts[i] for i in turn_needs], body.lang),
+            _translate_texts_robust(
+                [turn_texts[i] for i in turn_needs], body.lang, medication_drugs
+            ),
         )
     )
     translated_turns = [

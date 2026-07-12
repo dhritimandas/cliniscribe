@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 import src.pipeline as pipeline
 import web.app as app_module
 import web.verification as verification_module
-from src.types import ClinicalNote, Diagnosis, Medication, Vital
+from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Vital
 
 
 @pytest.fixture
@@ -554,6 +554,43 @@ def test_patch_note_invalidates_precomputed_cache(client) -> None:
     assert response.json()["flags"] == {"_general": ["medications.Azithral.unvalidated"]}
 
 
+def test_patch_note_drops_edited_paths_from_translation_caches(client) -> None:
+    """A warmed translation cache must never show the pre-edit translation
+    after a language switch. Only the edited paths are dropped (full
+    invalidation would force a cold re-translate of the whole note); the
+    client falls back to the source value for an absent path, i.e. the
+    doctor's edit is shown verbatim — never machine-translated."""
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        symptoms=[Symptom(name="बुखार")],
+        advice="आराम करो",
+    )
+    _write_note(sid, note)
+    cached = {
+        "note_values": {"advice": "Take rest", "symptoms[0].name": "Fever"},
+        "transcript": ["hello"],
+    }
+    for lang in ("hi", "en"):
+        app_module._write_json(
+            app_module._translations_cache_path(sid, lang), dict(cached)
+        )
+
+    client.patch(
+        f"/api/sessions/{sid}/note",
+        json={"edits": [{"field": "advice", "old": "आराम करो", "new": "walk daily"}]},
+    )
+
+    for lang in ("hi", "en"):
+        survived = app_module._read_json(app_module._translations_cache_path(sid, lang))
+        assert "advice" not in survived["note_values"]  # edited: dropped
+        assert survived["note_values"]["symptoms[0].name"] == "Fever"  # untouched
+        assert survived["transcript"] == ["hello"]  # note edits never touch it
+    # mr cache was never warmed — absence must not break the PATCH (asserted
+    # implicitly by the 200 above and the surviving caches).
+
+
 def test_process_precomputes_note_meta_before_review(client, monkeypatch) -> None:
     """Integration: the pipeline thread must write note_meta.json right after
     pipeline.run() succeeds, before status flips to "review"."""
@@ -818,8 +855,11 @@ def test_translate_excludes_medications_and_vitals_from_prompt(client, monkeypat
         ],
     )
 
+    # The transcript turn's "Azithral 500" is masked to DRUGSPAN0 (see
+    # web/drug_mask.py) before it ever reaches Ollama — the stub's response
+    # carries the placeholder through, exactly as a well-behaved model would.
     calls = _stub_ollama_batch_translate(
-        monkeypatch, [["बुखार"], ["Azithral 500 mg रोज़ एक बार लें।"]]
+        monkeypatch, [["बुखार"], ["DRUGSPAN0 mg रोज़ एक बार लें।"]]
     )
 
     response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "hi"})
@@ -828,12 +868,17 @@ def test_translate_excludes_medications_and_vitals_from_prompt(client, monkeypat
     assert body["note_values"] == {"chief_complaint": "बुखार"}
     assert body["transcript"] == ["Azithral 500 mg रोज़ एक बार लें।"]
 
-    # Patient-safety assertion: the note_values group (first Ollama call) must
-    # never carry medication or vitals text — only "fever" was eligible.
+    # Patient-safety assertion: neither Ollama call ever carries the raw drug
+    # name or vitals text — note_values excluded them entirely; the
+    # transcript call sees only the DRUGSPAN0 placeholder.
     note_values_call_payload = calls[0][1][1]["content"]
     assert "500 mg" not in note_values_call_payload
     assert "120/80" not in note_values_call_payload
     assert "Azithral" not in note_values_call_payload
+
+    transcript_call_payload = calls[1][1][1]["content"]
+    assert "Azithral" not in transcript_call_payload
+    assert "DRUGSPAN0" in transcript_call_payload
 
 
 def test_translate_caches_to_disk_and_serves_repeat_calls(client, monkeypatch) -> None:
@@ -1302,3 +1347,71 @@ def test_select_within_budget_keeps_lower_priority_span_that_fits_a_used_window(
 
     assert {s.fields[0].path for s in selected} == {"medications[0].drug", "vitals[0].value"}
     assert skipped == []
+
+
+# ── translation cache auto-warm (Task 2) ──────────────────────────────────
+
+
+def test_process_warms_all_three_translation_caches_after_review(client, monkeypatch) -> None:
+    """Once note.json is ready, en/hi/mr are pre-populated via the exact same
+    /translate code path — a doctor's first language switch after review is
+    already a cache hit instead of a cold 30-120s Ollama call."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        _write_note(session_id, ClinicalNote(chief_complaint="बुखार", history=None))
+        _write_transcript(session_id, [])
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    # One Ollama call per language (chief_complaint is the only translatable
+    # field; transcript is empty) — en, then hi, then mr, in that order.
+    calls = _stub_ollama_batch_translate(monkeypatch, [["Fever"], ["ज्वर"], ["ताप"]])
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 3.0
+    warm = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        warm = status.get("translation_warm", {})
+        if set(warm) == {"en", "hi", "mr"}:
+            break
+        time.sleep(0.01)
+
+    assert set(warm) == {"en", "hi", "mr"}
+    assert all(isinstance(v, (int, float)) for v in warm.values())
+    for lang in ("en", "hi", "mr"):
+        assert os.path.exists(os.path.join("outputs", sid, f"translations_{lang}.json"))
+    assert len(calls) == 3
+
+    # A subsequent on-demand call for an already-warmed language is a pure
+    # cache hit — no additional Ollama call.
+    response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "en"})
+    assert response.json() == {"note_values": {"chief_complaint": "Fever"}, "transcript": []}
+    assert len(calls) == 3
+
+
+def test_translation_warm_thread_skips_failed_language_and_continues(tmp_path, monkeypatch) -> None:
+    """One language's warm failing (e.g. Ollama unreachable) must not stop
+    the others, and must never raise out of the daemon thread."""
+    monkeypatch.chdir(tmp_path)
+    sid = "warm-thread-test"
+    os.makedirs(os.path.join("outputs", sid), exist_ok=True)
+    app_module._write_json(app_module._status_path(sid), {"state": "review"})
+
+    calls: list[str] = []
+
+    def fake_translate_session(sid_arg, body):
+        calls.append(body.lang)
+        if body.lang == "hi":
+            raise RuntimeError("ollama unreachable")
+        return {"note_values": {}, "transcript": []}
+
+    monkeypatch.setattr(app_module, "translate_session", fake_translate_session)
+
+    app_module._run_translation_warm_thread(sid)
+
+    assert calls == ["en", "hi", "mr"]  # hi's failure doesn't stop en/mr
+    status = app_module._read_json(app_module._status_path(sid))
+    assert set(status["translation_warm"]) == {"en", "mr"}  # hi recorded no timing
