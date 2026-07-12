@@ -7,6 +7,7 @@ function calls / mocks only) so this file runs in well under a second and
 can gate every commit, not just release branches.
 """
 
+from src.concepts import CONCEPTS
 from src.drug_lexicon import canonicalize_drug_span
 from src.l3_5_normalize import _normalize_drug_text
 from src.l3_asr import _contains_arabic_script
@@ -122,3 +123,156 @@ def test_do_teen_number_phrase_never_becomes_a_drug() -> None:
     assert canonicalize_drug_span("दो तीन") is None
     result = _normalize_drug_text("दो तीन 500 khao")
     assert "drotin" not in result.lower()
+
+
+# ── (6) candra-o fold gap — नैक्स्टॉम, outputs/<session>, 2026-07-12 ────────
+# Root cause: ASR wrote "एक नैक्स्टॉम 500 एक" using candra-o (ॉ), a Devanagari
+# vowel sign absent from all three "mirrored" fold-map implementations
+# (eval/drug_bench.py, src/l4_extract.py, src/drug_lexicon.py) — they listed
+# ा ि ी ु ू े ै ो ौ ं but not ॉ/ॅ/ृ/ऑ/ऍ/ँ/ः, so candra-o (and its siblings)
+# silently dropped out of the fold key instead of contributing "o". The
+# curated table already had नैक्स्टोम (regular ो) but not the candra-o
+# spelling. Fixed: all three fold maps gained the 7 missing entries (see
+# tests/test_fold_parity.py for the cross-implementation guard) and the
+# candra-o spelling was added to _DEVA_CURATED alongside its regular-o twin.
+
+
+def test_naxdom_candra_o_variant_normalizes_with_dose() -> None:
+    result = _normalize_drug_text("एक नैक्स्टॉम 500 एक")
+    assert "naxdom 500" in result
+
+
+# ── (7) filler-word glue on a drug span — same incident as (6) ─────────────
+# Root cause: even after (6)'s fix restores the drug name inside the
+# transcript, an LLM extraction can still copy Hindi filler words glued to
+# both ends of the drug span into the "drug" field verbatim (rule 12 says
+# copy exactly what's written) — "एक नैक्स्टॉम 500 एक" ("one naxdom 500 one")
+# was extracted as a single drug name. Fixed with a conservative span-
+# isolation step in L4: filler tokens are stripped from the edges only, and
+# the drug is trimmed/canonicalized ONLY when the remaining inner span
+# resolves via the curated table, the expanded lexicon, or CDSCO — an
+# unmatched name is never truncated.
+
+
+def test_filler_glued_drug_span_isolates_to_dose_and_name() -> None:
+    data = {"medications": [{"drug": "एक नैक्स्टॉम 500 एक", "dose": None}]}
+    note = _build_note(
+        data, transcript="[UNKNOWN]: एक नैक्स्टॉम 500 एक खा लो"
+    )
+    assert note.medications[0].drug == "naxdom 500"
+
+
+def test_filler_glued_dolo_isolates_cleanly() -> None:
+    data = {"medications": [{"drug": "dolo 650 le lena", "dose": None}]}
+    note = _build_note(data, transcript="[UNKNOWN]: dolo 650 le lena subah")
+    assert note.medications[0].drug == "dolo 650"
+
+
+def test_unmatched_garbled_drug_name_is_never_truncated() -> None:
+    """Conservative guard: no inner match exists, so the whole string stays —
+    trimming an unmatched name would silently discard information."""
+    data = {"medications": [{"drug": "एक झिनझिनझान 500 एक", "dose": None}]}
+    note = _build_note(
+        data, transcript="[UNKNOWN]: एक झिनझिनझान 500 एक खा लो"
+    )
+    assert note.medications[0].drug == "एक झिनझिनझान 500 एक"
+
+
+# ── (8) हफते/Shortness-of-Breath near-collision, outputs/<session>,
+# 2026-07-12 ─────────────────────────────────────────────────────────────
+# Root cause: transcript "एक हफते के लिए" ("for one week") was glossed
+# "(Shortness of Breath)" — हफते ("week") is one edit from हांफते
+# ("huffing/panting", a genuine near-synonym of this concept), and the
+# embedding model conflated the two. Fixed by adding हफ्ता/हफ्ते/हफते/हफ़्ते as
+# hard_negatives on the Shortness of Breath concept (src/concepts.py). The
+# full behavioral check requires the real parrotlet-e embedding model and
+# lives in tests/test_l3_5_normalize.py under @pytest.mark.slow
+# (test_haphte_week_not_glossed_as_shortness_of_breath /
+# test_haanphte_genuine_case_still_glosses); this is the fast, model-free
+# regression guard that the DATA fix itself never regresses.
+
+
+def test_haphte_family_present_as_shortness_of_breath_hard_negative() -> None:
+    sob = next(c for c in CONCEPTS if c.term == "Shortness of Breath")
+    for week_word in ("हफ्ता", "हफ्ते", "हफते", "हफ़्ते"):
+        assert week_word in sob.hard_negatives
+
+
+# ── (9) drug name in diagnosis/investigations — same screenshots as (6)/(7),
+# 2026-07-12 ─────────────────────────────────────────────────────────────
+# Root cause: "one naxdom 500 one" (the same filler-glued drug span) appeared
+# not only in medications but also in the DIAGNOSIS and INVESTIGATIONS
+# fields of the same extraction. A drug name is not a diagnosis or a test —
+# but it also isn't safe to silently move or delete (the doctor may have
+# meant something else entirely by that row). Fixed with a flag-only,
+# symmetric check: a diagnosis term or investigation string that
+# fold-matches a known drug (after stripping filler/dose tokens, same tiers
+# as (7)) is flagged, never altered.
+
+
+def test_drug_name_in_diagnosis_flagged_not_removed() -> None:
+    data = {"diagnosis": [{"term": "one naxdom 500 one"}]}
+    note = _build_note(data)
+    assert note.diagnosis[0].term == "one naxdom 500 one"  # never moved/deleted
+    assert "diagnosis.one naxdom 500 one.drug_in_diagnosis" in note.low_confidence_fields
+
+
+def test_drug_name_in_investigations_flagged_not_removed() -> None:
+    data = {"investigations": ["one naxdom 500 one"]}
+    note = _build_note(data)
+    assert note.investigations == ["one naxdom 500 one"]  # never moved/deleted
+    assert (
+        "investigations.one naxdom 500 one.drug_in_investigations"
+        in note.low_confidence_fields
+    )
+
+
+# ── (10) Hindi frequency phrase surfaced verbatim in the note, outputs/
+# <session>, 2026-07-12 ────────────────────────────────────────────────────
+# Root cause: the model correctly extracted frequency "दो बार दिन में"
+# verbatim from a Hindi transcript (rule 6: use the transcript's own
+# language) — but the note's frequency/timing fields are excluded from the
+# translate route by design (dosing schedules are patient-safety text and
+# must never be LLM-translated), so an English-reading physician saw only
+# the Hindi phrase. Fixed with a deterministic, exact-match canonicalization
+# table in L4 (never fuzzy, never model-based): recognized phrases (English
+# and Hindi) map to one canonical English display phrase; clinical notation
+# ("1-0-1", "BD", ...) and any unrecognized phrase pass through unchanged.
+
+
+def test_hindi_frequency_phrase_canonicalizes_to_english() -> None:
+    data = {
+        "medications": [
+            {"drug": "paracetamol", "dose": "500 mg", "frequency": "दो बार दिन में"}
+        ]
+    }
+    note = _build_note(data, transcript="[UNKNOWN]: paracetamol 500 mg दो बार दिन में")
+    assert note.medications[0].frequency == "twice a day"
+
+
+def test_notation_frequency_passes_through_unchanged() -> None:
+    data = {
+        "medications": [{"drug": "augmentin", "dose": "625 mg", "frequency": "1-0-1"}]
+    }
+    note = _build_note(data, transcript="[UNKNOWN]: augmentin 625 mg 1-0-1")
+    assert note.medications[0].frequency == "1-0-1"
+
+
+def test_unrecognized_frequency_phrase_passes_through_unchanged() -> None:
+    data = {
+        "medications": [
+            {"drug": "augmentin", "dose": "625 mg", "frequency": "कुछ अजीब सा"}
+        ]
+    }
+    note = _build_note(data, transcript="[UNKNOWN]: augmentin 625 mg कुछ अजीब सा")
+    assert note.medications[0].frequency == "कुछ अजीब सा"
+
+
+def test_hindi_timing_phrase_canonicalizes_to_english() -> None:
+    data = {
+        "medications": [
+            {"drug": "paracetamol", "dose": "500 mg", "timing": "खाने के बाद"}
+        ]
+    }
+    note = _build_note(data, transcript="[UNKNOWN]: paracetamol 500 mg खाने के बाद")
+    assert note.medications[0].timing == "after food"

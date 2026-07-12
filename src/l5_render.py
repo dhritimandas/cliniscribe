@@ -133,6 +133,16 @@ _FLAG_PATTERNS: list[tuple[re.Pattern, str]] = [
         "Diagnosis '{x}' lacks clear support in the conversation — confirm",
     ),
     (
+        re.compile(r"^diagnosis\.(?P<x>.+)\.drug_in_diagnosis$"),
+        "'{x}' in the diagnosis list looks like a medication name — review "
+        "diagnosis and medications",
+    ),
+    (
+        re.compile(r"^investigations\.(?P<x>.+)\.drug_in_investigations$"),
+        "'{x}' in ordered investigations looks like a medication name — "
+        "review investigations and medications",
+    ),
+    (
         re.compile(r"^symptoms\.(?P<x>.+)$"),
         "Symptom '{x}' could not be confirmed — verify with the patient",
     ),

@@ -75,6 +75,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "emotional pain", "painful memory", "heartbreak", "pain in the neck",
+            # Audit (2026-07-12): "rain" is one edit from the "pain" variant —
+            # monsoon small talk is common in Indian clinic conversation.
+            "rain", "it is raining",
         ],
     ),
     Concept(
@@ -110,6 +113,8 @@ CONCEPTS: list[Concept] = [
         hard_negatives=[
             "cold water", "cold weather", "cold drink", "feeling cold",
             "ice cold", "it's cold outside", "thanda pani",
+            # Audit (2026-07-12): "gold" is one edit from the "cold" variant.
+            "gold", "gold price", "gold jewellery",
         ],
     ),
     Concept(
@@ -200,6 +205,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "urine test result normal",
+            # Audit (2026-07-12): पेशा ("occupation/profession") is one edit
+            # from पेशाब ("urine") — a doctor's own history-taking question
+            # ("आपका पेशा क्या है?") could risk collision.
+            "पेशा", "आपका पेशा क्या है",
         ],
     ),
     Concept(
@@ -212,6 +221,10 @@ CONCEPTS: list[Concept] = [
         hard_negatives=[
             "skin care routine", "face wash", "skin cream", "moisturizer",
             "rash decision",
+            # Audit (2026-07-12): दान ("donation") is one edit from the दाने
+            # variant; "cash" is one edit from the "rash" variant (cash
+            # payment talk is routine in an Indian clinic visit).
+            "दान", "दान देना", "cash", "cash payment",
         ],
     ),
     Concept(
@@ -223,6 +236,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "fungal growth on bread", "mold", "mushroom",
+            # Audit (2026-07-12): दाल ("lentils") is one edit from दाद
+            # (ringworm) — one of the most common everyday food words.
+            "दाल", "दाल चावल",
         ],
     ),
     Concept(
@@ -234,6 +250,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "perfume allergy test", "food allergy",
+            # Audit (2026-07-12): नाच ("dance") is one edit from the नाक
+            # ("nose") root of the "नाक बहना" variant.
+            "नाच", "नाच गाना",
         ],
     ),
     Concept(
@@ -267,6 +286,15 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "short on time", "run out of breath after exercise",
+            # Real incident (outputs/<session>, 2026-07-12): "एक हफते के लिए"
+            # ("for one week") was glossed "(Shortness of Breath)" — हफ्ते
+            # ("week") is one edit from हांफते ("huffing/panting", a genuine
+            # near-synonym of this concept), so the embedding model conflated
+            # them. All common spellings guarded, not just the one that fired.
+            "हफ्ता", "हफ्ते", "हफते", "हफ़्ते",
+            # Audit bonus (same one-edit-collision class): सांप ("snake") is
+            # one edit from सांस ("breath"), a listed variant.
+            "सांप",
         ],
     ),
     Concept(
@@ -278,6 +306,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "constipated bureaucracy", "system is constipated",
+            # Audit (2026-07-12): कब्र ("grave") is one edit from कब्ज
+            # (constipation) — a common word in family-history/bereavement talk.
+            "कब्र", "कब्र में",
         ],
     ),
     Concept(
@@ -302,6 +333,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "stomach for adventure", "can't stomach this",
+            # Audit (2026-07-12): पेड़ ("tree") is one edit from पेट
+            # ("stomach"), a listed variant.
+            "पेड़", "पेड़ के नीचे",
         ],
     ),
     Concept(
@@ -314,6 +348,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "back to work", "back of the room",
+            # Audit (2026-07-12): कमरा ("room") is one edit from कमर
+            # ("waist/lower back") — a very common word in clinic instructions
+            # ("मरीज़ को कमरे में ले जाओ").
+            "कमरा", "कमरे में जाओ",
         ],
     ),
     Concept(
@@ -326,6 +364,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "asthmatic performance", "short of breath after running",
+            # Audit (2026-07-12): दवा ("medicine") is one edit from दमा
+            # (asthma) — दवा is one of the highest-frequency words in ANY
+            # consultation, making this the highest-risk finding of the audit.
+            "दवा", "दवा लो", "दवा खाओ",
         ],
     ),
     Concept(
@@ -360,6 +402,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "appetite for success", "no appetite for risk",
+            # Audit (2026-07-12): भूल ("forgot/mistake") is one edit from भूख
+            # ("hunger"), a listed variant.
+            "भूल", "मैं भूल गया",
         ],
     ),
 ]

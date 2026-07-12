@@ -117,6 +117,10 @@ _FOLD_MAP = {
     "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
     "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
     "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+    # Candra vowels + vocalic r + candrabindu/visarga — mirrors the same
+    # addition in src/drug_lexicon.py and src/l4_extract.py; see
+    # tests/test_fold_parity.py.
+    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
 }
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
 
