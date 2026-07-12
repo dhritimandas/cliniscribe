@@ -1361,3 +1361,129 @@ labeled dataset a context-aware fine-tune of parrotlet-e needs: train the
 encoder to score span-IN-SENTENCE rather than span-alone, and this entire
 residual class (including the accepted सर्दी winter/illness polysemy) becomes
 learnable instead of unreachable.
+
+## Drug Canonicalization Phase 2 — The spelling that lies, and one fold to rule them all (2026-07-12)
+
+### (a) What this phase does
+A real session prescribed नौरफलोक्स (norflox) and एजित्रोमाइसिन
+(azithromycin), and the app failed to recognize either as a known drug — the
+Rx showed Devanagari names marked "unvalidated", and the translation layer
+later mangled them into different drugs entirely. This phase made the drug
+fold script-symmetric: the fold (the function that squashes a word down to a
+phonetic "sound skeleton" so Hindi and English spellings of the same drug can
+be compared) now normalizes ENGLISH orthography too — x→ks, th→t, ph→f,
+c→s before e/i/y else k, y→ai — because English spelling encodes sound
+irregularly and skeletons previously met only when a drug's English spelling
+happened to be phonetic (paracetamol matched; norflox never could). On top of
+that, the note builder now displays the lexicon's canonical Latin name
+whenever a drug resolves (dose digits preserved, CDSCO validation against
+the canonical, a DISTINCT review flag when the match was fuzzy rather than
+exact), so drug names default to English on the prescription.
+
+### (b) Hardest bugs
+
+1. **The skeletons were phonetic on one side only.** fold(नौरफलोक्स) gave
+   "naurfloks" — roughly how it sounds — but fold("norflox") stayed
+   "norflox", because the Latin side passed through nearly raw. "ks" vs "x"
+   is obviously the same sound to a human and edit-distance-4 to the
+   matcher. Root cause: the fold was built outward from Devanagari (map each
+   letter to its sound) and nobody made the return journey — English
+   orthography is itself a lossy encoding of sound (x=/ks/, soft c=/s/,
+   th≈/t/) and needs its own normalization layer before the two scripts can
+   meet. The giveaway pattern for this bug class: matching succeeds exactly
+   when English spelling is phonetic and fails otherwise — a systematic
+   asymmetry, not missing lexicon entries.
+
+2. **Three hand-maintained copies of the fold, and the fix that would have
+   re-created the bug downstream.** The fold existed in three modules
+   (lexicon, L4 extractor, eval scorer), already drifted once before. The
+   advisor caught the trap before implementation: patch only the lexicon's
+   copy, and the L4 grounding guard — which re-folds every displayed drug
+   name to verify it actually appears in the transcript — would fold
+   "azithromycin" and the Devanagari transcript with the OLD rules, see low
+   similarity, and demote a correctly-resolved drug to "unnamed medication".
+   Root cause: duplicated safety-critical logic can't stay consistent by
+   discipline alone; the fix and the guard must share one definition of
+   "sounds like". The unification commit landed FIRST, and the blocker
+   scenario is now a permanent regression test.
+
+Two safety moments worth recording. The all-pairs collision scan over the
+546-drug lexicon under the new fold surfaced exactly one new exact collision
+— "vitamin c" and "vitamin k" (c→k!) — fixed with a lone-token-c exception;
+and the fuzzy-floor length threshold was re-DERIVED (rules like th→t shorten
+skeletons, shifting the length distribution it was tuned on), not just
+re-run. And एजित्रोमाइसिन turned out to sit within tolerance of BOTH
+azithromycin and erythromycin — two real antibiotics, genuinely ambiguous
+because the Devanagari rendering drops the aspirate that separates them —
+so the ambiguity guard refused, we did NOT loosen it, and the resolution
+went into the curated exact-match table instead. Wrong drug is worse than
+unknown drug, still.
+
+### (c) Fine-tuning hook
+The azithromycin/erythromycin ambiguity is an ASR-layer problem wearing a
+matcher costume: the distinguishing phonetics exist in the audio but the
+Devanagari transcription collapses them. An ASR fine-tune scored on drug
+keywords should be evaluated specifically on aspirate/nukta preservation in
+drug names. Separately, the hand-written orthography rules are a tiny
+grapheme-to-phoneme model built from five incident classes — if the lexicon
+grows past what hand rules cover, a learned G2P (or phonetic embeddings)
+could replace them, gated by exactly the same collision-scan +
+substitution-audit protocol this phase used.
+
+## Translation Guard Phase — A prompt instruction is not a safety mechanism (2026-07-12)
+
+### (a) What this phase does
+The translation layer was the last unguarded door for drug names: the note on
+disk stored the right drugs, but the LLM that translates the review screen
+phonetically guessed Devanagari drug names into DIFFERENT English drugs —
+एजित्रोमाइसिन (azithromycin) became "acetaminophen", and नौरफलोक्स (norflox,
+an antibiotic) became "naloxone", an opioid-overdose drug. This phase wraps
+every string sent to the translator in deterministic masking: drug spans are
+found by fold-matching (against the note's own medication list and the full
+lexicon), swapped for indexed placeholders the model must copy through
+unchanged, and restored afterwards as canonical Latin names — with any string
+whose placeholders don't survive intact falling back to its untranslated
+original, because showing the source language beats showing a guess. The
+same phase auto-warms all three language caches in the background the moment
+the note is ready (language switching drops from minutes to milliseconds),
+and an edit now drops its field from every warmed cache — so a doctor's
+correction is shown verbatim in every language view, never overwritten by a
+stale translation and never machine-translated itself.
+
+### (b) Hardest bugs
+
+1. **The protection existed, as a sentence.** The translator prompt already
+   said "preserve Latin-script drug names verbatim" — and the incident drugs
+   were Devanagari, so the sentence simply didn't apply, and a 3B model fills
+   the gap with its best phonetic guess. Root cause: safety expressed as an
+   INSTRUCTION to a model rather than a MECHANISM around it — an instruction
+   has a scope you didn't enumerate (here: one script of two), degrades with
+   model size, and fails silently. The replacement mechanism is enumerable
+   end to end: find spans deterministically, verify each placeholder appears
+   exactly once after translation (count-only checks pass when the model
+   drops one and duplicates another), fall back per-string on any violation.
+   Same family as the glue-layer lesson: note.json was CORRECT on disk; only
+   the rendered translation lied, so no pipeline metric could have caught it.
+
+2. **Globally ambiguous, locally certain.** The general lexicon correctly
+   REFUSES एजित्रोमाइसिन (within edit tolerance of both azithromycin and
+   erythromycin — the guard from the previous phase doing its job), which
+   would have left the most dangerous span unmasked. The resolution: scope
+   the candidate set — when matching against the note's OWN prescription
+   list (three drugs, only one of them an -mycin), the same fuzzy match is
+   unambiguous. Context shrinks ambiguity; the same string can be
+   unresolvable against 546 candidates and certain against 3. The dual of
+   this bug also appeared: a still-Devanagari medication value could
+   fuzzy-shadow a better whole-lexicon match under longest-span-wins, fixed
+   by letting only Latin (already-canonicalized) medication values join
+   tier-1 matching — two detection tiers with different trust levels must
+   not compete as equals.
+
+### (c) Fine-tuning hook
+Masking treats "drug span in Devanagari free text" as a permanent fact of
+life; an ASR fine-tune that learns to emit drug names in Latin script at
+transcription time (they are Latin-script brands being read aloud) would
+shrink the masked surface toward zero and remove the cross-script fuzzy
+step entirely. And the placeholder protocol doubles as an exact evaluation
+metric for any future translator swap: placeholder survival rate per model —
+a drug-name-safety bench that costs nothing beyond the runs themselves.
