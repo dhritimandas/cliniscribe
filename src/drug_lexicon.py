@@ -205,6 +205,11 @@ _FOLD_MAP: dict[str, str] = {
     "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
     "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
     "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+    # Candra vowels + vocalic r + candrabindu/visarga — absent from the
+    # original map, which let ASR spellings using them (e.g. नैक्स्टॉम with
+    # candra-o ॉ) escape every drug-normalization tier. See LEARNINGS.md /
+    # tests/test_fold_parity.py.
+    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
 }
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]")  # despaced: space is not kept either
 _DOUBLE_CONSONANT_RE = re.compile(r"([bcdfghjklmnpqrstvwxyz])\1")

@@ -352,6 +352,34 @@ def test_ghabrahat_maps_to_anxiety() -> None:
     assert "Anxiety" in result[0].text
 
 
+# ── हफते/Shortness-of-Breath near-collision — outputs/<session>, 2026-07-12 ──
+# "एक हफते के लिए" ("for one week") was glossed "(Shortness of Breath)": हफते
+# is one edit from हांफते ("huffing/panting", a genuine near-synonym of this
+# concept), so the embedding model conflated them. Fixed with हफ्ता/हफ्ते/
+# हफते/हफ़्ते as hard_negatives on Shortness of Breath (see the model-free
+# regression guard in tests/test_incidents.py). These two tests need the real
+# parrotlet-e model to verify the fix behaviorally.
+
+
+@pytest.mark.slow
+def test_haphte_week_not_glossed_as_shortness_of_breath() -> None:
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("एक हफते के लिए दवा खाओ")]
+    result = normalize(turns)
+    assert "Shortness of Breath" not in result[0].text
+
+
+@pytest.mark.slow
+def test_haanphte_genuine_case_still_glosses() -> None:
+    """The genuine near-synonym must still match despite the new hard negative."""
+    from src.l3_5_normalize import normalize
+
+    turns = [_turn("मरीज़ हांफ रहे हैं")]
+    result = normalize(turns)
+    assert "Shortness of Breath" in result[0].text
+
+
 # ── Latin-span drug tier (drug bench fix): distorted Latin drug names ───────
 
 

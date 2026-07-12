@@ -9,7 +9,8 @@ import unicodedata
 from src import config
 from src.cdsco import validate_drug
 from src.concepts import CONCEPTS
-from src.drug_lexicon import DRUG_LEXICON
+from src.drug_lexicon import DRUG_LEXICON, canonicalize_drug_span
+from src.l3_5_normalize import _DEVA_CURATED, _LATIN_CURATED
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,10 @@ _DRUG_FOLD_MAP: dict[str, str] = {
     "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
     "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
     "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+    # Candra vowels + vocalic r + candrabindu/visarga — see src/drug_lexicon.py's
+    # _FOLD_MAP for the same addition and tests/test_fold_parity.py for the
+    # cross-implementation parity guard.
+    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
 }
 _DRUG_FOLD_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
 _DRUG_WINDOW_SIZES: tuple[int, ...] = (1, 2, 3, 4)
@@ -256,6 +261,93 @@ def _restore_drug_spelling(drug: str, transcript: str) -> str:
     if missing_digits:
         return f"{best_window} {' '.join(missing_digits)}".strip()
     return best_window
+
+
+# ── Drug span isolation (filler-word-glue backstop) ─────────────────────────
+# Real incident (outputs/<session>, 2026-07-12): the extractor returned
+# drug="एक नैक्स्टॉम 500 एक" ("one naxdom 500 one") — Hindi filler words glued
+# onto both ends of a real drug span by the LLM. Conservative by design: this
+# only TRIMS when an inner span (after stripping filler tokens) resolves via
+# one of the three read-only recognition tiers below; an unmatched/garbled
+# name is never truncated (a false trim would silently drop information a
+# reviewing physician can't recover from the note).
+_DRUG_FILLER_TOKENS: frozenset[str] = frozenset(
+    {"एक", "one", "और", "and", "भी", "ले", "लेना", "खा", "खाना", "le", "lena"}
+)
+
+
+def _is_drug_filler_token(token: str) -> bool:
+    return token.lower() in _DRUG_FILLER_TOKENS
+
+
+def _strip_filler_edges(tokens: list[str]) -> list[str]:
+    """Return `tokens` with leading/trailing filler words removed (never the
+    middle — filler-glue in this incident class only wraps a span, it doesn't
+    interrupt it)."""
+    start, end = 0, len(tokens)
+    while start < end and _is_drug_filler_token(tokens[start]):
+        start += 1
+    while end > start and _is_drug_filler_token(tokens[end - 1]):
+        end -= 1
+    return tokens[start:end]
+
+
+def _resolve_known_drug_name(name_span: str) -> str | None:
+    """Read-only drug recognition: curated table -> expanded lexicon -> CDSCO.
+
+    Same three tiers L3.5's drug pass uses (src/l3_5_normalize.py), reused
+    here only to ANSWER "does this span name a known drug" — never to
+    re-spell a drug name L4 itself extracted (rule 12 forbids that); callers
+    decide what to do with a hit.
+    """
+    curated = _DEVA_CURATED.get(name_span) or _LATIN_CURATED.get(name_span.lower())
+    if curated:
+        return curated
+    lexicon_hit = canonicalize_drug_span(name_span)
+    if lexicon_hit is not None:
+        return lexicon_hit[0]
+    if validate_drug(name_span):
+        return name_span
+    return None
+
+
+def _names_a_known_drug(text: str) -> bool:
+    """True if `text` (after stripping filler words and dose digits) resolves
+    to a known drug — used to flag (never move or delete) a drug name that
+    surfaced in diagnosis or investigations instead of medications."""
+    name_tokens = [t for t in _strip_filler_edges(text.split()) if not t.isdigit()]
+    if not name_tokens:
+        return False
+    return _resolve_known_drug_name(" ".join(name_tokens)) is not None
+
+
+def _isolate_drug_span(drug: str) -> str:
+    """Trim filler-word glue around a drug name, only when an inner match exists.
+
+    Strips leading/trailing filler tokens, then resolves the remaining
+    non-digit tokens against `_resolve_known_drug_name`. On a hit, returns the
+    resolved canonical name plus any digit tokens from the trimmed span (dose
+    survives). On no hit — either nothing to strip, or the inner span doesn't
+    resolve either — returns `drug` unchanged.
+    """
+    tokens = drug.split()
+    if len(tokens) <= 1:
+        return drug
+
+    core = _strip_filler_edges(tokens)
+    if core == tokens:
+        return drug  # no filler at either edge -- nothing to isolate
+
+    name_tokens = [t for t in core if not t.isdigit()]
+    digit_tokens = [t for t in core if t.isdigit()]
+    if not name_tokens:
+        return drug
+
+    canonical = _resolve_known_drug_name(" ".join(name_tokens))
+    if canonical is None:
+        return drug  # inner span doesn't resolve either -- never truncate
+
+    return " ".join([canonical, *digit_tokens]) if digit_tokens else canonical
 
 
 # ── Condition guard (spurious medication-row backstop) ─────────────────────
@@ -430,6 +522,72 @@ def _iter_dicts(items: list, field_name: str) -> list[dict]:
     return valid
 
 
+# ── Frequency/timing canonicalization (deterministic, no LLM translation) ──
+# Real incident (outputs/<session>, 2026-07-12): the model correctly extracted
+# frequency "दिन में दो बार" verbatim (rule 6: use the transcript's own
+# language) but the English note view then showed only Hindi — the translate
+# route deliberately excludes medications[].* (dosing text is patient-safety
+# text; it must never be LLM-translated), which over-covers frequency/timing.
+# Fixed here with an EXACT-lookup map (never fuzzy, never model-based) from
+# recognized phrases to one canonical English phrase per group. An
+# unrecognized phrase — including clinical notation like "1-0-1" or "BD",
+# which is already language-neutral and needs no translation — is returned
+# unchanged. The original transcript phrase remains recoverable via the
+# session transcript; this field only ever holds the display form.
+_FREQUENCY_CANON: dict[str, str] = {
+    # English phrasing variants -> one canonical phrase per group (mirrors
+    # eval/run_eval.py's _FREQ_CANON groups; see LEARNINGS Phase B — E9).
+    # Kept in the system prompt's own "___ daily" idiom (rule 11's examples)
+    # so already-English extractions are never rewritten into new wording —
+    # only recognized (an already-correct value must never appear to change).
+    "once daily": "once daily", "once a day": "once daily",
+    "one daily": "once daily", "1 daily": "once daily",
+    "once in the morning": "once daily", "one in the morning": "once daily",
+    "once daily morning": "once daily", "in the morning": "once daily",
+    "once at night": "once daily", "once nightly": "once daily",
+    "once daily at night": "once daily", "at night": "once daily",
+    "at bedtime": "once daily", "in the night": "once daily",
+    "in the afternoon": "once daily", "at noon": "once daily",
+    "once at noon": "once daily",
+    "twice daily": "twice daily", "twice a day": "twice daily",
+    "two times a day": "twice daily", "2 times a day": "twice daily",
+    "morning and night": "twice daily", "morning and evening": "twice daily",
+    "three times a day": "three times daily",
+    "three times daily": "three times daily",
+    "thrice a day": "three times daily", "thrice daily": "three times daily",
+    "3 times a day": "three times daily",
+    "as needed": "as needed", "when needed": "as needed",
+    "if needed": "as needed",
+    # Hindi phrases (this incident's fixture) — time-of-day dosing schedule,
+    # per rule 11 ("time-of-day phrases ... belong in frequency, not timing").
+    "दिन में दो बार": "twice a day", "दो बार दिन में": "twice a day",
+    "दिन में एक बार": "once daily", "एक बार": "once daily",
+    "दो बार": "twice a day",
+    "तीन बार": "three times a day", "तीन बार दिन में": "three times a day",
+    "सुबह शाम": "twice a day",
+    "रोज़": "once daily", "रोज": "once daily", "हर रोज": "once daily",
+    "रात को": "once daily", "सुबह": "once daily", "सोते समय": "once daily",
+    "हफ्ते में एक बार": "once a week",
+}
+
+# Meal-relative phrases stay in TIMING, not frequency (rule 11: "TIMING is
+# ONLY for meal-relative context").
+_TIMING_CANON: dict[str, str] = {
+    "खाने के बाद": "after food",
+    "खाने से पहले": "before food",
+    "खाली पेट": "empty stomach",
+}
+
+
+def _canonicalize_phrase(value: str | None, canon: dict[str, str]) -> str | None:
+    """Exact-match, whitespace-normalized canonicalization; unmatched values
+    pass through unchanged. Never fuzzy, never model-based — see the module
+    section comment above for why dosing-schedule text is never guessed."""
+    if value is None:
+        return None
+    return canon.get(" ".join(value.split()), value)
+
+
 def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     # Guard with `or []`: model may emit null for list fields (e.g. "symptoms": null).
     # data.get("symptoms", []) returns None when the key is present with value null,
@@ -505,6 +663,13 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                     drug, restored,
                 )
                 drug = restored
+            isolated = _isolate_drug_span(drug)
+            if isolated != drug:
+                logger.info(
+                    "L4: isolated drug span %r -> %r (filler-glue backstop)",
+                    drug, isolated,
+                )
+                drug = isolated
             # Grounding guard: an invented drug name matches nothing in the
             # transcript, however loosely. _restore_drug_spelling only fixes
             # MIS-spellings of something actually said — a full invention
@@ -530,12 +695,23 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             Medication(
                 drug=drug,
                 dose=m.get("dose") or None,
-                frequency=m.get("frequency") or None,
-                timing=m.get("timing") or None,
+                frequency=_canonicalize_phrase(m.get("frequency") or None, _FREQUENCY_CANON),
+                timing=_canonicalize_phrase(m.get("timing") or None, _TIMING_CANON),
                 duration=m.get("duration") or None,
                 validated=validate_drug(drug),
             )
         )
+
+    def _coerce_str(item: object) -> str:
+        """Coerce a diagnostic_results or investigations item to plain string.
+
+        The model occasionally returns dicts (e.g. {"term": "..."}) in list
+        fields that should contain strings.  Extract the most informative key
+        rather than repr the dict.
+        """
+        if isinstance(item, dict):
+            return str(item.get("term") or item.get("name") or item.get("value") or item)
+        return str(item)
 
     # Hallucination calibration: flag any diagnosis whose term shares no word
     # with the transcript. This catches the most egregious fabrications (e.g.
@@ -557,6 +733,30 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 logger.warning(
                     "L4 calibration: diagnosis %r has no token overlap with transcript — flagged low-confidence",
                     diag.term,
+                )
+        if _names_a_known_drug(diag.term):
+            # Symmetric to the condition-in-rx guard, opposite direction: a
+            # drug name surfaced in DIAGNOSIS instead of medications (real
+            # incident, same screenshots as the filler-glue defect: "one
+            # naxdom 500 one" appeared in both diagnosis and investigations).
+            # Flag-only — never move or delete; the doctor decides.
+            flag = f"diagnosis.{diag.term}.drug_in_diagnosis"
+            if flag not in low_conf:
+                low_conf.append(flag)
+                logger.warning(
+                    "L4: diagnosis term %r fold-matches a drug lexicon entry — flagged (never moved)",
+                    diag.term,
+                )
+
+    investigations = [_coerce_str(x) for x in (data.get("investigations") or [])]
+    for inv in investigations:
+        if _names_a_known_drug(inv):
+            flag = f"investigations.{inv}.drug_in_investigations"
+            if flag not in low_conf:
+                low_conf.append(flag)
+                logger.warning(
+                    "L4: investigation %r fold-matches a drug lexicon entry — flagged (never moved)",
+                    inv,
                 )
 
     for med in medications:
@@ -583,17 +783,6 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             if flag not in low_conf:
                 low_conf.append(flag)
 
-    def _coerce_str(item: object) -> str:
-        """Coerce a diagnostic_results or investigations item to plain string.
-
-        The model occasionally returns dicts (e.g. {"term": "..."}) in list
-        fields that should contain strings.  Extract the most informative key
-        rather than repr the dict.
-        """
-        if isinstance(item, dict):
-            return str(item.get("term") or item.get("name") or item.get("value") or item)
-        return str(item)
-
     return ClinicalNote(
         chief_complaint=data.get("chief_complaint") or None,
         history=data.get("history") or None,
@@ -602,7 +791,7 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
         examination=data.get("examination") or None,
         diagnosis=diagnosis,
         medications=medications,
-        investigations=[_coerce_str(x) for x in (data.get("investigations") or [])],
+        investigations=investigations,
         diagnostic_results=[_coerce_str(x) for x in (data.get("diagnostic_results") or [])],
         advice=data.get("advice") or None,
         follow_up=data.get("follow_up") or None,

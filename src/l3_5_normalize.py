@@ -156,6 +156,15 @@ _DEVA_CURATED: dict[str, str] = {
     "नेक्स्टोम": "naxdom",
     "नैक्स्टोम 500": "naxdom 500",
     "नेक्स्टोम 500": "naxdom 500",
+    # Candra-o (ॉ) variant of the same spelling — outputs/<session>, 2026-07-12:
+    # "एक नैक्स्टॉम 500 एक" escaped normalization because candra-o was absent
+    # from every fold map (see src/drug_lexicon.py's _FOLD_MAP); fixed there
+    # too, but the curated tier stays the zero-risk fast path for this
+    # already-seen distortion.
+    "नैक्स्टॉम": "naxdom",
+    "नेक्स्टॉम": "naxdom",
+    "नैक्स्टॉम 500": "naxdom 500",
+    "नेक्स्टॉम 500": "naxdom 500",
 }
 
 _DEVA_RE = re.compile(r"[ऀ-ॿ]")
