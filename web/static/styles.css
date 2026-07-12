@@ -145,8 +145,9 @@ html, body {
 .stage-line.done .tick { display: inline; }
 .stage-line.active { color: var(--teal); opacity: 0.55; }
 
-/* Real transcription %/ETA suffix on the "transcribed" line — always gray,
-   never the teal/amber accents, regardless of the line's own state color. */
+/* Real-time %/ETA suffix, on whichever stage-line is currently active —
+   always gray, never the teal/amber accents, regardless of the line's own
+   state color. */
 .stage-line .progress {
   color: var(--gray-400);
   text-transform: none;

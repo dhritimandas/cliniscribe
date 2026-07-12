@@ -55,7 +55,7 @@ the arbiter of whether this config ships.
 import logging
 import re
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import soundfile as sf
@@ -687,6 +687,41 @@ def _decode_window_words_with_guards(
     return text, words
 
 
+# Progress-reporting granularity fix: window-packing (Fix 2) cut on_progress
+# from one call per DIARIZED SEGMENT down to one call per WINDOW, so a clip
+# short enough to pack into a single window (the common case — most tier-2/3
+# consults run under WINDOW_MAX_SPAN_S) reported exactly ONE datum, right at
+# the window's completion — indistinguishable in practice from no progress at
+# all, since it lands at (or after) the moment the stage itself ends and the
+# caller clears the display. When a window's decode degenerates and the retry
+# ladder fires, this shared helper lets each ladder step also report partial
+# credit, so a retried window does not go dark for its (up to 3) extra decode
+# calls either.
+def _report_progress(
+    on_progress: Callable[[float, float], None] | None,
+    done_seconds: float,
+    total_seconds: float,
+) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress(done_seconds, total_seconds)
+    except Exception:
+        logger.debug("on_progress callback failed (ignored)", exc_info=True)
+
+
+# Fractional credit (of the CURRENT window's own audio span) reported after
+# each ladder step resolves or falls through — approximate, not precise (a
+# step's wall-clock cost does not scale with the window's audio duration),
+# but strictly increasing step-to-step so the displayed percentage never
+# jumps backward.
+_LADDER_STEP_PROGRESS_FRACTION = {
+    "step1_boundary_shift": 0.25,
+    "step2_temp_condition": 0.5,
+    "step3_large_model": 0.75,
+}
+
+
 def _retry_ladder_windowed(
     audio: np.ndarray,
     sr: int,
@@ -696,6 +731,9 @@ def _retry_ladder_windowed(
     *,
     initial_text: str,
     initial_words: list[Word],
+    on_progress: Callable[[float, float], None] | None = None,
+    done_seconds_before_window: float = 0.0,
+    total_seconds: float = 0.0,
 ) -> tuple[str, list[Word], str]:
     """Window-granularity counterpart of _retry_ladder.
 
@@ -712,11 +750,25 @@ def _retry_ladder_windowed(
             boundary shift.
         initial_text, initial_words: The already-degenerate first decode
             (step0), kept as a give-up candidate.
+        on_progress, done_seconds_before_window, total_seconds: optional
+            per-step progress reporting (see _report_progress and
+            _LADDER_STEP_PROGRESS_FRACTION above). `done_seconds_before_window`
+            is every earlier window's already-completed audio; the caller
+            (fast_transcribe_windowed) still reports this window's full span
+            once the ladder returns, regardless of which step resolved it.
 
     Returns:
         (final_text, final_words, step_name).
     """
     candidates: list[tuple[str, list[Word]]] = [(initial_text, initial_words)]
+    window_span = window_end - window_start
+
+    def _report_step(step_name: str) -> None:
+        _report_progress(
+            on_progress,
+            done_seconds_before_window + _LADDER_STEP_PROGRESS_FRACTION[step_name] * window_span,
+            total_seconds,
+        )
 
     # Step 1: widen the window boundaries — a measured loop-breaker.
     shift = config.RETRY_BOUNDARY_SHIFT_S
@@ -726,6 +778,7 @@ def _retry_ladder_windowed(
         audio, sr, start1, end1, config.FAST_ASR_MODEL, config.FAST_ASR_DECODE_KWARGS
     )
     candidates.append((text1, words1))
+    _report_step("step1_boundary_shift")
     if not looks_degenerate(text1, end1 - start1):
         return text1, words1, "step1_boundary_shift"
 
@@ -738,6 +791,7 @@ def _retry_ladder_windowed(
         audio, sr, window_start, window_end, config.FAST_ASR_MODEL, step2_kwargs
     )
     candidates.append((text2, words2))
+    _report_step("step2_temp_condition")
     if not looks_degenerate(text2, window_end - window_start):
         return text2, words2, "step2_temp_condition"
 
@@ -751,6 +805,7 @@ def _retry_ladder_windowed(
         config.FAST_ASR_DECODE_KWARGS,
     )
     candidates.append((text3, words3))
+    _report_step("step3_large_model")
     if not looks_degenerate(text3, window_end - window_start):
         return text3, words3, "step3_large_model"
 
@@ -910,6 +965,9 @@ def fast_transcribe_windowed(
                 total_duration,
                 initial_text=text,
                 initial_words=words,
+                on_progress=on_progress,
+                done_seconds_before_window=done_seconds,
+                total_seconds=total_seconds,
             )
             logger.warning(
                 "fast_asr windowed ladder fired at [%.2f, %.2f]s — resolved by %s",
@@ -920,11 +978,7 @@ def fast_transcribe_windowed(
         all_words.extend(words)
 
         done_seconds += sum(max(0.0, s.end - s.start) for s in group)
-        if on_progress is not None:
-            try:
-                on_progress(done_seconds, total_seconds)
-            except Exception:
-                logger.debug("on_progress callback failed (ignored)", exc_info=True)
+        _report_progress(on_progress, done_seconds, total_seconds)
 
     raw_turns = _assign_words_to_turns(all_words, segments)
     return _build_turns_with_roles(raw_turns)
