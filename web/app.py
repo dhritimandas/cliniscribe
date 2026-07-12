@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from src import config, pipeline
 from src.l5_render import render
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
-from web import live_asr
+from web import live_asr, verification
 from web.provenance import flags_by_path, provenance_for_note
 from web.translations import TRANSLATIONS
 
@@ -262,14 +262,52 @@ def _make_progress_callbacks(sid: str):
     return on_stage, on_progress
 
 
+def _run_verification_thread(sid: str) -> None:
+    """Run web.verification's targeted second-listen and mirror its result
+    into status.json's "verification" key.
+
+    Started (see _run_pipeline_thread) only AFTER pipeline.run() has already
+    returned for this session — i.e. after L4 extraction has finished and the
+    fast-path Whisper/mlx model has already been released (memory
+    discipline: see web/verification.py's module docstring). Runs on its own
+    daemon thread and never blocks review or signing.
+    """
+    with _status_lock:
+        status = _read_json(_status_path(sid))
+        status["verification"] = {"state": "running", "n_differing": 0, "coverage": None}
+        _write_json(_status_path(sid), status)
+    result = verification.run_verification(sid)  # never raises — see its docstring
+    with _status_lock:
+        status = _read_json(_status_path(sid))
+        status["verification"] = {
+            "state": result.get("state", "failed"),
+            "n_differing": len(result.get("fields_differing", [])),
+            "coverage": result.get("coverage"),
+        }
+        _write_json(_status_path(sid), status)
+
+
 def _run_pipeline_thread(sid: str, in_path: str) -> None:
     on_stage, on_progress = _make_progress_callbacks(sid)
+    asr_engine = "fast" if config.FAST_ASR_ENABLED else "accurate"
     try:
-        pipeline.run(in_path, session_id=sid, on_stage=on_stage, on_progress=on_progress)
+        pipeline.run(
+            in_path,
+            session_id=sid,
+            on_stage=on_stage,
+            on_progress=on_progress,
+            asr_engine=asr_engine,
+        )
         with _status_lock:
             status = _read_json(_status_path(sid))
             status.update(state="review", stage=None, error=None)
             _write_json(_status_path(sid), status)
+        if asr_engine == "fast":
+            # Background verification (web/verification.py) only ever makes
+            # sense for the fast engine — the accurate engine's own L3 output
+            # is already the slow, careful transcription this would recheck
+            # against.
+            threading.Thread(target=_run_verification_thread, args=(sid,), daemon=True).start()
     except Exception as exc:
         logger.exception("Session %s: pipeline failed", sid)
         with _status_lock:
@@ -325,6 +363,23 @@ def get_note(sid: str) -> dict[str, Any]:
         "flags": flags_by_path(note),
         "low_confidence_fields": note.low_confidence_fields,
     }
+
+
+# ── GET /api/sessions/{sid}/verification ─────────────────────────────────
+@app.get("/api/sessions/{sid}/verification")
+def get_verification(sid: str) -> dict[str, Any]:
+    """Return the background verification result (web/verification.py) for a
+    session — fields_differing, doctor_resolved, unverified_by_budget,
+    coverage, and the safety-critical-span "checked transcript".
+
+    404 before verification has ever started (no verification.json yet); the
+    SPA only calls this once status.json's "verification" key first appears.
+    """
+    session_dir = _session_dir(sid)
+    path = os.path.join(session_dir, "verification.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Verification not started")
+    return _read_json(path)
 
 
 # ── PATCH /api/sessions/{sid}/note ───────────────────────────────────────

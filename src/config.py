@@ -57,14 +57,26 @@ EXTRACT_NUM_PREDICT = 2048
 # preload. Whisper is always released before the LLM loads (pipeline order).
 EXTRACT_KEEP_ALIVE = "15m"
 
-# ── L3-fast ASR (mlx-whisper, gated) ─────────────────────────────────────────
+# ── L3-fast ASR (mlx-whisper, shipped) ───────────────────────────────────────
 # Chunk-local detect+retry engine (src/fast_asr.py), built to answer the
 # Deployment Latency Phase's four negative results (see LEARNINGS.md): faster
 # engines/merged windows/decode-param tweaks/VAD pre-slicing all failed the
-# frozen-bench gate outright. This flag stays False — the production path
-# keeps using src.l3_asr.transcribe — until eval/fast_asr_gate.py reports a
-# PASS; the caller (src/pipeline.py) flips it, this file does not.
-FAST_ASR_ENABLED = False
+# frozen-bench gate outright. eval/fast_asr_gate.py's frozen 10-clip bench
+# (out-of-domain phone-call-style Hindi) never reported a PASS for either
+# engine config (outputs/fast_asr_gate_v2.json: both FAIL). The shipping
+# decision overrides that gate on the strength of a DIFFERENT measurement in
+# the same file — the "windowed" engine's numbers on the three actual
+# deployment-style clinic clips: ~15-20s decode (vs. the accurate path's
+# multi-minute wall) and improved drug capture post-normalize (2/3 clips,
+# including the naxdom session, vs. 1/3 for per-segment) — the frozen bench's
+# corpus_wer regression traces to whole-clip windows drifting into English
+# paraphrase on code-switched Hindi, a failure mode the background
+# verification pass below (web/verification.py) exists specifically to catch
+# on safety-critical fields without paying a full accurate re-transcription's
+# cost. Production always uses fast_transcribe_windowed for this reason (see
+# src/pipeline.py's asr_engine="fast" branch) regardless of FAST_ASR_MODE
+# below, which predates this decision and is now inert.
+FAST_ASR_ENABLED = True
 
 FAST_ASR_MODEL = "mlx-community/whisper-large-v3-turbo"  # per-segment primary decode
 FAST_ASR_FALLBACK_MODEL = "mlx-community/whisper-large-v3-mlx"  # retry-ladder step3
@@ -118,6 +130,23 @@ WINDOW_MAX_SPAN_S = 28.0
 # src/fast_asr.py::_pack_segments_into_windows).
 WINDOW_MIN_BREAK_GAP_S = 0.8
 
+# ── Background verification (targeted second listen, web/verification.py) ───
+# After a fast-engine review reaches the doctor, a daemon thread re-decodes
+# ONLY safety-critical spans (drug names+doses, vitals, diagnosis) — not a
+# full accurate re-transcription, which costs 20-60 min on CPU for a
+# multi-minute consult, far past the budget below.
+VERIFY_MODEL = FAST_ASR_FALLBACK_MODEL  # bigger mlx model, decorrelated from the primary turbo decode
+VERIFY_SPAN_PAD_S = 1.5  # seconds of context padded on each side of a field's transcript mention
+VERIFY_MAX_WINDOW_S = 28.0  # per-window cap, same as WINDOW_MAX_SPAN_S
+VERIFY_BUDGET_S = 90.0  # hard wall-clock budget for the whole verification pass
+VERIFY_DECODE_S_PER_WINDOW_ESTIMATE = 48.0  # measured: one full 28s window on VERIFY_MODEL
+# A second window (56s of audio, ~2x the decode cost) is only attempted when
+# its ESTIMATED cost still fits the budget below. With the measured
+# per-window cost above, 2 windows (~96s) does not, so verification currently
+# always resolves to a single packed window; written generically so a faster
+# model or a larger budget could unlock a second window later.
+VERIFY_MAX_WINDOWS = 2 if 2 * VERIFY_DECODE_S_PER_WINDOW_ESTIMATE <= VERIFY_BUDGET_S else 1
+
 # Which fast-ASR entry point to use once FAST_ASR_ENABLED flips True: either
 # "per_segment" (src.fast_asr.fast_transcribe) or "windowed"
 # (src.fast_asr.fast_transcribe_windowed) -- whichever passes
@@ -132,6 +161,8 @@ WINDOW_MIN_BREAK_GAP_S = 0.8
 # transcription (e.g. "सर दर्द" -> "How severe is your heart?"), a distinct
 # and worse failure mode than the anticipated Devanagari-absorption risk (zero
 # absorption candidates were found -- see eval/fast_asr_gate.py). This value
-# is a placeholder, inert until a future attempt clears the gate; no caller
-# reads it while FAST_ASR_ENABLED is False.
+# is a placeholder: src/pipeline.py's asr_engine="fast" branch always calls
+# fast_transcribe_windowed directly (see the shipping-decision note above) and
+# never reads this value — kept for eval/ harnesses that still compare both
+# configs, not as a live production switch.
 FAST_ASR_MODE = "per_segment"
