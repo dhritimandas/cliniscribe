@@ -443,6 +443,52 @@ def _run_verification_thread(sid: str) -> None:
         _write_json(_status_path(sid), status)
 
 
+# Warmed sequentially (one Ollama call in flight at a time) once note.json
+# is ready — see `_run_translation_warm_thread`.
+_TRANSLATION_WARM_LANGS = ("en", "hi", "mr")
+
+
+def _run_translation_warm_thread(sid: str) -> None:
+    """Pre-populate the /translate cache for every supported language.
+
+    Started right after a session reaches "review" (note.json ready) so the
+    doctor's first language switch in the review UI is instant instead of
+    paying a cold 30-120s Ollama call. Calls `translate_session` directly —
+    the exact POST /api/sessions/{sid}/translate code path — so cache keys,
+    cache invalidation, and drug-name masking (web/drug_mask.py) are
+    identical to an on-demand call; a language already cached (or requiring
+    no translation, e.g. an English-source field for lang="en") is cheap and
+    skipped internally by that same code path.
+
+    Runs on its own daemon thread, sequentially: only one Ollama call is ever
+    in flight, so this never competes with itself, and it never blocks
+    review or signing. Verification (web/verification.py) uses MLX, not
+    Ollama, so the two threads may safely overlap. Never raises — a warm
+    failure is logged and skipped, never surfaced to the session.
+    """
+    for lang in _TRANSLATION_WARM_LANGS:
+        t0 = time.monotonic()
+        try:
+            translate_session(sid, TranslateRequest(lang=lang))
+        except Exception:
+            logger.exception(
+                "Session %s: translation warm failed for lang=%s", sid, lang
+            )
+            continue
+        elapsed_s = round(time.monotonic() - t0, 2)
+        try:
+            with _status_lock:
+                status = _read_json(_status_path(sid))
+                status.setdefault("translation_warm", {})[lang] = elapsed_s
+                _write_json(_status_path(sid), status)
+        except Exception:
+            logger.exception(
+                "Session %s: failed to record translation warm timing for lang=%s",
+                sid,
+                lang,
+            )
+
+
 def _run_pipeline_thread(sid: str, in_path: str) -> None:
     on_stage, on_progress = _make_progress_callbacks(sid)
     asr_engine = "fast" if config.FAST_ASR_ENABLED else "accurate"
@@ -467,6 +513,9 @@ def _run_pipeline_thread(sid: str, in_path: str) -> None:
             status = _read_json(_status_path(sid))
             status.update(state="review", stage=None, error=None)
             _write_json(_status_path(sid), status)
+        threading.Thread(
+            target=_run_translation_warm_thread, args=(sid,), daemon=True
+        ).start()
         if asr_engine == "fast":
             # Background verification (web/verification.py) only ever makes
             # sense for the fast engine — the accurate engine's own L3 output

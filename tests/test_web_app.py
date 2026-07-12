@@ -1310,3 +1310,71 @@ def test_select_within_budget_keeps_lower_priority_span_that_fits_a_used_window(
 
     assert {s.fields[0].path for s in selected} == {"medications[0].drug", "vitals[0].value"}
     assert skipped == []
+
+
+# ── translation cache auto-warm (Task 2) ──────────────────────────────────
+
+
+def test_process_warms_all_three_translation_caches_after_review(client, monkeypatch) -> None:
+    """Once note.json is ready, en/hi/mr are pre-populated via the exact same
+    /translate code path — a doctor's first language switch after review is
+    already a cache hit instead of a cold 30-120s Ollama call."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        _write_note(session_id, ClinicalNote(chief_complaint="बुखार", history=None))
+        _write_transcript(session_id, [])
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    # One Ollama call per language (chief_complaint is the only translatable
+    # field; transcript is empty) — en, then hi, then mr, in that order.
+    calls = _stub_ollama_batch_translate(monkeypatch, [["Fever"], ["ज्वर"], ["ताप"]])
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 3.0
+    warm = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        warm = status.get("translation_warm", {})
+        if set(warm) == {"en", "hi", "mr"}:
+            break
+        time.sleep(0.01)
+
+    assert set(warm) == {"en", "hi", "mr"}
+    assert all(isinstance(v, (int, float)) for v in warm.values())
+    for lang in ("en", "hi", "mr"):
+        assert os.path.exists(os.path.join("outputs", sid, f"translations_{lang}.json"))
+    assert len(calls) == 3
+
+    # A subsequent on-demand call for an already-warmed language is a pure
+    # cache hit — no additional Ollama call.
+    response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "en"})
+    assert response.json() == {"note_values": {"chief_complaint": "Fever"}, "transcript": []}
+    assert len(calls) == 3
+
+
+def test_translation_warm_thread_skips_failed_language_and_continues(tmp_path, monkeypatch) -> None:
+    """One language's warm failing (e.g. Ollama unreachable) must not stop
+    the others, and must never raise out of the daemon thread."""
+    monkeypatch.chdir(tmp_path)
+    sid = "warm-thread-test"
+    os.makedirs(os.path.join("outputs", sid), exist_ok=True)
+    app_module._write_json(app_module._status_path(sid), {"state": "review"})
+
+    calls: list[str] = []
+
+    def fake_translate_session(sid_arg, body):
+        calls.append(body.lang)
+        if body.lang == "hi":
+            raise RuntimeError("ollama unreachable")
+        return {"note_values": {}, "transcript": []}
+
+    monkeypatch.setattr(app_module, "translate_session", fake_translate_session)
+
+    app_module._run_translation_warm_thread(sid)
+
+    assert calls == ["en", "hi", "mr"]  # hi's failure doesn't stop en/mr
+    status = app_module._read_json(app_module._status_path(sid))
+    assert set(status["translation_warm"]) == {"en", "mr"}  # hi recorded no timing
