@@ -38,6 +38,62 @@ class Concept:
     hard_negatives: list[str] = field(default_factory=list)
 
 
+# ── Everyday-word guard (concept-matcher hardening, mirrors the drug
+# matcher's near-collision discipline) ──────────────────────────────────────
+# A curated set of common Hindi/English conversation words that can NEVER be
+# glossed as a clinical concept, regardless of embedding similarity — the
+# categorical counterpart to the drug matcher's length-floor rule (some spans
+# live in "crowded" everyday-word space where similarity alone is not a safe
+# signal). Scoped to five closed classes: time words, numbers/quantifiers,
+# function/filler words, common verbs, and kinship/person words — NOT the
+# concept-adjacent nouns already covered by per-concept hard_negatives
+# (दवा, दाल, पेड़, कमरा, दान, कब्र, नाच, पेशा, भूल, सांप — see the audit in
+# commit 26c42ea), which is a different collision class with a different
+# fix (a margin test against a specific concept, not a blanket ban).
+#
+# Deliberately Devanagari + English only (no romanized-Hindi tier): keeps the
+# list close to the ~60-100 entry target while covering the two scripts our
+# ASR actually emits (config.py: "we only support hi/en/mr ... all Latin or
+# Devanagari"). Romanized-Hindi fillers ("subah", "aaj") are a known residual
+# gap, mitigated (not eliminated) by the higher unigram bar and the
+# hard-negative margin gate — not by this list.
+#
+# Runtime rule: if a concept legitimately lists one of these words as a
+# variant, the variant listing wins (see EVERYDAY_WORDS below, which removes
+# any such overlap at import time). Checked empirically: zero of the ~110
+# single-word CONCEPTS variants collide with this list (see
+# tests/test_concept_guard.py::test_everyday_words_documented_variant_overlap).
+_TIME_WORDS: frozenset[str] = frozenset({
+    "हफ्ता", "हफ्ते", "हफते", "हफ़्ते", "दिन", "रात", "सुबह", "शाम", "कल",
+    "आज", "साल", "महीना", "महीने",
+    "week", "weeks", "day", "days", "night", "morning", "evening",
+    "tomorrow", "yesterday", "today", "year", "month", "months",
+})
+_NUMBER_WORDS: frozenset[str] = frozenset({
+    "एक", "दो", "तीन", "चार", "पांच", "दस", "बार", "थोड़ा", "ज्यादा", "कम",
+    "one", "two", "three", "four", "five", "more", "less", "little",
+    "times", "again",
+})
+_FILLER_WORDS: frozenset[str] = frozenset({
+    "और", "तो", "हाँ", "हां", "नहीं", "है", "हैं", "था", "थी", "थे", "भी",
+    "ही", "जी",
+    "okay", "ok", "yes", "no", "please", "uh", "um",
+})
+_VERB_WORDS: frozenset[str] = frozenset({
+    "खाना", "खाओ", "लेना", "लो", "करना", "करो", "जाना", "जाओ", "पीना",
+    "सोना", "आना", "देना",
+    "take", "eat", "do", "go", "drink", "sleep", "give", "come",
+})
+_KINSHIP_WORDS: frozenset[str] = frozenset({
+    "डॉक्टर", "भाई", "बेटा", "बेटी", "माँ", "पापा", "पत्नी", "पति", "बहन",
+    "doctor", "patient", "brother", "sister", "mother", "father", "wife",
+    "husband", "son", "daughter", "sir", "madam",
+})
+_EVERYDAY_WORDS_CURATED: frozenset[str] = (
+    _TIME_WORDS | _NUMBER_WORDS | _FILLER_WORDS | _VERB_WORDS | _KINSHIP_WORDS
+)
+
+
 CONCEPTS: list[Concept] = [
     # ── Chronic / metabolic ──────────────────────────────────────────────────
     Concept(
@@ -239,6 +295,13 @@ CONCEPTS: list[Concept] = [
             # Audit (2026-07-12): दाल ("lentils") is one edit from दाद
             # (ringworm) — one of the most common everyday food words.
             "दाल", "दाल चावल",
+            # Concept Matcher Rebuild audit (2026-07-12, programmatic one-edit
+            # scan, tests/test_concept_guard.py): दान ("donation") is ALSO one
+            # edit from दाद — missed by the original manual audit in commit
+            # 26c42ea, which only checked common everyday NOUNS by hand;
+            # दान was already flagged as a Skin Rash hard negative (दाने
+            # collision) but never cross-checked against Fungal Infection.
+            "दान", "दान देना", "रक्तदान",
         ],
     ),
     Concept(
@@ -408,3 +471,20 @@ CONCEPTS: list[Concept] = [
         ],
     ),
 ]
+
+
+def _all_variant_strings_lower() -> frozenset[str]:
+    """Every CONCEPTS variant string, lower-cased, any span length.
+
+    Used only to strip everyday-word/variant overlaps at import time — see
+    EVERYDAY_WORDS below. Multi-word variants are included too so a variant
+    listing wins even if (hypothetically) it matched a guard entry exactly.
+    """
+    return frozenset(v.lower() for c in CONCEPTS for v in c.variants)
+
+
+# The runtime guard set: curated everyday words minus any word a concept
+# legitimately lists as a variant (variant listing wins — see module
+# docstring). Empirically empty today; computed defensively so a future
+# CONCEPTS edit can never silently make a real lay term unglossable.
+EVERYDAY_WORDS: frozenset[str] = _EVERYDAY_WORDS_CURATED - _all_variant_strings_lower()

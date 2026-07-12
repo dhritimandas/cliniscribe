@@ -43,6 +43,40 @@ ASR_SCRIPT_GUARD = True
 COSINE_THRESHOLD = 0.65  # min cosine similarity for a lay→clinical concept match
 HARDNEG_MARGIN = 0.05  # span must beat its hardest hard-negative by this margin
 
+# ── L3.5 concept matching — near-collision hardening (Concept Matcher
+# Rebuild Phase, tuned by eval/gloss_audit.py against the frozen 24-sample
+# extraction transcripts + 49-clip drug bench + 10-clip beam study + real
+# session transcripts — 173 items, 90 distinct unigram gloss candidates
+# adjudicated by hand; see the tuning table + adjudication in the phase
+# report). Transplants the drug matcher's length-floor and ambiguity-guard
+# disciplines onto the concept pass:
+#   - Unigram spans are the crowded, one-edit-collision-prone class (हफते↔
+#     हांफते, दमा↔दवा, ...), so they must clear a HIGHER bar than bigram+
+#     spans, which get contextual support from a neighbor word. Empirically,
+#     every CLEAR wrong unigram gloss found in the audit (योर->Fever, ब्लड/
+#     blood->Hypertension, BPM->Hypertension, DM->T2DM [a drug-name
+#     fragment, "Ompec DM"], D.->Diarrhea [a list marker "B, C, and D."],
+#     वाइटिंग->Vomiting, बसले/संपल्या->Weakness, flu->Fever, stools/
+#     गैप/acid->Acid Reflux) scored <= 0.721; the first preserved true
+#     positive (बीपी->Hypertension) scores 0.733 — 0.73 sits in that gap.
+#     A residual class of 4 unigrams (जळत->Acid Reflux, खीस->Cough,
+#     bare संपल्या->Weakness, Tension->Anxiety) still gloss wrong at
+#     0.78-0.85; pushing the bar there would ALSO drop dozens of legitimate
+#     matches in the same band (कमजोर, कफ, दर्द-family, डायबिटीज-family,
+#     "weakness.", "ache.", ...) — documented residual risk, same class as
+#     the सर्दी policy (span-only embeddings can't see sentence context).
+COSINE_THRESHOLD_UNIGRAM = 0.73
+#   - If the best- and second-best-scoring CONCEPTS for a span are within
+#     this margin, the span is genuinely ambiguous between two concepts and
+#     must not be glossed (mirrors src/drug_lexicon.py's ambiguity guard:
+#     "if a skeleton sits within tolerance of TWO drugs, refuse to choose").
+#     0.03 causes zero regressions on the audit corpus (its smallest
+#     observed margin for any accepted gloss is 0.065, a Migraine-vs-
+#     Headache case already resolved by other means) — kept as prophylactic
+#     defense-in-depth, not because it fired here, exactly like
+#     src/drug_lexicon.py's albendazole/mebendazole tie-breaker.
+CONCEPT_AMBIGUITY_MARGIN = 0.03
+
 # ── L4 extraction context ─────────────────────────────────────────────────────
 # Ollama's default context truncated long HI/MR transcripts and produced empty
 # notes: a 5.4k-char Devanagari transcript measures 5006 prompt tokens (bench
