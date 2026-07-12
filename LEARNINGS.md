@@ -1197,3 +1197,57 @@ the hard negatives a learned drug-NER or constrained-decoding scheme should
 train against, and the wrong-language hallucination clips join the
 repetition-loop clips (f2096fbd, 1ae62262) in the acceptance set any
 fine-tuned ASR must clear.
+
+---
+
+## Fast Transcription Phase — The 90-second constraint that redesigned the checker (2026-07-12)
+
+### (a) What this phase does
+This phase shipped the speed the clinic actually needs: the web app now
+transcribes with the window-packed fast engine (a 28-second recording's
+speech-to-text runs in ~16 seconds; the full note lands in 65-77 seconds),
+protected by two guards proven earlier — the wrong-language allowlist and the
+repetition-loop ladder — plus a background "second listen" that re-checks
+only the safety-critical seconds of audio. The decisive design force was a
+product constraint, not a technical one: appointments run 2-3 minutes, so a
+checker that takes longer than ~90 seconds is furniture. That single sentence
+from the user invalidated the obvious design (re-run the accurate engine on
+everything: 20-60 minutes) and produced a better one.
+
+### (b) Hardest bugs
+
+1. **The obvious verification design was uselessly correct.** Re-transcribing
+   the whole recording with the accurate engine gives the best possible
+   second opinion — arriving half an hour after the patient has left. Root
+   cause: engineering for maximum verification quality without pricing the
+   clinical workflow's time budget; correctness that misses its deadline is
+   indistinguishable from absence. The redesign inverts the question from
+   "how do we verify everything?" to "what is worth verifying inside 90
+   seconds?" — answer: the seconds of audio that produced drugs, doses,
+   vitals, and diagnoses (the note's provenance already knows them), padded,
+   merged, packed into one decode window, checked by a bigger decorrelated
+   model, with a hard budget cap and an honest "partial check" label when
+   spans overflow it. Measured: 57-59 seconds, full coverage, on the real
+   incident session. Lesson: a verifier is a product feature with a latency
+   SLO, not an offline benchmark — design it from the deadline backward.
+
+2. **The checker's first real run flagged almost every diagnosis — because
+   of our own annotations.** The pipeline glosses lay terms with clinical
+   ones ("बुखार (Fever)"), so diagnosis VALUES carry a suffix that no raw
+   re-decode of the audio will ever contain; fold-comparison saw permanent
+   disagreement. Root cause: comparing a value from one representational
+   layer (post-gloss) against text from another (raw decode) — the two sides
+   of a diff must be brought to the same representation before comparing.
+   Fixed by stripping the gloss suffix pre-comparison; caught only because
+   the E2E ran on real session data rather than synthetic fixtures. Lesson:
+   any diff across pipeline stages must normalize both sides to a common
+   form first, and false-positive floods in a verifier are as damaging as
+   misses — doctors stop reading flags that cry wolf.
+
+### (c) Fine-tuning hook
+Every background-check disagreement is now logged with both readings (fast
+vs checked span text), and every "use checked version" tap is a
+doctor-adjudicated label between two ASR hypotheses on identical audio —
+accumulating exactly the preference data a future ASR fine-tune or reranker
+needs, at zero annotation cost, in the deployment domain the frozen bench
+can't represent.

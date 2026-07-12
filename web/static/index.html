@@ -54,6 +54,8 @@
     </div>
   </header>
 
+  <div id="verification-banner" class="verification-banner" hidden></div>
+
   <div class="cell" id="cell-patient">
     <div class="label" id="label-patient"></div>
     <input type="text" id="patient-input" class="value patient-input" autocomplete="off">
@@ -94,6 +96,7 @@
 <!-- Transcript drawer -->
 <aside id="drawer" class="drawer">
   <div class="drawer-header">
+    <button id="checked-transcript-toggle" class="drawer-toggle-btn" hidden></button>
     <button id="drawer-close-btn" class="drawer-close-btn" aria-label="close">CLOSE</button>
   </div>
   <div class="drawer-inner" id="drawer-turns"></div>
