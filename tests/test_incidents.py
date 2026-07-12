@@ -7,7 +7,7 @@ function calls / mocks only) so this file runs in well under a second and
 can gate every commit, not just release branches.
 """
 
-from src.concepts import CONCEPTS
+from src.concepts import CONCEPTS, EVERYDAY_WORDS
 from src.drug_lexicon import canonicalize_drug_span
 from src.l3_5_normalize import _normalize_drug_text
 from src.l3_asr import _contains_arabic_script
@@ -196,6 +196,16 @@ def test_haphte_family_present_as_shortness_of_breath_hard_negative() -> None:
     sob = next(c for c in CONCEPTS if c.term == "Shortness of Breath")
     for week_word in ("हफ्ता", "हफ्ते", "हफते", "हफ़्ते"):
         assert week_word in sob.hard_negatives
+
+
+def test_haphte_family_also_blocked_by_everyday_word_guard() -> None:
+    """Concept Matcher Rebuild Phase (2026-07-12): this incident is now
+    caught by TWO independent mechanisms — the per-concept hard negative
+    above, AND the categorical EVERYDAY_WORDS guard (src/concepts.py),
+    which blocks हफ्ता/हफ्ते regardless of similarity to ANY concept, not
+    just Shortness of Breath. See tests/test_concept_guard.py."""
+    for week_word in ("हफ्ता", "हफ्ते", "हफते", "हफ़्ते"):
+        assert week_word in EVERYDAY_WORDS
 
 
 # ── (9) drug name in diagnosis/investigations — same screenshots as (6)/(7),
