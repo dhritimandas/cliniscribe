@@ -267,6 +267,26 @@ html, body {
   color: var(--gray-900);
 }
 
+.lang-select:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------- /translate in-flight feedback ----------
+   Quiet gray mono line, near the language dropdown. Pulses gently while a
+   translation is in flight; the failure wording is static (no pulse — it is
+   a terminal message, not an ongoing process). */
+.translate-status {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+  color: var(--gray-400);
+}
+
+.translate-status:not(.error) { animation: translate-pulse 1.4s ease-in-out infinite; }
+
+@keyframes translate-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
 .quiet-btn {
   font-family: var(--font-mono);
   font-size: 0.7rem;

@@ -88,6 +88,9 @@ const UI_STRINGS = {
   verify_after_sign_suffix: " differences logged",
   use_checked_version: "use checked version",
   checked_transcript: "checked transcript",
+  // /translate in-flight feedback (cold cache / loaded host can take 1-2 min).
+  translating: "translating…",
+  translation_unavailable: "translation unavailable — showing original",
 };
 function u(key) { return UI_STRINGS[key]; }
 
@@ -275,6 +278,13 @@ let pendingEdits = {};     // { path: {field, old, new} }
 let translatedValues = {};      // { path: translated text }
 let translatedTranscript = [];  // [translated text] aligned to transcriptData
 let translationsByLang = {};    // client-side cache: { lang: {note_values, transcript} }
+
+// Latency fix: the initial auto-translate (loadNoteAndShowReview) now runs
+// in the BACKGROUND after first paint instead of blocking it. This flags a
+// re-render that arrived while the reviewer was mid-edit in an inline
+// contenteditable field, so it can be deferred (applied on the field's next
+// blur) instead of clobbering in-progress, unsaved keystrokes.
+let deferredReviewRerenderPending = false;
 
 // Background verification (fast + background check architecture): the fast
 // engine's note is reviewable immediately; a daemon-thread "second listen"
@@ -1024,16 +1034,57 @@ async function loadNoteAndShowReview() {
   showCheckedTranscript = false;
   updateVerificationBanner(null);
   updateCheckedTranscriptToggle();
-  // Bug 1: the selected language (default "en") may mismatch the note's
-  // dominant script (e.g. a Hindi/Urdu-script consultation with English
-  // still selected) — fire the translation immediately so the first paint
-  // is already in the selected language, not a tap-to-translate surprise.
-  if (noteHasNonLatinScript(noteData, transcriptData)) {
-    await refreshTranslations();
-  }
+
+  // Latency fix: the note is already in hand (prefetched as soon as
+  // l4_extract finished) — render it and switch screens IMMEDIATELY, in
+  // source language. Never await a translation round trip before first
+  // paint: a cold /translate call is an Ollama call and can take 30-120s,
+  // which used to be the entire "drafting done" -> "note visible" gap.
   renderReview();
   renderDrawer();
   showScreen("review");
+
+  // Bug 1: the selected language (default "en") may mismatch the note's
+  // dominant script (e.g. a Hindi/Urdu-script consultation with English
+  // still selected) — fire the translation in the BACKGROUND and re-render
+  // in place once it lands, instead of blocking the screen switch on it.
+  if (noteHasNonLatinScript(noteData, transcriptData)) {
+    translateInBackgroundAndRerender();
+  }
+}
+
+// Runs the initial auto-translate off the critical path of first paint.
+// Reuses the exact same in-flight indicator and failure handling as the
+// lang-select handler (runTranslationWithIndicator) — a "translating…" line
+// on the way in, a silent fallback to source language plus the 4s
+// "translation unavailable" message on failure. Re-renders in place once the
+// translation lands (or fails), deferring if the reviewer is mid-edit — see
+// isEditingActiveField / the deferredReviewRerenderPending check in
+// onFieldBlur.
+async function translateInBackgroundAndRerender() {
+  langSelectEl.disabled = true;
+  try {
+    await runTranslationWithIndicator(refreshTranslations);
+  } catch (err) {
+    console.error("initial translation failed:", err);
+  } finally {
+    langSelectEl.disabled = false;
+  }
+  if (isEditingActiveField()) {
+    deferredReviewRerenderPending = true;
+    return;
+  }
+  renderReview();
+  renderDrawer();
+}
+
+// True while the reviewer has an inline note-grid field focused for editing
+// — used to defer a background re-render rather than clobber in-progress,
+// unsaved keystrokes (medications/vitals cells use the same
+// contenteditable .value convention as scalar/list fields).
+function isEditingActiveField() {
+  const el = document.activeElement;
+  return !!(el && el.isContentEditable && noteGrid.contains(el));
 }
 
 // Fix 4 / Bug 1 (target-language-absolute): resolve what to *show* for a
@@ -1263,13 +1314,22 @@ function onFieldBlur(el) {
   if (wasEmpty) {
     el.dataset.empty = "true";
     el.textContent = t("empty");
-    return;
-  }
-  // Unchanged and a translation exists for this language: editing is done,
-  // resume showing the translated overlay (the original was only shown
-  // transiently while the field had focus).
-  if (newVal === oldVal && hasTranslatedOverlay(path, baselineValues[path])) {
+  } else if (newVal === oldVal && hasTranslatedOverlay(path, baselineValues[path])) {
+    // Unchanged and a translation exists for this language: editing is
+    // done, resume showing the translated overlay (the original was only
+    // shown transiently while the field had focus).
     el.textContent = translatedValues[path];
+  }
+
+  // A background translation may have landed while this field (or another
+  // one — focus can move directly between fields on the same blur/focus
+  // tick) was being edited. Apply it now, but only once nothing in the note
+  // grid is still being edited. Checked unconditionally (not skipped for an
+  // emptied field) so the deferred re-render is never lost.
+  if (deferredReviewRerenderPending && !isEditingActiveField()) {
+    deferredReviewRerenderPending = false;
+    renderReview();
+    renderDrawer();
   }
 }
 
@@ -1476,14 +1536,74 @@ document.addEventListener("click", (e) => {
 
 /* ---------- Language switching ---------- */
 
-document.getElementById("lang-select").addEventListener("change", async (e) => {
+// A cold /translate call (uncached lang, and/or a loaded Ollama host) can
+// take 1-2 minutes with nothing else on screen changing meanwhile — the
+// doctor gets no feedback that anything is happening. Delayed-show guard:
+// the "translating…" line only appears if the request is STILL in flight
+// after TRANSLATE_INDICATOR_DELAY_MS, so an already-cached repeat switch
+// (which resolves in a microtask, well under the delay) never flashes it.
+const TRANSLATE_INDICATOR_DELAY_MS = 150;
+const TRANSLATE_ERROR_DISPLAY_MS = 4000;
+const translateStatusEl = document.getElementById("translate-status");
+const langSelectEl = document.getElementById("lang-select");
+let translateIndicatorTimer = null;
+let translateErrorTimer = null;
+
+function hideTranslateStatus() {
+  clearTimeout(translateErrorTimer);
+  translateErrorTimer = null;
+  translateStatusEl.hidden = true;
+  translateStatusEl.classList.remove("error");
+}
+
+// Shared in-flight indicator machinery: shows "translating…" once a request
+// has genuinely been in flight for TRANSLATE_INDICATOR_DELAY_MS (so an
+// already-cached repeat, which resolves in a microtask, never flashes it),
+// and on failure shows "translation unavailable" for TRANSLATE_ERROR_DISPLAY_MS
+// before falling silently back to source language. Used by both the
+// lang-select handler AND the initial background auto-translate
+// (translateInBackgroundAndRerender) so the doctor sees the same feedback
+// regardless of which path triggered the translation. Rethrows on failure so
+// each caller can log its own context-specific error message.
+async function runTranslationWithIndicator(translateFn) {
+  clearTimeout(translateErrorTimer);
+  translateIndicatorTimer = setTimeout(() => {
+    translateStatusEl.textContent = u("translating");
+    translateStatusEl.classList.remove("error");
+    translateStatusEl.hidden = false;
+  }, TRANSLATE_INDICATOR_DELAY_MS);
+  try {
+    await translateFn();
+    clearTimeout(translateIndicatorTimer);
+    translateStatusEl.hidden = true;
+  } catch (err) {
+    clearTimeout(translateIndicatorTimer);
+    translateStatusEl.textContent = u("translation_unavailable");
+    translateStatusEl.classList.add("error");
+    translateStatusEl.hidden = false;
+    translateErrorTimer = setTimeout(hideTranslateStatus, TRANSLATE_ERROR_DISPLAY_MS);
+    throw err;
+  }
+}
+
+langSelectEl.addEventListener("change", async (e) => {
   currentLang = e.target.value;
-  // Bug 1 (target-language-absolute): "en" is a real target like hi/mr —
-  // a Devanagari/Arabic-script note still needs translating TO English, so
-  // every switch (including back to en) refreshes the overlay. Cached per
-  // lang server-side and client-side, so repeated en<->hi<->mr switching
-  // never re-hits Ollama for a language already fetched this session.
-  await refreshTranslations();
+  // The indicator is gated on an ACTUAL request being in flight (>150ms),
+  // not on the target language: English is usually a client-side no-op
+  // (cached / Latin source → instant, so the delayed-show guard means no
+  // flash), but for a Devanagari/Arabic-script source note English is a
+  // real backend translation too — a silent 1-2 min wait there is exactly
+  // the gap this indicator exists to close. Cached per lang server-side
+  // and client-side, so repeated switching never re-hits Ollama for a
+  // language already fetched this session.
+  langSelectEl.disabled = true;
+  try {
+    await runTranslationWithIndicator(refreshTranslations);
+  } catch (err) {
+    console.error("translation fetch failed:", err);
+  } finally {
+    langSelectEl.disabled = false;
+  }
   renderReview();
   renderDrawer();
 });
@@ -1493,15 +1613,25 @@ async function refreshTranslations() {
     ({ note_values: translatedValues, transcript: translatedTranscript } = translationsByLang[currentLang]);
     return;
   }
-  const res = await api(`/api/sessions/${sessionId}/translate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lang: currentLang }),
-  });
-  const data = await res.json();
-  translationsByLang[currentLang] = data;
-  translatedValues = data.note_values || {};
-  translatedTranscript = data.transcript || [];
+  try {
+    const res = await api(`/api/sessions/${sessionId}/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: currentLang }),
+    });
+    if (!res.ok) throw new Error(`translate failed: ${res.status}`);
+    const data = await res.json();
+    translationsByLang[currentLang] = data;
+    translatedValues = data.note_values || {};
+    translatedTranscript = data.transcript || [];
+  } catch (err) {
+    // Failure (network or non-200): fall back to the source-language values
+    // — never leave a stale overlay from a previously selected language on
+    // screen mislabeled as the newly selected one.
+    translatedValues = {};
+    translatedTranscript = [];
+    throw err;
+  }
 }
 
 /* ---------- Sign flow ---------- */
