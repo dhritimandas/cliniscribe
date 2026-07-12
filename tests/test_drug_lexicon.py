@@ -52,13 +52,20 @@ def test_no_exact_fold_collisions_in_shipped_lexicon() -> None:
 # ── Fold function ─────────────────────────────────────────────────────────
 
 
-def test_fold_despaces_and_lowercases() -> None:
-    assert _fold("Zerodol SP") == "zerodolsp"
+def test_fold_lowercases_and_keeps_spaces() -> None:
+    # _fold keeps spaces (l4_extract's and drug_bench's word-window
+    # comparisons need them); a despaced dictionary key is
+    # _fold(text).replace(" ", "") — see canonicalize_drug_span below.
+    assert _fold("Zerodol SP") == "zerodol sp"
+    assert _fold("Zerodol SP").replace(" ", "") == "zerodolsp"
 
 
 def test_fold_devanagari_x_digraph() -> None:
-    # क्स -> x, shared convention with src/l4_extract.py's _fold_drug.
-    assert "x" in _fold("क्सरे")
+    # क्स -> x (_FOLD_DIGRAPHS) -> ks (the Latin-orthography x -> ks rule,
+    # _apply_orthography) — so an English "norflox" and a Devanagari
+    # "...लोक्स" spelling land on the same key. Shared convention with
+    # src/l4_extract.py's fold_drug, which now imports this function.
+    assert "ks" in _fold("क्सरे")
 
 
 def test_fold_collapses_doubled_consonants() -> None:
@@ -191,8 +198,14 @@ def test_zifi_incident_not_reached_report_honestly() -> None:
 
 
 def test_glycomate_recovered_via_lexicon_tier() -> None:
-    """glycomate (misspelling) -> glycomet (real brand, metformin)."""
-    assert canonicalize_drug_span("glycomate") == ("glycomet", 0.7778)
+    """glycomate (misspelling) -> glycomet (real brand, metformin).
+
+    Confidence moved from the pre-orthography 0.7778 (9-char key, distance 2)
+    to 0.8 (10-char key "glaikomate", distance 2 from "glaikomet") once the
+    y -> ai Latin-orthography rule folds "gly-" the same way Devanagari
+    spells its /aɪ/ diphthong (ग्लाइ) — see _apply_orthography.
+    """
+    assert canonicalize_drug_span("glycomate") == ("glycomet", 0.8)
 
 
 def test_gmenti_recovered_via_lexicon_tier_with_context() -> None:

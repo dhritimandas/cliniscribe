@@ -450,3 +450,25 @@ def test_paracetamol_devanagari_variants_curated() -> None:
         ("पैरसेट मॉल दिन में दो बार", "paracetamol"),
     ):
         assert expected in _normalize_drug_text(text)
+
+
+# ── Latin-orthography drug-lexicon fold (drug-Latin-canon fix) ──────────────
+# Real incident (outputs/20260712-194649-763e13, 2026-07-12): नौरफलोक्स and
+# एजित्रोमाइसिन both stayed Devanagari through L3.5 because the lexicon
+# fold's Latin keys kept English orthography ('x' never became 'ks', etc.)
+# while Devanagari folded phonetically. See src/drug_lexicon.py's
+# _apply_orthography and tests/test_incidents.py for the full fix.
+
+
+def test_norflox_devanagari_recovered_via_lexicon_fold() -> None:
+    result = _normalize_drug_text("नौरफलोक्स रात में एक बार सोने से पहले")
+    assert "norflox" in result
+
+
+def test_azithromycin_no_aspirate_spelling_recovered_with_dose() -> None:
+    # This spelling's fold key is ambiguous with erythromycin under the
+    # general fuzzy tier (a real ambiguity, not a rule gap — see
+    # tests/test_incidents.py) — recovered via the curated table instead,
+    # same mechanism as the नैक्सडॉम family. Dose digit must survive.
+    result = _normalize_drug_text("एजित्रोमाइसिन 500 दिन में दो बार")
+    assert "azithromycin 500" in result

@@ -925,5 +925,6 @@ def test_drug_lexicon_precedence_wins_over_condition_set(monkeypatch) -> None:
     """
     import src.l4_extract as l4
 
-    monkeypatch.setattr(l4, "_DRUG_LEXICON_FOLDS", frozenset({"hypertension"}))
+    key = l4._fold_drug("Hypertension").replace(" ", "")
+    monkeypatch.setattr(l4, "_DRUG_LEXICON_FOLDS", frozenset({key}))
     assert l4._is_condition_term("Hypertension") is False
