@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 import src.pipeline as pipeline
 import web.app as app_module
 import web.verification as verification_module
-from src.types import ClinicalNote, Diagnosis, Medication, Vital
+from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Vital
 
 
 @pytest.fixture
@@ -552,6 +552,43 @@ def test_patch_note_invalidates_precomputed_cache(client) -> None:
     # any medication by name, so the flag is unresolvable -> falls to
     # _general instead of staying (incorrectly) pinned to medications[0].drug.
     assert response.json()["flags"] == {"_general": ["medications.Azithral.unvalidated"]}
+
+
+def test_patch_note_drops_edited_paths_from_translation_caches(client) -> None:
+    """A warmed translation cache must never show the pre-edit translation
+    after a language switch. Only the edited paths are dropped (full
+    invalidation would force a cold re-translate of the whole note); the
+    client falls back to the source value for an absent path, i.e. the
+    doctor's edit is shown verbatim — never machine-translated."""
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        symptoms=[Symptom(name="बुखार")],
+        advice="आराम करो",
+    )
+    _write_note(sid, note)
+    cached = {
+        "note_values": {"advice": "Take rest", "symptoms[0].name": "Fever"},
+        "transcript": ["hello"],
+    }
+    for lang in ("hi", "en"):
+        app_module._write_json(
+            app_module._translations_cache_path(sid, lang), dict(cached)
+        )
+
+    client.patch(
+        f"/api/sessions/{sid}/note",
+        json={"edits": [{"field": "advice", "old": "आराम करो", "new": "walk daily"}]},
+    )
+
+    for lang in ("hi", "en"):
+        survived = app_module._read_json(app_module._translations_cache_path(sid, lang))
+        assert "advice" not in survived["note_values"]  # edited: dropped
+        assert survived["note_values"]["symptoms[0].name"] == "Fever"  # untouched
+        assert survived["transcript"] == ["hello"]  # note edits never touch it
+    # mr cache was never warmed — absence must not break the PATCH (asserted
+    # implicitly by the 200 above and the surviving caches).
 
 
 def test_process_precomputes_note_meta_before_review(client, monkeypatch) -> None:

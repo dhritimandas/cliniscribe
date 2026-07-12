@@ -661,6 +661,27 @@ def patch_note(sid: str, body: PatchNoteRequest) -> dict[str, Any]:
     meta_path = _note_meta_path(sid)
     if os.path.exists(meta_path):
         os.remove(meta_path)
+    # Invalidate the edited paths in every warmed translation cache: a stale
+    # entry would keep showing the pre-edit translation after a language
+    # switch. Only the edited paths are dropped (a full-cache invalidation
+    # would force a 30s+ cold re-translate of the whole note on the next
+    # switch); an absent path falls back to the source value in the client —
+    # i.e. the doctor's edit is shown verbatim in every language view, which
+    # is the safe behavior (never machine-translate what the doctor typed).
+    edited_paths = {edit.field for edit in body.edits}
+    for lang in _SUPPORTED_LANGS:
+        cache_path = _translations_cache_path(sid, lang)
+        if not os.path.exists(cache_path):
+            continue
+        cached = _read_json(cache_path)
+        kept = {
+            path: text
+            for path, text in cached.get("note_values", {}).items()
+            if path not in edited_paths
+        }
+        if kept != cached.get("note_values"):
+            cached["note_values"] = kept
+            _write_json(cache_path, cached)
     return note_data
 
 
