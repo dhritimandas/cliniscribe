@@ -52,6 +52,7 @@ def run(
     session_id: str | None = None,
     *,
     on_stage: Callable[[str, str], None] | None = None,
+    on_progress: Callable[[float, float], None] | None = None,
 ) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
@@ -64,6 +65,10 @@ def run(
             the stage_report keys (e.g. "l3_asr"). Used by the review-frontend
             backend to mirror progress into status.json. Default None keeps
             current behavior unchanged.
+        on_progress: Optional callback passed through to L3's `transcribe()`
+            as `on_progress(done_seconds, total_seconds)`, invoked after each
+            segment decodes during L3 ASR. Used by the review-frontend backend
+            for the percent/ETA display. Default None keeps current behavior.
 
     Returns:
         Path to the generated draft prescription PDF
@@ -98,7 +103,7 @@ def run(
     segments = _staged("l2_diarize", diarize, wav_path)
 
     logger.info("L3: transcribing %d segments", len(segments))
-    turns = _staged("l3_asr", transcribe, wav_path, segments)
+    turns = _staged("l3_asr", transcribe, wav_path, segments, on_progress=on_progress)
 
     # Warm the LLM while L3.5 runs on CPU: Whisper was released inside
     # transcribe(), so only the (small) embedding model and Qwen coexist —

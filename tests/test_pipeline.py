@@ -37,7 +37,7 @@ def stubbed_stages(monkeypatch, tmp_path):
 
     monkeypatch.setattr(pipeline, "preprocess", fake_preprocess)
     monkeypatch.setattr(pipeline, "diarize", lambda wav: [Segment(0.0, 2.0, "S0")])
-    monkeypatch.setattr(pipeline, "transcribe", lambda wav, segs: [_TURN])
+    monkeypatch.setattr(pipeline, "transcribe", lambda wav, segs, on_progress=None: [_TURN])
     monkeypatch.setattr(pipeline, "normalize", lambda turns: turns)
     monkeypatch.setattr(pipeline, "extract", lambda turns: _NOTE)
     monkeypatch.setattr(pipeline, "render", fake_render)
@@ -83,3 +83,27 @@ def test_persisted_transcript_and_note_are_valid_json(stubbed_stages) -> None:
 def test_new_session_ids_are_unique() -> None:
     ids = {pipeline.new_session_id() for _ in range(50)}
     assert len(ids) == 50
+
+
+def test_run_forwards_on_progress_to_transcribe(stubbed_stages, monkeypatch) -> None:
+    """run()'s on_progress kwarg must reach transcribe() unchanged (L3 is the
+    only stage that reports real sub-stage progress; see src/l3_asr.py)."""
+    received_kwarg = {}
+
+    def fake_transcribe(wav, segs, on_progress=None):
+        received_kwarg["on_progress"] = on_progress
+        if on_progress:
+            on_progress(1.0, 2.0)
+        return [_TURN]
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+
+    events = []
+    pipeline.run(
+        "consult.mp3",
+        session_id="progress-test",
+        on_progress=lambda done, total: events.append((done, total)),
+    )
+
+    assert received_kwarg["on_progress"] is not None
+    assert events == [(1.0, 2.0)]

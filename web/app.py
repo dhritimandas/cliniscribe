@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -24,6 +25,7 @@ from pydantic import BaseModel
 from src import config, pipeline
 from src.l5_render import render
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
+from web import live_asr
 from web.provenance import flags_by_path, provenance_for_note
 from web.translations import TRANSLATIONS
 
@@ -34,6 +36,7 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 _ALLOWED_AUDIO_EXTS = {"wav", "mp3"}
 _SUPPORTED_LANGS = {"en", "hi", "mr"}
 _IST = timezone(timedelta(hours=5, minutes=30))  # tier-2/3 India clinics only
+_PROGRESS_WRITE_MIN_INTERVAL_S = 1.0  # throttle status.json progress writes
 
 _status_lock = threading.Lock()
 
@@ -172,30 +175,97 @@ async def create_session(audio: UploadFile = File(...)) -> dict[str, str]:
         _status_path(sid),
         {"state": "idle", "stage": None, "stages_done": [], "error": None},
     )
+    # A finished recording is uploaded here — the live-preview model (if it
+    # was loaded during recording) is no longer needed; release it before
+    # the production faster-whisper (L3) or Ollama (L4) models load, so the
+    # load-one-release-one memory discipline holds at its peak.
+    live_asr.release_model()
     return {"session_id": sid}
 
 
+# ── POST /api/live/preview ────────────────────────────────────────────────
+@app.post("/api/live/preview")
+def live_preview(audio: UploadFile = File(...)) -> dict[str, str]:
+    """UI-DISPLAY-ONLY transcription preview of the recorded-so-far audio.
+
+    Clinical-safety contract (see web/live_asr.py): this text is never used
+    by L4 and never lands in note.json. Not session-scoped — capture happens
+    before a session exists. Debounced: an overlapping call while one is
+    already in flight is rejected with 429 so the SPA's ~10s polling can
+    never stack concurrent mlx-whisper decodes.
+
+    A plain (non-async) route: mlx-whisper's decode is a blocking, CPU/GPU-
+    bound call — declaring this `async def` and calling it directly would
+    block the single event loop for the whole decode (9-15s), stalling every
+    other request (including status polling for a session already
+    processing). FastAPI runs plain `def` routes in its threadpool, so this
+    call runs on a worker thread instead.
+    """
+    if not live_asr.available():
+        raise HTTPException(status_code=503, detail="Live preview unavailable")
+    if not live_asr.try_acquire():
+        raise HTTPException(status_code=429, detail="Preview already in progress")
+    try:
+        text = live_asr.transcribe_preview(audio.file.read())
+    finally:
+        live_asr.release()
+    return {"text": text}
+
+
 # ── POST /api/sessions/{sid}/process ─────────────────────────────────────
-def _make_on_stage(sid: str):
+def _make_progress_callbacks(sid: str):
+    """Build the on_stage/on_progress pair pipeline.run uses to mirror L3
+    transcription progress into status.json.
+
+    Both callbacks share one `l3_start` timestamp (set by on_stage when
+    "l3_asr" starts) so on_progress can compute `eta_seconds = elapsed_l3 *
+    (1 - progress) / progress`. on_stage clears "progress"/"eta_seconds" from
+    status.json when "l3_asr" ends, so the SPA's percent/ETA suffix
+    disappears the moment the stage completes.
+    """
+    shared: dict[str, float | None] = {"l3_start": None, "last_write": 0.0}
+
     def on_stage(name: str, event: str) -> None:
         with _status_lock:
             status = _read_json(_status_path(sid))
             if event == "start":
                 status["state"] = "processing"
                 status["stage"] = name
+                if name == "l3_asr":
+                    shared["l3_start"] = time.monotonic()
             elif event == "end":
                 done = status.get("stages_done", [])
                 if name not in done:
                     done.append(name)
                 status["stages_done"] = done
+                if name == "l3_asr":
+                    status.pop("progress", None)
+                    status.pop("eta_seconds", None)
             _write_json(_status_path(sid), status)
 
-    return on_stage
+    def on_progress(done_seconds: float, total_seconds: float) -> None:
+        now = time.monotonic()
+        if now - shared["last_write"] < _PROGRESS_WRITE_MIN_INTERVAL_S:
+            return
+        shared["last_write"] = now
+        progress = done_seconds / total_seconds if total_seconds > 0 else 0.0
+        eta_seconds = None
+        if progress > 0 and shared["l3_start"] is not None:
+            elapsed_l3 = now - shared["l3_start"]
+            eta_seconds = round(elapsed_l3 * (1 - progress) / progress, 1)
+        with _status_lock:
+            status = _read_json(_status_path(sid))
+            status["progress"] = round(progress, 4)
+            status["eta_seconds"] = eta_seconds
+            _write_json(_status_path(sid), status)
+
+    return on_stage, on_progress
 
 
 def _run_pipeline_thread(sid: str, in_path: str) -> None:
+    on_stage, on_progress = _make_progress_callbacks(sid)
     try:
-        pipeline.run(in_path, session_id=sid, on_stage=_make_on_stage(sid))
+        pipeline.run(in_path, session_id=sid, on_stage=on_stage, on_progress=on_progress)
         with _status_lock:
             status = _read_json(_status_path(sid))
             status.update(state="review", stage=None, error=None)
