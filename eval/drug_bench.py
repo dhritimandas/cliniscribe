@@ -22,14 +22,13 @@ Run:  PYTHONPATH=. python eval/drug_bench.py           # asr (resumable) + score
 import json
 import logging
 import os
-import re
 import tempfile
-import unicodedata
 
 from dotenv import load_dotenv
 
 from eval.metrics import keyword_hits
 from eval.run_eval import _keywords_from_entities
+from src.drug_lexicon import _fold
 from src.l1_preprocess import preprocess
 from src.l2_diarize import diarize
 from src.l3_asr import transcribe
@@ -104,31 +103,13 @@ def run_asr(
 # Gold labels and hypotheses mix scripts and spacing for the SAME drug:
 # gold 'तेंडोलाईफ' vs hyp 'टेंडो लाइफ'; gold 'एंटीबायोटिक्स' vs hyp 'antibiotics'.
 # The ASR captured the drug — a script/spacing-blind scorer must not call it a
-# miss. Fold = coarse Devanagari→Latin + lowercase + drop non-alnum; matching
-# is EXACT equality of despaced folds over hypothesis token windows. No fuzzy
-# matching here: fuzz is how the substring false-positive bug class returns.
-_FOLD_MAP = {
-    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
-    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
-    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
-    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
-    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
-    "ज़": "z", "फ़": "f", "ा": "a", "ि": "i", "ी": "i", "ु": "u",
-    "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
-    "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
-    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
-    # Candra vowels + vocalic r + candrabindu/visarga — mirrors the same
-    # addition in src/drug_lexicon.py and src/l4_extract.py; see
-    # tests/test_fold_parity.py.
-    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
-}
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
-
-
-def _fold(text: str) -> str:
-    """Coarse phonetic fold: Devanagari→Latin, lowercase, alnum+space only."""
-    folded = "".join(_FOLD_MAP.get(ch, ch) for ch in unicodedata.normalize("NFC", text))
-    return _NON_ALNUM_RE.sub("", folded.lower())
+# miss. Fold is imported from src/drug_lexicon.py (single shared
+# implementation — see that module and tests/test_fold_parity.py) rather
+# than hand-copied here; this scorer's own copy previously had no क्स/क्श
+# digraph handling and no Latin-orthography step, a pre-existing gap the
+# unification closes as a side effect. Matching is EXACT equality of
+# despaced folds over hypothesis token windows. No fuzzy matching here: fuzz
+# is how the substring false-positive bug class returns.
 
 
 def _folded_match(gold: str, hyp: str) -> bool:

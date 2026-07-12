@@ -4,12 +4,11 @@ import difflib
 import json
 import logging
 import re
-import unicodedata
 
 from src import config
 from src.cdsco import validate_drug
 from src.concepts import CONCEPTS
-from src.drug_lexicon import DRUG_LEXICON, canonicalize_drug_span
+from src.drug_lexicon import DRUG_LEXICON, _fold, canonicalize_drug_span
 from src.l3_5_normalize import _DEVA_CURATED, _LATIN_CURATED
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
 
@@ -175,41 +174,22 @@ def _diagnosis_has_overlap(term: str, transcript_tokens: set[str]) -> bool:
 # that was actually said in the transcript, so there is no wrong-drug
 # substitution risk the way there would be with a fuzzy drug-list match.
 
-# Adapted from eval/drug_bench.py's _fold (reimplemented here, not imported —
-# eval/ and src/ are separate module boundaries). "क्स"/"क्श" are common
-# Devanagari digraphs for the English "x" sound in loanwords (टैक्स, बॉक्स,
-# एक्स-रे); folded to "x" before the per-character pass, since the
-# per-character map alone renders them as "ks", which folds far from the
-# Latin spelling of names that use "x".
-_DRUG_FOLD_DIGRAPHS: tuple[tuple[str, str], ...] = (("क्स", "x"), ("क्श", "x"))
-_DRUG_FOLD_MAP: dict[str, str] = {
-    "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
-    "ज": "j", "झ": "jh", "ट": "t", "ठ": "th", "ड": "d", "ढ": "dh",
-    "त": "t", "थ": "th", "द": "d", "ध": "dh", "न": "n", "प": "p",
-    "फ": "f", "ब": "b", "भ": "bh", "म": "m", "य": "y", "र": "r",
-    "ल": "l", "व": "v", "श": "sh", "ष": "sh", "स": "s", "ह": "h",
-    "ज़": "z", "फ़": "f", "ा": "a", "ि": "i", "ी": "i", "ु": "u",
-    "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
-    "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
-    "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
-    # Candra vowels + vocalic r + candrabindu/visarga — see src/drug_lexicon.py's
-    # _FOLD_MAP for the same addition and tests/test_fold_parity.py for the
-    # cross-implementation parity guard.
-    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
-}
-_DRUG_FOLD_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
+# Fold is imported from src/drug_lexicon.py (single shared implementation —
+# see that module's "THE single Devanagari/Latin phonetic key" section and
+# tests/test_fold_parity.py). Previously reimplemented here with its own
+# digraph/character map and no Latin-orthography step; unifying is a
+# BLOCKER, not a style preference: _isolate_drug_span (below) can replace a
+# Devanagari drug name with its canonical Latin spelling BEFORE the
+# grounding guard runs, and the guard folds that canonical against the
+# still-Devanagari transcript to check it — with two different folds, a
+# correctly-resolved real drug (e.g. azithromycin) could fold far enough
+# from its own Devanagari transcript mention to be wrongly converted to an
+# "unnamed medication" row, reintroducing the exact failure this guard
+# exists to prevent.
+_fold_drug = _fold
 _DRUG_WINDOW_SIZES: tuple[int, ...] = (1, 2, 3, 4)
 _DRUG_RESTORE_MIN_SIMILARITY = 0.80
 _ROLE_TAG_RE = re.compile(r"\[(?:DOCTOR|PATIENT|UNKNOWN)\]:\s*")
-
-
-def _fold_drug(text: str) -> str:
-    """Coarse phonetic fold: Devanagari→Latin, lowercase, alnum+space only."""
-    text = unicodedata.normalize("NFC", text)
-    for digraph, latin in _DRUG_FOLD_DIGRAPHS:
-        text = text.replace(digraph, latin)
-    folded = "".join(_DRUG_FOLD_MAP.get(ch, ch) for ch in text)
-    return _DRUG_FOLD_NON_ALNUM_RE.sub("", folded.lower())
 
 
 def _transcript_word_windows(transcript: str) -> list[str]:
@@ -292,22 +272,28 @@ def _strip_filler_edges(tokens: list[str]) -> list[str]:
     return tokens[start:end]
 
 
-def _resolve_known_drug_name(name_span: str) -> str | None:
+def _resolve_known_drug_name(name_span: str) -> tuple[str, bool] | None:
     """Read-only drug recognition: curated table -> expanded lexicon -> CDSCO.
 
     Same three tiers L3.5's drug pass uses (src/l3_5_normalize.py), reused
     here only to ANSWER "does this span name a known drug" — never to
     re-spell a drug name L4 itself extracted (rule 12 forbids that); callers
     decide what to do with a hit.
+
+    Returns:
+        (canonical_name, is_fuzzy) — is_fuzzy is True only for a lexicon
+        match below 1.0 confidence (the curated table and CDSCO-exact tiers
+        are never fuzzy); None if `name_span` names no known drug.
     """
     curated = _DEVA_CURATED.get(name_span) or _LATIN_CURATED.get(name_span.lower())
     if curated:
-        return curated
+        return curated, False
     lexicon_hit = canonicalize_drug_span(name_span)
     if lexicon_hit is not None:
-        return lexicon_hit[0]
+        canonical, confidence = lexicon_hit
+        return canonical, confidence < 1.0
     if validate_drug(name_span):
-        return name_span
+        return name_span, False
     return None
 
 
@@ -321,7 +307,7 @@ def _names_a_known_drug(text: str) -> bool:
     return _resolve_known_drug_name(" ".join(name_tokens)) is not None
 
 
-def _isolate_drug_span(drug: str) -> str:
+def _isolate_drug_span(drug: str) -> tuple[str, bool]:
     """Trim filler-word glue around a drug name, only when an inner match exists.
 
     Strips leading/trailing filler tokens, then resolves the remaining
@@ -329,25 +315,73 @@ def _isolate_drug_span(drug: str) -> str:
     resolved canonical name plus any digit tokens from the trimmed span (dose
     survives). On no hit — either nothing to strip, or the inner span doesn't
     resolve either — returns `drug` unchanged.
+
+    Returns:
+        (drug_or_canonical, is_fuzzy) — is_fuzzy is always False when no trim
+        happened (first element equals the input); see
+        _resolve_known_drug_name for what makes a hit fuzzy.
     """
     tokens = drug.split()
     if len(tokens) <= 1:
-        return drug
+        return drug, False
 
     core = _strip_filler_edges(tokens)
     if core == tokens:
-        return drug  # no filler at either edge -- nothing to isolate
+        return drug, False  # no filler at either edge -- nothing to isolate
 
     name_tokens = [t for t in core if not t.isdigit()]
     digit_tokens = [t for t in core if t.isdigit()]
     if not name_tokens:
-        return drug
+        return drug, False
 
-    canonical = _resolve_known_drug_name(" ".join(name_tokens))
-    if canonical is None:
-        return drug  # inner span doesn't resolve either -- never truncate
+    resolved = _resolve_known_drug_name(" ".join(name_tokens))
+    if resolved is None:
+        return drug, False  # inner span doesn't resolve either -- never truncate
 
-    return " ".join([canonical, *digit_tokens]) if digit_tokens else canonical
+    canonical, is_fuzzy = resolved
+    result = " ".join([canonical, *digit_tokens]) if digit_tokens else canonical
+    return result, is_fuzzy
+
+
+# ── Canonical-Latin display precedence (real incident, outputs/
+# 20260712-194649-763e13, 2026-07-12) ───────────────────────────────────────
+# The doctor prescribed azithromycin and norflox; the transcript (and the
+# LLM's rule-12-compliant verbatim copy) stayed Devanagari — "एजित्रोमाइसिन
+# 500", "नौरफलोक्स" — so both stayed unvalidated Devanagari on the printed
+# Rx instead of the canonical Latin name a pharmacist reads off CDSCO. Fixed
+# here: once a drug name has passed every guard above (generic-term,
+# condition, span isolation, grounding), if it resolves to a known drug the
+# NOTE DISPLAYS the canonical Latin spelling — transcript spelling remains
+# the display form only when nothing resolves. CDSCO `validated` is checked
+# against this same canonical name (see the medications-loop call site).
+def _canonical_drug_display(drug: str) -> tuple[str, bool] | None:
+    """Resolve `drug` to its canonical Latin display name, preserving dose.
+
+    Args:
+        drug: An accepted drug string (post restore/isolate/grounding),
+            Devanagari, Latin, or mixed, optionally with dose digit tokens
+            glued on (e.g. "एजित्रोमाइसिन 500").
+
+    Returns:
+        (display, is_fuzzy) if `drug` resolves to a known drug — is_fuzzy
+        True only for a lexicon match below 1.0 confidence (see
+        _resolve_known_drug_name). display carries every digit token
+        already present in `drug` (dose is never dropped). None if `drug`
+        does not resolve to a known drug at all — the caller then leaves
+        the transcript spelling as-is.
+    """
+    tokens = drug.split()
+    name_tokens = [t for t in tokens if not t.isdigit()]
+    digit_tokens = [t for t in tokens if t.isdigit()]
+    if not name_tokens:
+        return None
+    resolved = _resolve_known_drug_name(" ".join(name_tokens))
+    if resolved is None:
+        return None
+    canonical, is_fuzzy = resolved
+    missing_digits = [d for d in digit_tokens if d not in canonical]
+    display = " ".join([canonical, *missing_digits]) if missing_digits else canonical
+    return display, is_fuzzy
 
 
 # ── Condition guard (spurious medication-row backstop) ─────────────────────
@@ -663,20 +697,25 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                     drug, restored,
                 )
                 drug = restored
-            isolated = _isolate_drug_span(drug)
-            if isolated != drug:
+            isolated, isolated_fuzzy = _isolate_drug_span(drug)
+            isolated_by_span = isolated != drug
+            if isolated_by_span:
                 logger.info(
                     "L4: isolated drug span %r -> %r (filler-glue backstop)",
                     drug, isolated,
                 )
                 drug = isolated
+            fuzzy_canonical = isolated_fuzzy if isolated_by_span else False
             # Grounding guard: an invented drug name matches nothing in the
             # transcript, however loosely. _restore_drug_spelling only fixes
             # MIS-spellings of something actually said — a full invention
             # (real case: LLM fabricated "nasal spray" out of thin air) has
             # no transcript source to restore from, so it must never render
             # as a real drug name. Skipped when transcript is empty (tests/
-            # eval call _build_note without one).
+            # eval call _build_note without one). Runs BEFORE canonical-Latin
+            # display below so it always compares the as-extracted name
+            # against the transcript, never a canonical substitution against
+            # a still-Devanagari transcript (see that section's docstring).
             if transcript_words:
                 _, _, ground_ratio = _best_fold_match(drug, transcript_words)
                 if ground_ratio < _DRUG_GROUND_MIN_SIMILARITY:
@@ -691,6 +730,25 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                     if flag not in low_conf:
                         low_conf.append(flag)
                     drug = label
+                    fuzzy_canonical = False
+            # Canonical-Latin display: _isolate_drug_span already resolved
+            # its own trim path above (isolated_by_span) — skip re-resolving
+            # here so a name is never canonicalized twice. Otherwise, this is
+            # the first and only canonicalization attempt for this row.
+            if not isolated_by_span and not drug.startswith("unnamed medication"):
+                display = _canonical_drug_display(drug)
+                if display is not None:
+                    canonical, is_fuzzy = display
+                    if canonical != drug:
+                        logger.info(
+                            "L4: canonical display %r -> %r", drug, canonical
+                        )
+                        drug = canonical
+                    fuzzy_canonical = is_fuzzy
+            if fuzzy_canonical:
+                flag = f"medications.{drug}.canonicalized_fuzzy"
+                if flag not in low_conf:
+                    low_conf.append(flag)
         medications.append(
             Medication(
                 drug=drug,

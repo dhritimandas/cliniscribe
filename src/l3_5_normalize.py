@@ -70,6 +70,16 @@ _DEVA_CURATED: dict[str, str] = {
     "मेट्रोनिडाज़ोल": "metronidazole",
     "एजिथ्रोमाइसिन": "azithromycin",
     "एजिथ्रोमायसिन": "azithromycin",
+    # No-aspirate ASR spelling (missing थ AND the ज़ nukta) — real incident,
+    # outputs/20260712-194649-763e13, 2026-07-12. The expanded-lexicon fold
+    # tier (src/drug_lexicon.py) cannot recover this one safely: its fold
+    # key sits within the fuzzy bound of BOTH azithromycin and erythromycin
+    # (two genuinely distinct antibiotics), a real ambiguity from the missing
+    # nukta/aspirate, not a rule gap — canonicalize_drug_span() correctly
+    # returns None rather than guess. Curated here instead, the same
+    # zero-risk mechanism the नैक्सडॉम spelling family already uses for a
+    # known, seen distortion.
+    "एजित्रोमाइसिन": "azithromycin",
     "एमोक्सिसिलिन": "amoxicillin",
     "अमोक्सिसिलिन": "amoxicillin",
     "आइबुप्रोफेन": "ibuprofen",
