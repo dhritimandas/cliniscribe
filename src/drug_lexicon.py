@@ -185,15 +185,19 @@ _ADDITIONAL_DRUGS: frozenset[str] = frozenset().union(*(c[1] for c in _CATEGORIE
 DRUG_LEXICON: frozenset[str] = _APPROVED_DRUGS | _ADDITIONAL_DRUGS
 
 
-# ── Fold: coarse Devanagari→Latin phonetic key, shared by both scripts ──────
-# Adapted from the _fold_drug approach in src/l4_extract.py (same digraph
-# handling for the क्स/क्श → x loanword sound), extended with the
-# _normalize_roman-style collapses from src/l3_5_normalize.py (aa/ii/uu →
-# single vowel, doubled-consonant collapse, ph → f) so Devanagari-origin and
-# Latin-origin spans land in the SAME fold-key space and one index serves
-# both. Matras and nukta are already erased by the character map (short/long
-# vowel signs collapse to the same Latin vowel; nukta consonants like ज़/फ़
-# map straight to z/f).
+# ── Fold: THE single Devanagari/Latin phonetic key, shared by every module ──
+# src/l4_extract.py, src/l3_5_normalize.py (via canonicalize_drug_span) and
+# eval/drug_bench.py's scorer all import _fold from here — see
+# tests/test_fold_parity.py. Previously each had its own hand-copied fold:
+# l4_extract's and drug_bench's kept spaces (needed for word-window
+# comparisons) and had no Latin-orthography step; this module's despaced its
+# output and applied a partial orthography pass (ph->f, aa/ii/uu collapse,
+# double-consonant collapse) that the other two lacked. Unified here: _fold
+# keeps spaces (a despaced dict key is `_fold(text).replace(" ", "")`, done
+# at the two call sites below) and every caller gets the same
+# _apply_orthography pass. Matras and nukta are already erased by the
+# character map (short/long vowel signs collapse to the same Latin vowel;
+# nukta consonants like ज़/फ़ map straight to z/f).
 _FOLD_DIGRAPHS: tuple[tuple[str, str], ...] = (("क्स", "x"), ("क्श", "x"))
 _FOLD_MAP: dict[str, str] = {
     "क": "k", "ख": "kh", "ग": "g", "घ": "gh", "च": "ch", "छ": "chh",
@@ -205,30 +209,108 @@ _FOLD_MAP: dict[str, str] = {
     "ू": "u", "े": "e", "ै": "ai", "ो": "o", "ौ": "au", "ं": "n",
     "अ": "a", "आ": "aa", "इ": "i", "ई": "i", "उ": "u", "ऊ": "u",
     "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au", "्": "",
+    # Candra vowels + vocalic r + candrabindu/visarga — absent from the
+    # original map, which let ASR spellings using them (e.g. नैक्स्टॉम with
+    # candra-o ॉ) escape every drug-normalization tier. See LEARNINGS.md /
+    # tests/test_fold_parity.py.
+    "ॉ": "o", "ॅ": "e", "ृ": "ri", "ऑ": "o", "ऍ": "e", "ँ": "n", "ः": "",
 }
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]")  # despaced: space is not kept either
-_DOUBLE_CONSONANT_RE = re.compile(r"([bcdfghjklmnpqrstvwxyz])\1")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")  # space kept — see _fold docstring
 _DIGIT_TOKEN_RE = re.compile(r"^\d+$")
+
+# ── Latin-orthography phonetic normalization (Part 1) ───────────────────────
+# Applied AFTER the Devanagari->Latin map, to every fold regardless of
+# script origin, so an English drug spelling and a Devanagari transcription
+# of the same drug land on the same key. Real incident (outputs/
+# 20260712-194649-763e13): नौरफलोक्स and एजित्रोमाइसिन both folded to a key
+# with no relationship to "norflox"/"azithromycin" because English drug
+# names keep English orthography (x never becomes the /ks/ it sounds like;
+# th/ph/ch never collapse to their plain-stop sound; c is sometimes /s/,
+# sometimes /k/) while the Devanagari map already spells sounds phonetically.
+_ORTH_TWO_CHAR: dict[str, str] = {"th": "t", "ph": "f", "ch": "k"}
+_ORTH_C_SOFT_TRIGGERS: frozenset[str] = frozenset("eiy")
+_DOUBLE_LETTER_RE = re.compile(r"([a-z])\1+")
+
+
+def _apply_orthography(folded: str) -> str:
+    """Latin-orthography rules, applied to an already Devanagari->Latin
+    mapped, lowercased, alnum+space string (see _fold).
+
+    Rules (data-driven off the real incident above; see
+    tests/test_incidents.py for the gate each one closes):
+      - th/ph/ch -> t/f/k: this is about *English* th/ph/ch digraphs (as in
+        "azithromycin", "pharma", "cheston") collapsing to their plain-stop
+        sound — a separate concern from ठ/थ/फ/च, which the character map
+        above already folds to single Latin letters on the Devanagari side.
+      - x -> ks: matches the क्स/क्श digraph's own "x" output (_FOLD_DIGRAPHS
+        above) — so an English "norflox" and a Devanagari "...लोक्स" spelling
+        land on the same key instead of one keeping "x" and the other never
+        having it.
+      - c -> s before e/i/y, else c -> k (English's soft/hard c).
+      - y -> ai: a stressed English "y" spells the /aɪ/ diphthong Devanagari
+        writes out as ा+ि/ी (e.g. "-mycin"/"gly-" ~ माइ/ग्लाइ, as in
+        azithromycin/glycomet). A plain y -> i underslices this diphthong by
+        one letter and misses the match entirely — see the
+        एजित्रोमाइसिन/azithromycin gate in tests/test_incidents.py, which a
+        y -> i rule fails (edit distance 3, over the length-9 fuzzy bound)
+        while y -> ai passes (edit distance 2).
+      - collapse any run of a repeated letter to one — generalizes the prior
+        aa/ii/uu vowel-length collapse and doubled-consonant collapse into
+        one rule.
+
+    Args:
+        folded: Devanagari->Latin mapped, lowercased, alnum+space text.
+
+    Returns:
+        The same text with the rules above applied.
+    """
+    out: list[str] = []
+    i, n = 0, len(folded)
+    while i < n:
+        two_char = _ORTH_TWO_CHAR.get(folded[i : i + 2])
+        if two_char is not None:
+            out.append(two_char)
+            i += 2
+            continue
+        ch = folded[i]
+        if ch == "x":
+            out.append("ks")
+        elif ch == "c":
+            nxt = folded[i + 1] if i + 1 < n else ""
+            # A "c" that is its OWN token (e.g. "vitamin c") is a spoken
+            # letter name ("see", soft) — not a word-final hard c as in
+            # "clinic"/"generic". Without this, "vitamin c" and "vitamin k"
+            # fold to the identical key "vitamink" (a real exact collision
+            # between two distinct drugs — see tests/test_drug_lexicon.py).
+            is_lone_token = (
+                (i == 0 or folded[i - 1] == " ") and (i + 1 == n or nxt == " ")
+            )
+            soft = is_lone_token or nxt in _ORTH_C_SOFT_TRIGGERS
+            out.append("s" if soft else "k")
+        else:
+            out.append(ch)
+        i += 1
+    return _DOUBLE_LETTER_RE.sub(r"\1", "".join(out).replace("y", "ai"))
 
 
 def _fold(text: str) -> str:
-    """Coarse phonetic fold to a despaced Latin key.
+    """Coarse phonetic fold to a Latin key (space-preserving).
 
     Args:
         text: A drug-name span, Devanagari, Latin, or mixed.
 
     Returns:
-        Lowercase alnum-only string with no spaces — the fold key.
+        Lowercase alnum+space string — the fold key. Callers needing a
+        despaced dictionary key call `_fold(text).replace(" ", "")`;
+        word-window fuzzy-match callers (src/l4_extract.py,
+        eval/drug_bench.py) need the spaces to keep token boundaries.
     """
     text = unicodedata.normalize("NFC", text)
     for digraph, latin in _FOLD_DIGRAPHS:
         text = text.replace(digraph, latin)
     folded = "".join(_FOLD_MAP.get(ch, ch) for ch in text).lower()
     folded = _NON_ALNUM_RE.sub("", folded)
-    folded = folded.replace("ph", "f")
-    folded = folded.replace("aa", "a").replace("ii", "i").replace("uu", "u")
-    folded = _DOUBLE_CONSONANT_RE.sub(r"\1", folded)
-    return folded
+    return _apply_orthography(folded)
 
 
 # Fold-key index: fold_key -> set of canonical drugs sharing that exact key.
@@ -237,7 +319,7 @@ def _fold(text: str) -> str:
 # collision, rather than picking one arbitrarily.
 _FOLD_INDEX: dict[str, set[str]] = {}
 for _drug in DRUG_LEXICON:
-    _key = _fold(_drug)
+    _key = _fold(_drug).replace(" ", "")
     if not _key:
         continue
     _FOLD_INDEX.setdefault(_key, set()).add(_drug)
@@ -261,6 +343,16 @@ def _distance_bound(key_len: int) -> int | None:
     gold drug). Wrong drug is worse than unknown, so the shorter tier is
     dropped rather than patched with a per-word denylist — a denylist is
     exactly the reactive per-variant growth this module replaces.
+
+    Re-derived (not just re-run) for the Latin-orthography fold (see
+    _apply_orthography): re-shortening rules (th->t, ph->f, ch->k, doubled-
+    letter collapse) and re-lengthening ones (x->ks, y->ai) shift the
+    546-entry lexicon's key-length distribution modestly (entries below the
+    floor: 234 -> 217; at/above: 312 -> 329) but do not change its shape,
+    and every dangerous short probe (the three false positives above, plus
+    the 107-word EVERYDAY_WORDS list and the 46-word Latin drug-span
+    stopword list) still folds well below 9 characters. 9 remains the
+    right floor; see tests/test_incidents.py and tests/test_drug_lexicon.py.
     """
     if key_len < 9:
         return None
@@ -316,7 +408,7 @@ def canonicalize_drug_span(text: str) -> tuple[str, float] | None:
     tokens = [t for t in text.split() if not _DIGIT_TOKEN_RE.match(t)]
     if not tokens:
         return None
-    key = _fold(" ".join(tokens))
+    key = _fold(" ".join(tokens)).replace(" ", "")
     if not key:
         return None
 

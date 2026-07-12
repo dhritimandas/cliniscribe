@@ -38,6 +38,62 @@ class Concept:
     hard_negatives: list[str] = field(default_factory=list)
 
 
+# ── Everyday-word guard (concept-matcher hardening, mirrors the drug
+# matcher's near-collision discipline) ──────────────────────────────────────
+# A curated set of common Hindi/English conversation words that can NEVER be
+# glossed as a clinical concept, regardless of embedding similarity — the
+# categorical counterpart to the drug matcher's length-floor rule (some spans
+# live in "crowded" everyday-word space where similarity alone is not a safe
+# signal). Scoped to five closed classes: time words, numbers/quantifiers,
+# function/filler words, common verbs, and kinship/person words — NOT the
+# concept-adjacent nouns already covered by per-concept hard_negatives
+# (दवा, दाल, पेड़, कमरा, दान, कब्र, नाच, पेशा, भूल, सांप — see the audit in
+# commit 26c42ea), which is a different collision class with a different
+# fix (a margin test against a specific concept, not a blanket ban).
+#
+# Deliberately Devanagari + English only (no romanized-Hindi tier): keeps the
+# list close to the ~60-100 entry target while covering the two scripts our
+# ASR actually emits (config.py: "we only support hi/en/mr ... all Latin or
+# Devanagari"). Romanized-Hindi fillers ("subah", "aaj") are a known residual
+# gap, mitigated (not eliminated) by the higher unigram bar and the
+# hard-negative margin gate — not by this list.
+#
+# Runtime rule: if a concept legitimately lists one of these words as a
+# variant, the variant listing wins (see EVERYDAY_WORDS below, which removes
+# any such overlap at import time). Checked empirically: zero of the ~110
+# single-word CONCEPTS variants collide with this list (see
+# tests/test_concept_guard.py::test_everyday_words_documented_variant_overlap).
+_TIME_WORDS: frozenset[str] = frozenset({
+    "हफ्ता", "हफ्ते", "हफते", "हफ़्ते", "दिन", "रात", "सुबह", "शाम", "कल",
+    "आज", "साल", "महीना", "महीने",
+    "week", "weeks", "day", "days", "night", "morning", "evening",
+    "tomorrow", "yesterday", "today", "year", "month", "months",
+})
+_NUMBER_WORDS: frozenset[str] = frozenset({
+    "एक", "दो", "तीन", "चार", "पांच", "दस", "बार", "थोड़ा", "ज्यादा", "कम",
+    "one", "two", "three", "four", "five", "more", "less", "little",
+    "times", "again",
+})
+_FILLER_WORDS: frozenset[str] = frozenset({
+    "और", "तो", "हाँ", "हां", "नहीं", "है", "हैं", "था", "थी", "थे", "भी",
+    "ही", "जी",
+    "okay", "ok", "yes", "no", "please", "uh", "um",
+})
+_VERB_WORDS: frozenset[str] = frozenset({
+    "खाना", "खाओ", "लेना", "लो", "करना", "करो", "जाना", "जाओ", "पीना",
+    "सोना", "आना", "देना",
+    "take", "eat", "do", "go", "drink", "sleep", "give", "come",
+})
+_KINSHIP_WORDS: frozenset[str] = frozenset({
+    "डॉक्टर", "भाई", "बेटा", "बेटी", "माँ", "पापा", "पत्नी", "पति", "बहन",
+    "doctor", "patient", "brother", "sister", "mother", "father", "wife",
+    "husband", "son", "daughter", "sir", "madam",
+})
+_EVERYDAY_WORDS_CURATED: frozenset[str] = (
+    _TIME_WORDS | _NUMBER_WORDS | _FILLER_WORDS | _VERB_WORDS | _KINSHIP_WORDS
+)
+
+
 CONCEPTS: list[Concept] = [
     # ── Chronic / metabolic ──────────────────────────────────────────────────
     Concept(
@@ -75,6 +131,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "emotional pain", "painful memory", "heartbreak", "pain in the neck",
+            # Audit (2026-07-12): "rain" is one edit from the "pain" variant —
+            # monsoon small talk is common in Indian clinic conversation.
+            "rain", "it is raining",
         ],
     ),
     Concept(
@@ -110,6 +169,8 @@ CONCEPTS: list[Concept] = [
         hard_negatives=[
             "cold water", "cold weather", "cold drink", "feeling cold",
             "ice cold", "it's cold outside", "thanda pani",
+            # Audit (2026-07-12): "gold" is one edit from the "cold" variant.
+            "gold", "gold price", "gold jewellery",
         ],
     ),
     Concept(
@@ -200,6 +261,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "urine test result normal",
+            # Audit (2026-07-12): पेशा ("occupation/profession") is one edit
+            # from पेशाब ("urine") — a doctor's own history-taking question
+            # ("आपका पेशा क्या है?") could risk collision.
+            "पेशा", "आपका पेशा क्या है",
         ],
     ),
     Concept(
@@ -212,6 +277,10 @@ CONCEPTS: list[Concept] = [
         hard_negatives=[
             "skin care routine", "face wash", "skin cream", "moisturizer",
             "rash decision",
+            # Audit (2026-07-12): दान ("donation") is one edit from the दाने
+            # variant; "cash" is one edit from the "rash" variant (cash
+            # payment talk is routine in an Indian clinic visit).
+            "दान", "दान देना", "cash", "cash payment",
         ],
     ),
     Concept(
@@ -223,6 +292,16 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "fungal growth on bread", "mold", "mushroom",
+            # Audit (2026-07-12): दाल ("lentils") is one edit from दाद
+            # (ringworm) — one of the most common everyday food words.
+            "दाल", "दाल चावल",
+            # Concept Matcher Rebuild audit (2026-07-12, programmatic one-edit
+            # scan, tests/test_concept_guard.py): दान ("donation") is ALSO one
+            # edit from दाद — missed by the original manual audit in commit
+            # 26c42ea, which only checked common everyday NOUNS by hand;
+            # दान was already flagged as a Skin Rash hard negative (दाने
+            # collision) but never cross-checked against Fungal Infection.
+            "दान", "दान देना", "रक्तदान",
         ],
     ),
     Concept(
@@ -234,6 +313,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "perfume allergy test", "food allergy",
+            # Audit (2026-07-12): नाच ("dance") is one edit from the नाक
+            # ("nose") root of the "नाक बहना" variant.
+            "नाच", "नाच गाना",
         ],
     ),
     Concept(
@@ -267,6 +349,15 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "short on time", "run out of breath after exercise",
+            # Real incident (outputs/<session>, 2026-07-12): "एक हफते के लिए"
+            # ("for one week") was glossed "(Shortness of Breath)" — हफ्ते
+            # ("week") is one edit from हांफते ("huffing/panting", a genuine
+            # near-synonym of this concept), so the embedding model conflated
+            # them. All common spellings guarded, not just the one that fired.
+            "हफ्ता", "हफ्ते", "हफते", "हफ़्ते",
+            # Audit bonus (same one-edit-collision class): सांप ("snake") is
+            # one edit from सांस ("breath"), a listed variant.
+            "सांप",
         ],
     ),
     Concept(
@@ -278,6 +369,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "constipated bureaucracy", "system is constipated",
+            # Audit (2026-07-12): कब्र ("grave") is one edit from कब्ज
+            # (constipation) — a common word in family-history/bereavement talk.
+            "कब्र", "कब्र में",
         ],
     ),
     Concept(
@@ -302,6 +396,9 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "stomach for adventure", "can't stomach this",
+            # Audit (2026-07-12): पेड़ ("tree") is one edit from पेट
+            # ("stomach"), a listed variant.
+            "पेड़", "पेड़ के नीचे",
         ],
     ),
     Concept(
@@ -314,6 +411,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "back to work", "back of the room",
+            # Audit (2026-07-12): कमरा ("room") is one edit from कमर
+            # ("waist/lower back") — a very common word in clinic instructions
+            # ("मरीज़ को कमरे में ले जाओ").
+            "कमरा", "कमरे में जाओ",
         ],
     ),
     Concept(
@@ -326,6 +427,10 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "asthmatic performance", "short of breath after running",
+            # Audit (2026-07-12): दवा ("medicine") is one edit from दमा
+            # (asthma) — दवा is one of the highest-frequency words in ANY
+            # consultation, making this the highest-risk finding of the audit.
+            "दवा", "दवा लो", "दवा खाओ",
         ],
     ),
     Concept(
@@ -360,6 +465,26 @@ CONCEPTS: list[Concept] = [
         ],
         hard_negatives=[
             "appetite for success", "no appetite for risk",
+            # Audit (2026-07-12): भूल ("forgot/mistake") is one edit from भूख
+            # ("hunger"), a listed variant.
+            "भूल", "मैं भूल गया",
         ],
     ),
 ]
+
+
+def _all_variant_strings_lower() -> frozenset[str]:
+    """Every CONCEPTS variant string, lower-cased, any span length.
+
+    Used only to strip everyday-word/variant overlaps at import time — see
+    EVERYDAY_WORDS below. Multi-word variants are included too so a variant
+    listing wins even if (hypothetically) it matched a guard entry exactly.
+    """
+    return frozenset(v.lower() for c in CONCEPTS for v in c.variants)
+
+
+# The runtime guard set: curated everyday words minus any word a concept
+# legitimately lists as a variant (variant listing wins — see module
+# docstring). Empirically empty today; computed defensively so a future
+# CONCEPTS edit can never silently make a real lay term unglossable.
+EVERYDAY_WORDS: frozenset[str] = _EVERYDAY_WORDS_CURATED - _all_variant_strings_lower()

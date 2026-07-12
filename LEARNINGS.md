@@ -1302,3 +1302,62 @@ constrained-decoding scheme should be evaluated not just on recall but on a
 category-confusion matrix (condition-in-Rx, drug-in-diagnosis, etc.) — and
 tests/test_incidents.py plus the corrections flywheel now accumulate exactly
 those labeled confusions from real use.
+
+## Concept Matcher Rebuild Phase — The audit corpus picks the threshold (2026-07-12)
+
+### (a) What this phase does
+The concept matcher is the L3.5 pass that spots lay medical words in the
+transcript ("sugar", "बीपी") and glosses them with the clinical concept they
+mean ("Type 2 Diabetes Mellitus", "Hypertension") using embedding similarity —
+a score of how close two phrases are in meaning. This phase transplanted the
+drug matcher's near-collision disciplines onto that pass: a curated
+everyday-word ban list (time words, numbers, fillers, verbs, kinship terms can
+never gloss, whatever their score), a higher similarity bar for single-word
+spans (the crowded, collision-prone class), and an ambiguity gate that refuses
+to gloss a span sitting between two different concepts. Every threshold was
+chosen from a hand-adjudicated audit of 173 real transcripts (90 distinct
+single-word gloss candidates read in context), which cut wrong glosses from 17
+to 4 while preserving all 10 must-keep true positives — बीपी, बुखार, खांसी,
+शुगर and friends all still gloss.
+
+### (b) Hardest bugs
+
+1. **The guard we added last phase was silently vetoing a genuine symptom.**
+   Last phase added हफ्ते ("week") as a hard negative on Shortness of Breath,
+   to stop the one-edit collision with हांफते ("panting"). This phase's gate
+   verification found the pre-existing test for the GENUINE case — "हांफ रहे
+   हैं" (is panting) — already failing on the inherited code: the हफ्ते
+   hard-negative embedding scored higher (0.88–0.94) against the panting
+   phrase than the phrase's own concept match (0.82–0.88), so the guard built
+   to protect the concept was suppressing its real mentions. Root cause: a
+   hard negative added for a one-WORD collision was allowed to compete
+   against spans of any length, and short common words sit so centrally in
+   embedding space that they out-score specific multi-word phrases. Fix:
+   a hard negative shorter than the query span is excluded from the veto —
+   unigram-vs-unigram collisions (the case the guard exists for) are
+   untouched. Lesson: every guard needs a regression test for the case it
+   must NOT fire on, written the day the guard lands.
+
+2. **The eleventh collision the manual audit missed.** The previous phase's
+   audit hand-listed ten one-edit neighbor pairs (दमा↔दवा, हफते↔हांफते …).
+   Rebuilding, we replaced the hand list with a programmatic scan: generate
+   every concept variant's one-edit neighbors and check each against a common
+   Hindi word list. It found दाद (ringworm) ↔ दान (donation) — a pair the
+   manual pass never considered, even though दान was ALREADY a hard negative
+   on a different concept (Skin Rash) for a different collision. Root cause:
+   manual enumeration finds the collisions a human thinks to check;
+   the space of one-edit neighbors is mechanical and should be searched
+   mechanically. The scan now runs as a permanent test, so a newly added
+   variant with a dangerous neighbor fails CI instead of shipping.
+
+### (c) Fine-tuning hook
+Every residual wrong gloss is the same failure: the matcher encodes each span
+in isolation, so it cannot see that "acid" meant uric acid (a lab value), that
+"blood" meant a blood TEST, or that "Tension" was part of "Tension headache" —
+and no threshold separates these from real mentions, because the word alone IS
+ambiguous. The audit artifact (outputs/gloss_audit.json — every candidate with
+its context window, score, runner-up, and a hand adjudication) is exactly the
+labeled dataset a context-aware fine-tune of parrotlet-e needs: train the
+encoder to score span-IN-SENTENCE rather than span-alone, and this entire
+residual class (including the accepted सर्दी winter/illness polysemy) becomes
+learnable instead of unreachable.

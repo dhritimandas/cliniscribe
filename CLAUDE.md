@@ -149,6 +149,17 @@ Drug names and doses MUST be validated against the CDSCO list. Unvalidated entri
 
 **Schema scope:** field set is aligned to the EkaCare clinical-note rubric targets so the note can hold what consultations actually contain (symptoms ≈ 23% of rubric criteria, vitals ≈ 8%, exam ≈ 7%, diagnostic results ≈ 8%, medication timing ≈ 5%, diagnosis status ≈ 3%). Structured past/family/social/lifestyle history is intentionally left as free-text `history` — Indian tier-2/3 clinic transcripts rarely capture it on tape (≈ 10% of rubric criteria), and structuring empty fields invites LLM fabrication. `investigations` = tests ORDERED; `diagnostic_results` = results already AVAILABLE.
 
+## Git / PR Discipline (strict)
+
+**Max 10 changed files per PR. Each work-wave is its own branch and its own
+PR — never merge waves into one accumulating branch.** Smaller PRs = faster
+review, cleaner history, less cognitive load when something breaks. Structure
+work as waves (as now), but cut a branch + PR per wave; stack PRs when a wave
+depends on the previous one. One logical change per commit, as before. If a
+wave genuinely needs more than 10 files, split it into two PRs at a coherent
+seam (e.g. backend/frontend, code/tests-fixtures) rather than exceeding the
+limit. Screenshots/binary assets accompanying a docs PR count toward the 10.
+
 ## Development Rules
 
 **Build one stage at a time.** Each stage must run and be tested on real EkaCare data before the next begins. No speculative scaffolding.

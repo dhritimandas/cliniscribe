@@ -73,6 +73,16 @@ def test_hallucination_flag_is_plain_language() -> None:
     assert "Pulmonary Embolism" in s and "confirm" in s.lower()
 
 
+def test_drug_in_diagnosis_flag_is_plain_language() -> None:
+    s = _flag_sentence("diagnosis.naxdom 500.drug_in_diagnosis")
+    assert "naxdom 500" in s and "medication" in s.lower() and "." not in s.replace("— ", "")
+
+
+def test_drug_in_investigations_flag_is_plain_language() -> None:
+    s = _flag_sentence("investigations.naxdom 500.drug_in_investigations")
+    assert "naxdom 500" in s and "medication" in s.lower() and "." not in s.replace("— ", "")
+
+
 def test_bare_field_flag_gets_label() -> None:
     assert _flag_sentence("chief_complaint").startswith("Chief complaint")
     assert _flag_sentence("follow_up").startswith("Follow-up")
