@@ -1251,3 +1251,54 @@ doctor-adjudicated label between two ASR hypotheses on identical audio —
 accumulating exactly the preference data a future ASR fine-tune or reranker
 needs, at zero annotation cost, in the deployment domain the frozen bench
 can't represent.
+
+---
+
+## QA Hardening Phase — Category errors and the incident suite (2026-07-12)
+
+### (a) What this phase does
+This phase closed the user-reported defect round with a QA doctrine: every
+real production failure becomes a permanent, model-free regression test
+(tests/test_incidents.py), so no fixed bug can silently return. The marquee
+fix: "my BP is high" had produced a MEDICATION row reading "(Hypertension)
+भी" — a category error the grounding guard rightly passed (the string WAS
+spoken; grounding catches inventions, not miscategorization). A deterministic
+condition guard now drops any drug-field value that fold-matches the clinical
+concepts table, with real-drug precedence proven collision-free across all
+546 lexicon entries. The same round restored and expanded live progress to
+all three pipeline stages, removed the note-appearance dead time, and pinned
+the print dialog to the review page.
+
+### (b) Hardest bugs
+
+1. **Every guard was right, and the condition still landed in the Rx table.**
+   The generic-term guard, grounding guard, and lexicon each did their job —
+   none of them owns the question "is this string a DISEASE?". Root cause: a
+   taxonomy gap between defenses, each built from a previous incident's shape
+   (invented names, generic words, misspellings) — while the model found a
+   fourth shape: correctly-transcribed, well-grounded, wrong CATEGORY.
+   Defenses built from incident shapes will always trail the model's
+   creativity by one shape; the countermeasure is a defense per FIELD
+   SEMANTICS (what may a drug field contain?) rather than per failure story —
+   plus the incident suite so each new shape is at least never repeated.
+
+2. **The progress display existed, worked, and was never visible.** The fast
+   engine reports progress once per decode window; short clinic clips pack
+   into ONE window, so the single progress event raced the stage-end event
+   that clears it — technically alive, observably dead (934 of 934 DOM
+   samples empty). Root cause: an interface contract ("callback fires during
+   the stage") that silently degenerated when the implementation's
+   granularity (per-window) collapsed to one unit. The fix blends calibrated
+   expectation (per-stage medians from real session history, shown instantly,
+   capped at 95%) with true events wherever they exist. Lesson: progress
+   reporting is a product surface with its own liveness requirement — test
+   "is it VISIBLE at t=2s?", not "does the callback fire?".
+
+### (c) Fine-tuning hook
+The BP incident is the clearest argument yet for constrained extraction: the
+model had the right information in the right fields (history captured "BP is
+high") and STILL emitted a spurious medication row. A future fine-tune or
+constrained-decoding scheme should be evaluated not just on recall but on a
+category-confusion matrix (condition-in-Rx, drug-in-diagnosis, etc.) — and
+tests/test_incidents.py plus the corrections flywheel now accumulate exactly
+those labeled confusions from real use.
