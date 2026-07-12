@@ -116,6 +116,14 @@ _FLAG_PATTERNS: list[tuple[re.Pattern, str]] = [
         "A medication was mentioned without a clear name ({x}) — identify it",
     ),
     (
+        re.compile(r"^medications\.(?P<x>.+)\.ungrounded$"),
+        "A medication name could not be matched to the conversation — verify with the recording",
+    ),
+    (
+        re.compile(r"^medications\.(?P<x>.+)\.dose_unattributed$"),
+        "Dose for {x} could not be located next to it in the conversation — confirm",
+    ),
+    (
         re.compile(r"^diagnosis\.(?P<x>.+)\.no_transcript_overlap$"),
         "Diagnosis '{x}' lacks clear support in the conversation — confirm",
     ),

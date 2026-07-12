@@ -395,3 +395,30 @@ def test_latin_canonical_drug_left_untouched() -> None:
 def test_naxdom_curated_hit_with_dose() -> None:
     result = _normalize_drug_text("नैक्सडॉम 500 khao")
     assert "naxdom" in result
+
+
+# ── Real incident (outputs/20260711-184756-36c330): "nextom" spelling gap ──
+# ASR wrote a naxdom spelling variant not in the curated Devanagari table
+# ("नैक्स्टोम"/"नेक्स्टोम"), L3.5 couldn't normalize it, and the LLM invented
+# "nasal spray" as the drug name downstream. These fixtures are the exact
+# transcript turns from that session.
+
+
+def test_naxdom_devanagari_variant_curated_hit_with_dose() -> None:
+    result = _normalize_drug_text("और एक नैक्स्टोम 500 खाईएगा")
+    assert "naxdom 500" in result
+
+
+def test_naxdom_latin_curated_variant_recovered_with_dose() -> None:
+    # Whisper distorts brand names in Latin script too, and naxdom is not in
+    # CDSCO, so the CDSCO tiers alone can never recover "nextom" -> "naxdom".
+    result = _normalize_drug_text("nextom 500 le lena")
+    assert "naxdom 500" in result
+
+
+def test_paracetamol_devanagari_variants_curated() -> None:
+    for text, expected in (
+        ("पैरासेट मूल", "paracetamol"),
+        ("पैरसेट मॉल दिन में दो बार", "paracetamol"),
+    ):
+        assert expected in _normalize_drug_text(text)

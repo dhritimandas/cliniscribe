@@ -73,7 +73,7 @@ const MOCK_TRANSLATIONS = {
 const UI_STRINGS = {
   use_audio_file: "use audio file instead",
   save: "save",
-  draft_pdf: "draft pdf",
+  draft_pdf: "draft pdf and print",
   download_pdf: "download pdf",
   original: "original",
   editing_original: "editing original",
@@ -994,6 +994,59 @@ document.getElementById("save-btn").addEventListener("click", async () => {
   for (const edit of edits) baselineValues[edit.field] = edit.new ?? "";
   pendingEdits = {};
 });
+
+/* ---------- Draft PDF (open + print) ----------
+ * "DRAFT PDF AND PRINT" must both open the current draft in a new tab and
+ * pop the browser's print dialog for it. The /pdf endpoint always answers
+ * with Content-Disposition: attachment (web/app.py get_pdf) so pointing a
+ * plain window.open()/iframe.src straight at that URL only forces a file
+ * download — there is never an inline, printable document to call .print()
+ * on. Fetching the bytes ourselves and handing the browser a blob: URL
+ * (which carries no Content-Disposition) sidesteps that and renders inline.
+ * Printing is done from a hidden iframe's own 'load' event rather than
+ * win.addEventListener('load', () => win.print()) on the window.open()
+ * result: verified against headless Chrome that a popup Window showing a
+ * PDF does not reliably fire 'load', while an iframe navigated to the same
+ * blob URL does. If print() throws, the tab opened above (independent of
+ * print's success) is left as the manual-print fallback. The iframe is
+ * given a real off-screen size, not 0x0: verified against headless Chrome
+ * that Chromium's built-in PDF viewer never initializes (and 'load' never
+ * fires) inside a zero-area frame.
+ */
+document.getElementById("draft-pdf-link").addEventListener("click", async (event) => {
+  if (!sessionId) return;
+  event.preventDefault();
+  const url = event.currentTarget.href;
+  try {
+    const res = await api(url);
+    if (!res.ok) throw new Error(`pdf fetch failed: ${res.status}`);
+    const blobUrl = URL.createObjectURL(await res.blob());
+    window.open(blobUrl, "_blank");
+    printBlobViaHiddenIframe(blobUrl);
+  } catch (err) {
+    console.error("draft pdf open/print failed, falling back to plain download:", err);
+    window.open(url, "_blank");
+  }
+});
+
+function printBlobViaHiddenIframe(blobUrl) {
+  const iframe = document.createElement("iframe");
+  iframe.style.cssText = "position:fixed; left:-9999px; top:-9999px; width:600px; height:800px; border:0;";
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.addEventListener("load", () => {
+    try {
+      iframe.contentWindow.print();
+    } catch (err) {
+      console.error("draft pdf print() failed:", err);
+    }
+    setTimeout(() => {
+      iframe.remove();
+      URL.revokeObjectURL(blobUrl);
+    }, 2000);
+  });
+  iframe.src = blobUrl;
+  document.body.appendChild(iframe);
+}
 
 /* ---------- Transcript drawer ---------- */
 

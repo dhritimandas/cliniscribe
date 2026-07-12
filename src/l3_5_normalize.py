@@ -59,6 +59,9 @@ _DEVA_CURATED: dict[str, str] = {
     "टिंचर": "tincture",
     "पैरासिटामोल": "paracetamol",
     "पैरासिटमोल": "paracetamol",
+    "पैरासेट मूल": "paracetamol",
+    "पैरसेट मॉल": "paracetamol",
+    "पैरासेट मॉल": "paracetamol",
     "फ्लूकोनाज़ोल": "fluconazole",
     "फ्लुकोनाज़ोल": "fluconazole",
     "फ्लूकोनाज़ोल 150": "fluconazole 150",
@@ -147,6 +150,10 @@ _DEVA_CURATED: dict[str, str] = {
     "नैक्सडॉम 500": "naxdom 500",
     "नेक्स डॉम 500": "naxdom 500",
     "नैक्सडॉम 250": "naxdom 250",
+    "नैक्स्टोम": "naxdom",
+    "नेक्स्टोम": "naxdom",
+    "नैक्स्टोम 500": "naxdom 500",
+    "नेक्स्टोम 500": "naxdom 500",
 }
 
 _DEVA_RE = re.compile(r"[ऀ-ॿ]")
@@ -238,15 +245,25 @@ def _latin_span_candidate(span: list[str]) -> bool:
     return not any(t.lower() in _LATIN_SPAN_STOPWORDS for t in alpha)
 
 
+# Hand-curated Latin→Latin table for brand names Whisper distorts even when it
+# stays in Latin script (naxdom is not in CDSCO, so the CDSCO tiers below can
+# never recover it). Checked first, same as _DEVA_CURATED for Devanagari spans.
+_LATIN_CURATED: dict[str, str] = {
+    "nextom": "naxdom",
+}
+
+
 def _normalize_drug_text(text: str) -> str:
     """Apply 3-tier drug normalization to a single string.
 
     Processes windows of 3, 2, 1 tokens (longest match wins). Windows with
     Devanagari tokens go through curated-table → ITRANS+CDSCO-exact →
     CDSCO-fuzzy. All-Latin windows that look drug-like (see
-    _latin_span_candidate) go through CDSCO-exact → CDSCO-fuzzy with the
-    same thresholds — Whisper distorts Latin drug names too. Already-covered
-    positions are skipped.
+    _latin_span_candidate) go through curated-table (_LATIN_CURATED) →
+    CDSCO-exact → CDSCO-fuzzy with the same thresholds — Whisper distorts
+    Latin drug names too, and brands absent from CDSCO (e.g. naxdom) can only
+    ever be recovered via the curated table. Already-covered positions are
+    skipped.
 
     Args:
         text: Raw ASR hypothesis string.
@@ -284,7 +301,9 @@ def _normalize_drug_text(text: str) -> str:
 
             if _latin_span_candidate(span):
                 roman = span_text.lower()
-                latin = _cdsco_exact(roman)
+                latin = _LATIN_CURATED.get(roman)
+                if latin is None:
+                    latin = _cdsco_exact(roman)
                 if latin is None:
                     latin = _cdsco_fuzzy(roman)
                 if latin is None or latin.lower() == roman:
