@@ -88,6 +88,9 @@ const UI_STRINGS = {
   verify_after_sign_suffix: " differences logged",
   use_checked_version: "use checked version",
   checked_transcript: "checked transcript",
+  // /translate in-flight feedback (cold cache / loaded host can take 1-2 min).
+  translating: "translating…",
+  translation_unavailable: "translation unavailable — showing original",
 };
 function u(key) { return UI_STRINGS[key]; }
 
@@ -1029,7 +1032,14 @@ async function loadNoteAndShowReview() {
   // still selected) — fire the translation immediately so the first paint
   // is already in the selected language, not a tap-to-translate surprise.
   if (noteHasNonLatinScript(noteData, transcriptData)) {
-    await refreshTranslations();
+    // A failure here must not block the review screen from ever loading
+    // (reviewLoaded is already latched true by the caller) — fall back to
+    // the source-language note/transcript, same as a failed lang-switch.
+    try {
+      await refreshTranslations();
+    } catch (err) {
+      console.error("initial translation failed:", err);
+    }
   }
   renderReview();
   renderDrawer();
@@ -1476,14 +1486,57 @@ document.addEventListener("click", (e) => {
 
 /* ---------- Language switching ---------- */
 
-document.getElementById("lang-select").addEventListener("change", async (e) => {
+// A cold /translate call (uncached lang, and/or a loaded Ollama host) can
+// take 1-2 minutes with nothing else on screen changing meanwhile — the
+// doctor gets no feedback that anything is happening. Delayed-show guard:
+// the "translating…" line only appears if the request is STILL in flight
+// after TRANSLATE_INDICATOR_DELAY_MS, so an already-cached repeat switch
+// (which resolves in a microtask, well under the delay) never flashes it.
+const TRANSLATE_INDICATOR_DELAY_MS = 150;
+const TRANSLATE_ERROR_DISPLAY_MS = 4000;
+const translateStatusEl = document.getElementById("translate-status");
+const langSelectEl = document.getElementById("lang-select");
+let translateIndicatorTimer = null;
+let translateErrorTimer = null;
+
+function hideTranslateStatus() {
+  clearTimeout(translateErrorTimer);
+  translateErrorTimer = null;
+  translateStatusEl.hidden = true;
+  translateStatusEl.classList.remove("error");
+}
+
+langSelectEl.addEventListener("change", async (e) => {
   currentLang = e.target.value;
-  // Bug 1 (target-language-absolute): "en" is a real target like hi/mr —
-  // a Devanagari/Arabic-script note still needs translating TO English, so
-  // every switch (including back to en) refreshes the overlay. Cached per
-  // lang server-side and client-side, so repeated en<->hi<->mr switching
-  // never re-hits Ollama for a language already fetched this session.
-  await refreshTranslations();
+  // The indicator is gated on an ACTUAL request being in flight (>150ms),
+  // not on the target language: English is usually a client-side no-op
+  // (cached / Latin source → instant, so the delayed-show guard means no
+  // flash), but for a Devanagari/Arabic-script source note English is a
+  // real backend translation too — a silent 1-2 min wait there is exactly
+  // the gap this indicator exists to close. Cached per lang server-side
+  // and client-side, so repeated switching never re-hits Ollama for a
+  // language already fetched this session.
+  langSelectEl.disabled = true;
+  clearTimeout(translateErrorTimer);
+  translateIndicatorTimer = setTimeout(() => {
+    translateStatusEl.textContent = u("translating");
+    translateStatusEl.classList.remove("error");
+    translateStatusEl.hidden = false;
+  }, TRANSLATE_INDICATOR_DELAY_MS);
+  try {
+    await refreshTranslations();
+    clearTimeout(translateIndicatorTimer);
+    translateStatusEl.hidden = true;
+  } catch (err) {
+    console.error("translation fetch failed:", err);
+    clearTimeout(translateIndicatorTimer);
+    translateStatusEl.textContent = u("translation_unavailable");
+    translateStatusEl.classList.add("error");
+    translateStatusEl.hidden = false;
+    translateErrorTimer = setTimeout(hideTranslateStatus, TRANSLATE_ERROR_DISPLAY_MS);
+  } finally {
+    langSelectEl.disabled = false;
+  }
   renderReview();
   renderDrawer();
 });
@@ -1493,15 +1546,25 @@ async function refreshTranslations() {
     ({ note_values: translatedValues, transcript: translatedTranscript } = translationsByLang[currentLang]);
     return;
   }
-  const res = await api(`/api/sessions/${sessionId}/translate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lang: currentLang }),
-  });
-  const data = await res.json();
-  translationsByLang[currentLang] = data;
-  translatedValues = data.note_values || {};
-  translatedTranscript = data.transcript || [];
+  try {
+    const res = await api(`/api/sessions/${sessionId}/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: currentLang }),
+    });
+    if (!res.ok) throw new Error(`translate failed: ${res.status}`);
+    const data = await res.json();
+    translationsByLang[currentLang] = data;
+    translatedValues = data.note_values || {};
+    translatedTranscript = data.transcript || [];
+  } catch (err) {
+    // Failure (network or non-200): fall back to the source-language values
+    // — never leave a stale overlay from a previously selected language on
+    // screen mislabeled as the newly selected one.
+    translatedValues = {};
+    translatedTranscript = [];
+    throw err;
+  }
 }
 
 /* ---------- Sign flow ---------- */
