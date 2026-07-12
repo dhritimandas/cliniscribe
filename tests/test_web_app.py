@@ -818,8 +818,11 @@ def test_translate_excludes_medications_and_vitals_from_prompt(client, monkeypat
         ],
     )
 
+    # The transcript turn's "Azithral 500" is masked to DRUGSPAN0 (see
+    # web/drug_mask.py) before it ever reaches Ollama — the stub's response
+    # carries the placeholder through, exactly as a well-behaved model would.
     calls = _stub_ollama_batch_translate(
-        monkeypatch, [["बुखार"], ["Azithral 500 mg रोज़ एक बार लें।"]]
+        monkeypatch, [["बुखार"], ["DRUGSPAN0 mg रोज़ एक बार लें।"]]
     )
 
     response = client.post(f"/api/sessions/{sid}/translate", json={"lang": "hi"})
@@ -828,12 +831,17 @@ def test_translate_excludes_medications_and_vitals_from_prompt(client, monkeypat
     assert body["note_values"] == {"chief_complaint": "बुखार"}
     assert body["transcript"] == ["Azithral 500 mg रोज़ एक बार लें।"]
 
-    # Patient-safety assertion: the note_values group (first Ollama call) must
-    # never carry medication or vitals text — only "fever" was eligible.
+    # Patient-safety assertion: neither Ollama call ever carries the raw drug
+    # name or vitals text — note_values excluded them entirely; the
+    # transcript call sees only the DRUGSPAN0 placeholder.
     note_values_call_payload = calls[0][1][1]["content"]
     assert "500 mg" not in note_values_call_payload
     assert "120/80" not in note_values_call_payload
     assert "Azithral" not in note_values_call_payload
+
+    transcript_call_payload = calls[1][1][1]["content"]
+    assert "Azithral" not in transcript_call_payload
+    assert "DRUGSPAN0" in transcript_call_payload
 
 
 def test_translate_caches_to_disk_and_serves_repeat_calls(client, monkeypatch) -> None:

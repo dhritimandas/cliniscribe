@@ -15,6 +15,7 @@ import re
 import statistics
 import threading
 import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -27,7 +28,7 @@ from pydantic import BaseModel
 from src import config, pipeline
 from src.l5_render import render
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
-from web import live_asr, verification
+from web import drug_mask, live_asr, verification
 from web.provenance import flags_by_path, provenance_for_note
 from web.translations import TRANSLATIONS
 
@@ -726,7 +727,12 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     Returns translations aligned index-for-index with `texts`. Numbers, units,
     and Latin-script drug names embedded in a sentence are instructed to
     survive verbatim — this function is never called with drug/dose/vitals
-    fields in the first place (see `_translatable_note_values`).
+    fields in the first place (see `_translatable_note_values`). Drug names
+    that DO appear in free text (advice, transcript turns) arrive here
+    already replaced by `DRUGSPANn` placeholders (see `web/drug_mask.py`) —
+    the prompt instruction below is a second, best-effort layer; the actual
+    safety guarantee is `_translate_texts_robust`'s placeholder-survival
+    check, not this instruction.
     """
     if not texts:
         return []
@@ -735,8 +741,10 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     system = (
         f"Translate each string in the JSON array into {_OLLAMA_LANG_NAMES[lang]}. "
         "Preserve numbers, units, and any Latin-script drug names verbatim within "
-        "each translated sentence. Output ONLY a JSON array of translated strings, "
-        "same length and order as the input, no extra commentary."
+        "each translated sentence. Any token of the form DRUGSPAN0, DRUGSPAN1, etc. "
+        "is a placeholder — copy each one through EXACTLY as-is, unchanged, do not "
+        "translate, reword, or drop it. Output ONLY a JSON array of translated "
+        "strings, same length and order as the input, no extra commentary."
     )
     response = ollama.chat(
         model=config.EXTRACT_MODEL,
@@ -758,38 +766,64 @@ def _translate_batch_via_ollama(texts: list[str], lang: str) -> list[str]:
     return [str(item) for item in translated]
 
 
-def _translate_texts_robust(texts: list[str], lang: str) -> list[str]:
+def _translate_texts_robust(
+    texts: list[str], lang: str, medication_drugs: Sequence[str] = ()
+) -> list[str]:
     """Translate `texts` into `lang`, aligned index-for-index; never raises.
+
+    Every string is masked (see `web/drug_mask.py`) before it reaches Ollama
+    and restored afterwards — this is the ONE seam both note free-text
+    fields and transcript turns pass through, so it is where the drug-name
+    masking is applied regardless of caller.
 
     Tries one batched call first. If the batch call fails outright or comes
     back misaligned (wrong length — an occasional Qwen JSON-array slip), it
     falls back to translating each string individually; if an individual
-    item's translation call also fails, that item's ORIGINAL text is kept
-    (never blank, never a crash, never lets one bad item fail the group).
+    item's translation call also fails, that item's ORIGINAL (unmasked,
+    untranslated) text is kept (never blank, never a crash, never lets one
+    bad item fail the group). A string whose translation comes back but
+    fails the placeholder-survival check (a dropped or duplicated
+    `DRUGSPANn`) falls back the same way — never a guessed drug name.
     """
     if not texts:
         return []
+    masked = [drug_mask.mask(text, medication_drugs) for text in texts]
+    masked_texts = [m.masked for m in masked]
+
+    translated_masked: list[str | None] | None
     try:
-        translated = _translate_batch_via_ollama(texts, lang)
-        if len(translated) == len(texts):
-            return translated
-        logger.warning(
-            "Ollama batch translation length mismatch (%d texts, %d results); "
-            "retrying item-by-item",
-            len(texts),
-            len(translated),
-        )
+        translated_masked = _translate_batch_via_ollama(masked_texts, lang)
+        if len(translated_masked) != len(masked_texts):
+            logger.warning(
+                "Ollama batch translation length mismatch (%d texts, %d results); "
+                "retrying item-by-item",
+                len(masked_texts),
+                len(translated_masked),
+            )
+            translated_masked = None
     except Exception:
         logger.exception("Ollama batch translation failed; retrying item-by-item")
+        translated_masked = None
+
+    if translated_masked is None:
+        translated_masked = []
+        for masked_text in masked_texts:
+            try:
+                item = _translate_batch_via_ollama([masked_text], lang)
+                translated_masked.append(item[0] if item else None)
+            except Exception:
+                logger.exception("Ollama per-item translation failed; keeping original")
+                translated_masked.append(None)
 
     results: list[str] = []
-    for text in texts:
-        try:
-            item = _translate_batch_via_ollama([text], lang)
-            results.append(item[0] if item else text)
-        except Exception:
-            logger.exception("Ollama per-item translation failed; keeping original")
-            results.append(text)
+    for original, m, translated_item in zip(
+        texts, masked, translated_masked, strict=True
+    ):
+        if translated_item is None:
+            results.append(original)
+            continue
+        restored = drug_mask.restore(translated_item, m.spans)
+        results.append(restored if restored is not None else original)
     return results
 
 
@@ -836,6 +870,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
 
     note_data = _read_json(_note_path(sid))
     turns = _read_turns(sid)
+    medication_drugs = [
+        m["drug"] for m in note_data.get("medications", []) if m.get("drug")
+    ]
 
     note_values = _translatable_note_values(note_data)
     paths = list(note_values)
@@ -846,7 +883,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
     translated_note_by_idx = dict(
         zip(
             note_needs,
-            _translate_texts_robust([note_texts[i] for i in note_needs], body.lang),
+            _translate_texts_robust(
+                [note_texts[i] for i in note_needs], body.lang, medication_drugs
+            ),
         )
     )
     note_values_out = {paths[i]: text for i, text in translated_note_by_idx.items()}
@@ -855,7 +894,9 @@ def translate_session(sid: str, body: TranslateRequest) -> dict[str, Any]:
     translated_turn_by_idx = dict(
         zip(
             turn_needs,
-            _translate_texts_robust([turn_texts[i] for i in turn_needs], body.lang),
+            _translate_texts_robust(
+                [turn_texts[i] for i in turn_needs], body.lang, medication_drugs
+            ),
         )
     )
     translated_turns = [
