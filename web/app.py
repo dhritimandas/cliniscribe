@@ -12,11 +12,13 @@ import json
 import logging
 import os
 import re
+import statistics
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import librosa
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +27,7 @@ from pydantic import BaseModel
 from src import config, pipeline
 from src.l5_render import render
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
-from web import live_asr
+from web import live_asr, verification
 from web.provenance import flags_by_path, provenance_for_note
 from web.translations import TRANSLATIONS
 
@@ -37,6 +39,94 @@ _ALLOWED_AUDIO_EXTS = {"wav", "mp3"}
 _SUPPORTED_LANGS = {"en", "hi", "mr"}
 _IST = timezone(timedelta(hours=5, minutes=30))  # tier-2/3 India clinics only
 _PROGRESS_WRITE_MIN_INTERVAL_S = 1.0  # throttle status.json progress writes
+
+# ── Stage-duration calibration (issue 1: instant + honest %/ETA display) ────
+# Backend stages that ever get a client-side %/ETA suffix. l1_preprocess is
+# deliberately excluded — it is fast (well under a couple of seconds on the
+# 11-27s clips seen in outputs/ so far) and low-variance, so it never carried
+# a %/ETA display even before this change.
+_CALIBRATED_STAGES = ("l2_diarize", "l3_asr", "l3_5_normalize", "l4_extract")
+
+# Sane fallback ratios (seconds of stage wall-time per second of clip audio),
+# used per-stage only when no session in outputs/ qualifies for calibration
+# (e.g. a fresh checkout with no history yet). Rough medians from the first
+# fast-engine (windowed) production runs — see outputs/*/timings.json.
+_FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND: dict[str, float] = {
+    "l2_diarize": 1.0,
+    "l3_asr": 1.0,
+    "l3_5_normalize": 1.5,
+    "l4_extract": 1.5,
+}
+
+# l3_asr's wall/audio ratio history mixes the pre-window-packing "fast"
+# engine (one mlx-whisper call per DIARIZED SEGMENT — tens of seconds per
+# audio second, see src/fast_asr.py's Fix 2 docstring) with the current
+# windowed engine (~1x realtime or faster). A session's timings.json carries
+# no engine-version marker, so this ratio is used as a cheap, direct proxy
+# for "ran under the windowed engine": a session is only used for calibration
+# if l3_asr's OWN wall/audio ratio is below this cutoff.
+_CALIBRATION_L3_RATIO_CUTOFF = 2.0
+
+
+def _session_audio_seconds(session_dir: str) -> float | None:
+    """Duration of a session's L1-preprocessed 16kHz wav, or None if absent/unreadable."""
+    wav_names = [f for f in os.listdir(session_dir) if f.endswith("_16k.wav")]
+    if not wav_names:
+        return None
+    try:
+        return float(librosa.get_duration(path=os.path.join(session_dir, wav_names[0])))
+    except Exception:
+        return None
+
+
+def _compute_stage_calibration(root: str = OUTPUTS_ROOT) -> dict[str, float]:
+    """Median measured seconds-per-audio-second for each of `_CALIBRATED_STAGES`.
+
+    Scans every `<root>/<session>/timings.json`, filtering out pre-windowed-
+    engine sessions via `_CALIBRATION_L3_RATIO_CUTOFF` (see its docstring),
+    and takes the median wall_s/audio_s ratio per stage over the sessions
+    that remain. Falls back to `_FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND`,
+    per stage, when no session qualifies.
+
+    Runs once at server startup (module import) to seed the live
+    `_STAGE_SECONDS_PER_AUDIO_SECOND` constant; `root` is a parameter (not a
+    hardcoded `OUTPUTS_ROOT` read) purely so tests can point it at a
+    tmp_path fixture instead of the repo's real `outputs/` history.
+    """
+    stage_ratios: dict[str, list[float]] = {stage: [] for stage in _CALIBRATED_STAGES}
+    if os.path.isdir(root):
+        for sid in os.listdir(root):
+            session_dir = os.path.join(root, sid)
+            timings_path = os.path.join(session_dir, "timings.json")
+            if not os.path.isdir(session_dir) or not os.path.exists(timings_path):
+                continue
+            audio_seconds = _session_audio_seconds(session_dir)
+            if not audio_seconds:
+                continue
+            try:
+                with open(timings_path, encoding="utf-8") as f:
+                    stages = json.load(f)["stages"]
+            except (json.JSONDecodeError, KeyError, OSError):
+                continue
+            l3_wall = stages.get("l3_asr", {}).get("wall_s")
+            if l3_wall is None or l3_wall / audio_seconds >= _CALIBRATION_L3_RATIO_CUTOFF:
+                continue  # pre-windowed-engine session (or l3_asr never ran) — skip
+            for stage in _CALIBRATED_STAGES:
+                wall_s = stages.get(stage, {}).get("wall_s")
+                if wall_s is not None:
+                    stage_ratios[stage].append(wall_s / audio_seconds)
+
+    return {
+        stage: (
+            statistics.median(ratios)
+            if ratios
+            else _FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND[stage]
+        )
+        for stage, ratios in stage_ratios.items()
+    }
+
+
+_STAGE_SECONDS_PER_AUDIO_SECOND = _compute_stage_calibration()
 
 _status_lock = threading.Lock()
 
@@ -107,6 +197,10 @@ def _status_path(sid: str) -> str:
 
 def _note_path(sid: str) -> str:
     return os.path.join(OUTPUTS_ROOT, sid, "note.json")
+
+
+def _note_meta_path(sid: str) -> str:
+    return os.path.join(OUTPUTS_ROOT, sid, "note_meta.json")
 
 
 def _read_json(path: str) -> Any:
@@ -262,14 +356,122 @@ def _make_progress_callbacks(sid: str):
     return on_stage, on_progress
 
 
+def _estimate_audio_seconds(in_path: str) -> float | None:
+    """Best-effort duration of a just-uploaded audio file, in seconds.
+
+    Used only to scale `_STAGE_SECONDS_PER_AUDIO_SECOND` into this clip's own
+    `expected_stage_seconds` (issue 1) before L1 has produced the real 16kHz
+    wav. Returns None — never raises — on any decode failure: a corrupt or
+    non-audio upload must never abort the pipeline thread over a
+    progress-display estimate (existing tests upload deliberately-fake bytes
+    for this exact reason).
+    """
+    try:
+        return float(librosa.get_duration(path=in_path))
+    except Exception:
+        logger.warning(
+            "Could not estimate audio duration for %s; expected_stage_seconds "
+            "will be skipped for this session",
+            in_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _write_expected_stage_seconds(sid: str, audio_seconds: float) -> None:
+    """Write status.json's `expected_stage_seconds` once, before any stage starts.
+
+    Scales the calibrated `_STAGE_SECONDS_PER_AUDIO_SECOND` medians (module
+    import time) by this clip's own audio duration, so the SPA can render an
+    honest %/ETA suffix the instant each calibrated stage begins, rather than
+    waiting for that stage's own real progress data (only l3_asr has any).
+    """
+    with _status_lock:
+        status = _read_json(_status_path(sid))
+        status["expected_stage_seconds"] = {
+            stage: round(ratio * audio_seconds, 1)
+            for stage, ratio in _STAGE_SECONDS_PER_AUDIO_SECOND.items()
+        }
+        _write_json(_status_path(sid), status)
+
+
+def _compute_and_cache_note_meta(sid: str) -> None:
+    """Precompute per-field provenance + resolved flags right after L5.
+
+    Issue 2 (review-transition dead time): provenance/flag resolution scans
+    every populated note field against every transcript turn — measurable
+    work that used to run inline on every GET .../note call, including the
+    first one right after "review" appears. Caching it here (in the pipeline
+    thread, overlapping with nothing else — L5 has already finished) makes
+    that first GET .../note a pure read. `patch_note` deletes this cache on
+    every edit so a later GET .../note recomputes fresh (see its call site) —
+    flags in particular are resolved by matching CURRENT field values (e.g. a
+    medication's drug name), so a stale cache could keep showing a flag the
+    doctor's own edit already fixed.
+    """
+    note = _note_from_dict(_read_json(_note_path(sid)))
+    turns = _read_turns(sid)
+    _write_json(
+        _note_meta_path(sid),
+        {"provenance": provenance_for_note(note, turns), "flags": flags_by_path(note)},
+    )
+
+
+def _run_verification_thread(sid: str) -> None:
+    """Run web.verification's targeted second-listen and mirror its result
+    into status.json's "verification" key.
+
+    Started (see _run_pipeline_thread) only AFTER pipeline.run() has already
+    returned for this session — i.e. after L4 extraction has finished and the
+    fast-path Whisper/mlx model has already been released (memory
+    discipline: see web/verification.py's module docstring). Runs on its own
+    daemon thread and never blocks review or signing.
+    """
+    with _status_lock:
+        status = _read_json(_status_path(sid))
+        status["verification"] = {"state": "running", "n_differing": 0, "coverage": None}
+        _write_json(_status_path(sid), status)
+    result = verification.run_verification(sid)  # never raises — see its docstring
+    with _status_lock:
+        status = _read_json(_status_path(sid))
+        status["verification"] = {
+            "state": result.get("state", "failed"),
+            "n_differing": len(result.get("fields_differing", [])),
+            "coverage": result.get("coverage"),
+        }
+        _write_json(_status_path(sid), status)
+
+
 def _run_pipeline_thread(sid: str, in_path: str) -> None:
     on_stage, on_progress = _make_progress_callbacks(sid)
+    asr_engine = "fast" if config.FAST_ASR_ENABLED else "accurate"
+    audio_seconds = _estimate_audio_seconds(in_path)
+    if audio_seconds is not None:
+        _write_expected_stage_seconds(sid, audio_seconds)
     try:
-        pipeline.run(in_path, session_id=sid, on_stage=on_stage, on_progress=on_progress)
+        pipeline.run(
+            in_path,
+            session_id=sid,
+            on_stage=on_stage,
+            on_progress=on_progress,
+            asr_engine=asr_engine,
+        )
+        try:
+            _compute_and_cache_note_meta(sid)
+        except Exception:
+            # An optimization, not a hard dependency — GET .../note falls
+            # back to computing provenance/flags inline (see its route).
+            logger.exception("Session %s: note_meta precompute failed", sid)
         with _status_lock:
             status = _read_json(_status_path(sid))
             status.update(state="review", stage=None, error=None)
             _write_json(_status_path(sid), status)
+        if asr_engine == "fast":
+            # Background verification (web/verification.py) only ever makes
+            # sense for the fast engine — the accurate engine's own L3 output
+            # is already the slow, careful transcription this would recheck
+            # against.
+            threading.Thread(target=_run_verification_thread, args=(sid,), daemon=True).start()
     except Exception as exc:
         logger.exception("Session %s: pipeline failed", sid)
         with _status_lock:
@@ -311,6 +513,12 @@ def get_note(sid: str) -> dict[str, Any]:
     `flags` is the INDEX-keyed dict from `flags_by_path` (what the SPA reads);
     `low_confidence_fields` rides along as the raw NAME-keyed list for
     fidelity with note.json (contract: docs/frontend_contracts.md GET note row).
+
+    Issue 2 (review-transition dead time): provenance/flags are read from
+    `note_meta.json` when present (precomputed in the pipeline thread right
+    after L5 — `_compute_and_cache_note_meta`) so this route is a pure read;
+    otherwise (an older session, or right after a PATCH edit invalidated the
+    cache) they are computed inline exactly as before.
     """
     _session_dir(sid)
     if not os.path.exists(_note_path(sid)):
@@ -318,13 +526,36 @@ def get_note(sid: str) -> dict[str, Any]:
     note_data = _read_json(_note_path(sid))
     note = _note_from_dict(note_data)
     turns = _read_turns(sid)
+    meta_path = _note_meta_path(sid)
+    if os.path.exists(meta_path):
+        meta = _read_json(meta_path)
+        provenance, flags = meta["provenance"], meta["flags"]
+    else:
+        provenance, flags = provenance_for_note(note, turns), flags_by_path(note)
     return {
         "note": note_data,
         "transcript": [dataclasses.asdict(t) for t in turns],
-        "provenance": provenance_for_note(note, turns),
-        "flags": flags_by_path(note),
+        "provenance": provenance,
+        "flags": flags,
         "low_confidence_fields": note.low_confidence_fields,
     }
+
+
+# ── GET /api/sessions/{sid}/verification ─────────────────────────────────
+@app.get("/api/sessions/{sid}/verification")
+def get_verification(sid: str) -> dict[str, Any]:
+    """Return the background verification result (web/verification.py) for a
+    session — fields_differing, doctor_resolved, unverified_by_budget,
+    coverage, and the safety-critical-span "checked transcript".
+
+    404 before verification has ever started (no verification.json yet); the
+    SPA only calls this once status.json's "verification" key first appears.
+    """
+    session_dir = _session_dir(sid)
+    path = os.path.join(session_dir, "verification.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Verification not started")
+    return _read_json(path)
 
 
 # ── PATCH /api/sessions/{sid}/note ───────────────────────────────────────
@@ -373,6 +604,13 @@ def patch_note(sid: str, body: PatchNoteRequest) -> dict[str, Any]:
             }
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     _write_json(_note_path(sid), note_data)
+    # Invalidate the precomputed provenance/flags cache (issue 2): flags in
+    # particular are resolved by matching CURRENT field values, so a stale
+    # cache could keep showing a flag this very edit already fixed. The next
+    # GET .../note recomputes inline from the just-written note_data.
+    meta_path = _note_meta_path(sid)
+    if os.path.exists(meta_path):
+        os.remove(meta_path)
     return note_data
 
 

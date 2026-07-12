@@ -107,3 +107,32 @@ def test_run_forwards_on_progress_to_transcribe(stubbed_stages, monkeypatch) -> 
 
     assert received_kwarg["on_progress"] is not None
     assert events == [(1.0, 2.0)]
+
+
+# ── asr_engine selection (fast + background check architecture) ──────────
+
+
+def test_run_default_asr_engine_uses_accurate_transcribe(stubbed_stages, monkeypatch) -> None:
+    """CLI behavior unchanged: no asr_engine kwarg -> src.l3_asr.transcribe."""
+    calls = []
+    monkeypatch.setattr(pipeline, "transcribe", lambda wav, segs, on_progress=None: (calls.append("accurate"), [_TURN])[1])
+    monkeypatch.setattr(pipeline, "fast_transcribe_windowed", lambda wav, segs, on_progress=None: (calls.append("fast"), [_TURN])[1])
+
+    pipeline.run("consult.mp3", session_id="engine-default")
+
+    assert calls == ["accurate"]
+
+
+def test_run_asr_engine_fast_uses_fast_transcribe_windowed(stubbed_stages, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(pipeline, "transcribe", lambda wav, segs, on_progress=None: (calls.append("accurate"), [_TURN])[1])
+    monkeypatch.setattr(pipeline, "fast_transcribe_windowed", lambda wav, segs, on_progress=None: (calls.append("fast"), [_TURN])[1])
+
+    pipeline.run("consult.mp3", session_id="engine-fast", asr_engine="fast")
+
+    assert calls == ["fast"]
+
+
+def test_run_rejects_unknown_asr_engine(stubbed_stages) -> None:
+    with pytest.raises(ValueError):
+        pipeline.run("consult.mp3", session_id="engine-bad", asr_engine="bogus")

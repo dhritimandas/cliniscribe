@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 import threading
 
 from src import telemetry
+from src.fast_asr import fast_transcribe_windowed
 from src.l1_preprocess import preprocess
 from src.l2_diarize import diarize
 from src.l3_asr import transcribe
@@ -53,6 +54,7 @@ def run(
     *,
     on_stage: Callable[[str, str], None] | None = None,
     on_progress: Callable[[float, float], None] | None = None,
+    asr_engine: str = "accurate",
 ) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
@@ -69,11 +71,22 @@ def run(
             as `on_progress(done_seconds, total_seconds)`, invoked after each
             segment decodes during L3 ASR. Used by the review-frontend backend
             for the percent/ETA display. Default None keeps current behavior.
+        asr_engine: Which L3 transcription engine to use — "accurate"
+            (src.l3_asr.transcribe, faster-whisper; the default, CLI behavior
+            unchanged) or "fast" (src.fast_asr.fast_transcribe_windowed,
+            mlx-whisper; see src.config.FAST_ASR_ENABLED). The web review
+            frontend passes "fast" once that flag is on, then runs a
+            background verification pass (web/verification.py) that
+            re-checks safety-critical fields against a second, slower decode.
 
     Returns:
         Path to the generated draft prescription PDF
         (outputs/<session_id>/draft_rx.pdf).
     """
+    if asr_engine not in ("accurate", "fast"):
+        raise ValueError(f"asr_engine must be 'accurate' or 'fast', got {asr_engine!r}")
+    transcribe_fn = fast_transcribe_windowed if asr_engine == "fast" else transcribe
+
     session_id = session_id or new_session_id()
     session_dir = os.path.join(OUTPUTS_ROOT, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -102,8 +115,8 @@ def run(
     logger.info("L2: diarizing %s", wav_path)
     segments = _staged("l2_diarize", diarize, wav_path)
 
-    logger.info("L3: transcribing %d segments", len(segments))
-    turns = _staged("l3_asr", transcribe, wav_path, segments, on_progress=on_progress)
+    logger.info("L3: transcribing %d segments (engine=%s)", len(segments), asr_engine)
+    turns = _staged("l3_asr", transcribe_fn, wav_path, segments, on_progress=on_progress)
 
     # Warm the LLM while L3.5 runs on CPU: Whisper was released inside
     # transcribe(), so only the (small) embedding model and Qwen coexist —

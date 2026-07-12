@@ -8,6 +8,8 @@ import unicodedata
 
 from src import config
 from src.cdsco import validate_drug
+from src.concepts import CONCEPTS
+from src.drug_lexicon import DRUG_LEXICON
 from src.types import ClinicalNote, Diagnosis, Medication, Symptom, Turn, Vital
 
 logger = logging.getLogger(__name__)
@@ -110,6 +112,7 @@ _GENERIC_DRUG_TERMS: frozenset[str] = frozenset(
         "tablet", "tablets", "capsule", "capsules",
         "syrup", "cough syrup", "injection", "gel", "cream",
         "ointment", "drops", "painkiller", "pain killer",
+        "nasal spray", "spray",
         "dawai", "dawa",
         "दवाई", "दवा", "दवाइयां", "टैबलेट", "जेल", "इंजेक्शन", "सिरप",
     }
@@ -255,6 +258,157 @@ def _restore_drug_spelling(drug: str, transcript: str) -> str:
     return best_window
 
 
+# ── Condition guard (spurious medication-row backstop) ─────────────────────
+# Real incident (outputs/20260712-124506-715247, 2026-07-12): the patient
+# said "मेरा BP (Hypertension) भी हाई है" — L3.5's concept-glosser correctly
+# annotated "BP" with its clinical gloss "(Hypertension)" — but qwen2.5:3b
+# then extracted the parenthetical itself, "(Hypertension) भी", as a
+# MEDICATION drug name. The grounding guard above correctly passed it (the
+# string IS in the transcript; grounding catches inventions, not category
+# errors). This is a category error, not a fabrication: a clinical
+# CONDITION, not a drug, and the information is already captured elsewhere
+# in the note (history/diagnosis) — so the row is dropped entirely rather
+# than converted to an unnamed row (unlike a generic term, a condition row
+# carries no salvageable prescription info).
+_CONDITION_PARTICLES: frozenset[str] = frozenset({"भी", "है", "का", "की", "को"})
+_CONDITION_PUNCT_RE = re.compile(r"[()।॥.,!?]")
+_CONDITION_PAREN_RE = re.compile(r"\(([^()]+)\)")
+
+# Modest supplement of common condition words not necessarily covered by
+# CONCEPTS' variants — CONCEPTS (src/concepts.py) does the heavy lifting.
+_CONDITION_SUPPLEMENT: frozenset[str] = frozenset({
+    "hypertension", "diabetes", "fever", "cough", "cold", "asthma",
+    "migraine", "anemia", "arthritis", "allergy", "infection",
+    "बुखार", "खांसी", "जुकाम", "दमा", "माइग्रेन", "एनीमिया", "गठिया",
+    "एलर्जी", "संक्रमण", "उच्च रक्तचाप", "मधुमेह",
+})
+
+
+def _strip_condition_noise(text: str) -> str:
+    """Strip gloss punctuation/parens and trailing Hindi particles.
+
+    "(Hypertension) भी" -> "Hypertension" — isolates the clinical term from
+    surrounding gloss punctuation and grammatical particles a concept-gloss
+    or LLM extraction may carry along with it.
+    """
+    despunctuated = _CONDITION_PUNCT_RE.sub(" ", text)
+    tokens = [t for t in despunctuated.split() if t not in _CONDITION_PARTICLES]
+    return " ".join(tokens)
+
+
+def _build_condition_terms() -> frozenset[str]:
+    """Fold-normalized condition-term set: CONCEPTS terms/variants + supplement."""
+    terms: set[str] = set(_CONDITION_SUPPLEMENT)
+    for concept in CONCEPTS:
+        terms.add(concept.term)
+        terms.update(concept.variants)
+    folded: set[str] = set()
+    for term in terms:
+        key = _fold_drug(term).replace(" ", "")
+        if key:
+            folded.add(key)
+    return frozenset(folded)
+
+
+def _build_drug_lexicon_folds() -> frozenset[str]:
+    """Fold-normalized keys of every canonical drug name (precedence check)."""
+    folded: set[str] = set()
+    for drug in DRUG_LEXICON:
+        key = _fold_drug(drug).replace(" ", "")
+        if key:
+            folded.add(key)
+    return frozenset(folded)
+
+
+# Built once at import — CONCEPTS/DRUG_LEXICON are static tables, no per-call cost.
+_CONDITION_TERMS: frozenset[str] = _build_condition_terms()
+# Drug-lexicon membership takes precedence over the condition set (see
+# _is_condition_term): a brand/generic name that happens to fold-match a
+# condition term is never dropped. No collision exists in the current
+# 546-entry lexicon (test_no_drug_lexicon_entry_matches_condition_set), but
+# the precedence check stays as a structural guarantee, not a fact about
+# today's lexicon contents.
+_DRUG_LEXICON_FOLDS: frozenset[str] = _build_drug_lexicon_folds()
+
+
+def _is_condition_term(drug: str) -> bool:
+    """Return True if `drug` names a clinical condition, not a medication.
+
+    Checks the whole string (after stripping gloss punctuation/particles)
+    for an exact fold match against the condition set, then any
+    parenthetical gloss content within it (e.g. "BP (Hypertension)"). Drug-
+    lexicon membership always wins: a real drug name is never dropped even
+    if it also happens to fold-match a condition term.
+    """
+    cleaned_fold = _fold_drug(_strip_condition_noise(drug)).replace(" ", "")
+    if cleaned_fold in _DRUG_LEXICON_FOLDS:
+        return False
+    if cleaned_fold in _CONDITION_TERMS:
+        return True
+    for m in _CONDITION_PAREN_RE.finditer(drug):
+        gloss_fold = _fold_drug(_strip_condition_noise(m.group(1))).replace(" ", "")
+        is_condition = gloss_fold and gloss_fold in _CONDITION_TERMS
+        if is_condition and gloss_fold not in _DRUG_LEXICON_FOLDS:
+            return True
+    return False
+
+
+# ── Grounding guard + dose-provenance flag (invented-drug-name backstop) ────
+# _restore_drug_spelling recovers a drug name the LLM MIS-spelled but actually
+# said (source-fidelity restoration). This guard catches the other failure
+# mode: the LLM INVENTING a drug name with no plausible source in the
+# transcript at all (real case: transcript never says "nasal spray"; the LLM
+# fabricated it after failing to normalize a distorted brand name). No
+# restoration is safe here — there is nothing in the transcript to restore
+# from — so the row is converted to the numbered "unnamed medication N" form
+# instead, the same machinery the generic-term guard already uses.
+_DRUG_GROUND_MIN_SIMILARITY = 0.60
+_DOSE_PROXIMITY_TOKENS = 6
+_DOSE_DIGIT_RE = re.compile(r"\d+")
+
+
+def _transcript_words(transcript: str) -> list[str]:
+    """Role-tag-stripped surface word tokens of a transcript string."""
+    return _ROLE_TAG_RE.sub("", transcript).split()
+
+
+def _best_fold_match(drug: str, words: list[str]) -> tuple[int, int, float]:
+    """Return (start, end, ratio) of the words[]-window (sizes 1-4, see
+    _DRUG_WINDOW_SIZES) with the highest fold-similarity to `drug`.
+
+    Returns (0, 0, 0.0) when `words` is empty — no plausible match to report.
+    """
+    best_start, best_end, best_ratio = 0, 0, 0.0
+    drug_fold = _fold_drug(drug)
+    for n in _DRUG_WINDOW_SIZES:
+        for i in range(len(words) - n + 1):
+            ratio = difflib.SequenceMatcher(
+                None, drug_fold, _fold_drug(" ".join(words[i : i + n]))
+            ).ratio()
+            if ratio > best_ratio:
+                best_start, best_end, best_ratio = i, i + n, ratio
+    return best_start, best_end, best_ratio
+
+
+def _dose_digits_near_drug(dose: str, drug: str, words: list[str]) -> bool:
+    """Return True if a digit token of `dose` appears in `words` within
+    _DOSE_PROXIMITY_TOKENS of the drug's best fold-match span.
+
+    Real case: transcript never states a paracetamol dose, but the LLM glued
+    a neighbouring drug's dose onto it ("naxdom 500" -> paracetamol dose
+    "500 mg"). Returns True (no flag) when `dose` has no digits or `words` is
+    empty — nothing to check, never a false positive.
+    """
+    digit_tokens = _DOSE_DIGIT_RE.findall(dose)
+    if not digit_tokens or not words:
+        return True
+    start, end, _ = _best_fold_match(drug, words)
+    lo = max(0, start - _DOSE_PROXIMITY_TOKENS)
+    hi = min(len(words), end + _DOSE_PROXIMITY_TOKENS)
+    nearby = words[lo:hi]
+    return any(digit in w for digit in digit_tokens for w in nearby)
+
+
 def _iter_dicts(items: list, field_name: str) -> list[dict]:
     """Filter a list field to well-formed dict items, skipping malformed ones.
 
@@ -310,6 +464,7 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
     medications: list[Medication] = []
     low_conf: list[str] = list(data.get("low_confidence_fields") or [])
     n_unnamed = 0
+    transcript_words = _transcript_words(transcript)
     for m in _iter_dicts(data.get("medications") or [], "medications"):
         drug = (m.get("drug") or "").strip()
         if not drug:
@@ -328,6 +483,20 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
             if flag not in low_conf:
                 low_conf.append(flag)
             drug = label
+        elif _is_condition_term(drug):
+            # A clinical condition/gloss extracted as a medication carries no
+            # salvageable prescription info, and the information is already
+            # captured elsewhere in the note (history/diagnosis) — drop the
+            # row entirely rather than converting it to an unnamed row (see
+            # the "Condition guard" section above for the real incident).
+            logger.warning(
+                "L4: condition term %r dropped from medications (condition_in_rx)",
+                drug,
+            )
+            flag = f"medications.{drug}.condition_in_rx"
+            if flag not in low_conf:
+                low_conf.append(flag)
+            continue
         else:
             restored = _restore_drug_spelling(drug, transcript)
             if restored != drug:
@@ -336,6 +505,27 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                     drug, restored,
                 )
                 drug = restored
+            # Grounding guard: an invented drug name matches nothing in the
+            # transcript, however loosely. _restore_drug_spelling only fixes
+            # MIS-spellings of something actually said — a full invention
+            # (real case: LLM fabricated "nasal spray" out of thin air) has
+            # no transcript source to restore from, so it must never render
+            # as a real drug name. Skipped when transcript is empty (tests/
+            # eval call _build_note without one).
+            if transcript_words:
+                _, _, ground_ratio = _best_fold_match(drug, transcript_words)
+                if ground_ratio < _DRUG_GROUND_MIN_SIMILARITY:
+                    n_unnamed += 1
+                    label = f"unnamed medication {n_unnamed}"
+                    logger.warning(
+                        "L4: ungrounded drug name %r (best transcript "
+                        "similarity %.2f) converted to %r",
+                        drug, ground_ratio, label,
+                    )
+                    flag = f"medications.{label}.ungrounded"
+                    if flag not in low_conf:
+                        low_conf.append(flag)
+                    drug = label
         medications.append(
             Medication(
                 drug=drug,
@@ -378,6 +568,18 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 low_conf.append(flag)
         if med.dose is None:
             flag = f"medications.{med.drug}.dose_unknown"
+            if flag not in low_conf:
+                low_conf.append(flag)
+        elif not med.drug.startswith("unnamed medication") and not _dose_digits_near_drug(
+            med.dose, med.drug, transcript_words
+        ):
+            # Dose-provenance flag (never alters the extracted value): a dose
+            # far from every mention of its own drug is likely cross-
+            # attributed from a neighbouring medication (real case: a
+            # "naxdom 500" dose glued onto "paracetamol"). unnamed rows are
+            # skipped — there is no drug mention in the transcript to be
+            # "near" once the name itself is a fabrication.
+            flag = f"medications.{med.drug}.dose_unattributed"
             if flag not in low_conf:
                 low_conf.append(flag)
 

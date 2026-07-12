@@ -25,8 +25,8 @@
 
   <div id="stage-lines" class="stage-lines" hidden>
     <div class="stage-line" data-stage="transcribed"><span class="tick">&#10003;</span><span class="text"></span><span class="progress" hidden></span></div>
-    <div class="stage-line" data-stage="speakers"><span class="tick">&#10003;</span><span class="text"></span></div>
-    <div class="stage-line" data-stage="drafting"><span class="tick">&#10003;</span><span class="text"></span></div>
+    <div class="stage-line" data-stage="speakers"><span class="tick">&#10003;</span><span class="text"></span><span class="progress" hidden></span></div>
+    <div class="stage-line" data-stage="drafting"><span class="tick">&#10003;</span><span class="text"></span><span class="progress" hidden></span></div>
   </div>
 
   <div id="live-preview" class="live-preview" hidden>
@@ -53,6 +53,8 @@
       <button id="view-transcript-btn" class="quiet-btn"></button>
     </div>
   </header>
+
+  <div id="verification-banner" class="verification-banner" hidden></div>
 
   <div class="cell" id="cell-patient">
     <div class="label" id="label-patient"></div>
@@ -94,6 +96,7 @@
 <!-- Transcript drawer -->
 <aside id="drawer" class="drawer">
   <div class="drawer-header">
+    <button id="checked-transcript-toggle" class="drawer-toggle-btn" hidden></button>
     <button id="drawer-close-btn" class="drawer-close-btn" aria-label="close">CLOSE</button>
   </div>
   <div class="drawer-inner" id="drawer-turns"></div>

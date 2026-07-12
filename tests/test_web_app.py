@@ -8,18 +8,28 @@ import json
 import os
 import time
 
+import numpy as np
 import pytest
+import soundfile as sf
 from fastapi.testclient import TestClient
 
 import src.pipeline as pipeline
 import web.app as app_module
-from src.types import ClinicalNote
+import web.verification as verification_module
+from src.types import ClinicalNote, Diagnosis, Medication, Vital
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    """TestClient with cwd isolated to tmp_path so outputs/ never touches the repo."""
+    """TestClient with cwd isolated to tmp_path so outputs/ never touches the repo.
+
+    FAST_ASR_ENABLED is forced False here so the pre-existing status-machine
+    tests (which stub pipeline.run but never write note.json/transcript.json)
+    don't also kick off a real background verification thread — the tests
+    that specifically exercise fast-engine + verification wiring re-enable it.
+    """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app_module.config, "FAST_ASR_ENABLED", False)
     return TestClient(app_module.app)
 
 
@@ -140,7 +150,7 @@ def test_live_preview_rejects_overlapping_calls_with_429(client, monkeypatch) ->
 def test_process_advances_status_through_stages_to_review(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
         for stage in ("l1_preprocess", "l2_diarize", "l3_asr"):
             on_stage(stage, "start")
             on_stage(stage, "end")
@@ -168,7 +178,7 @@ def test_process_advances_status_through_stages_to_review(client, monkeypatch) -
 def test_process_records_error_state_on_pipeline_failure(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def failing_run(in_path, session_id=None, *, on_stage=None, on_progress=None):
+    def failing_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
         on_stage("l1_preprocess", "start")
         raise RuntimeError("boom")
 
@@ -247,6 +257,183 @@ def test_progress_callbacks_compute_eta_throttle_and_clear_on_stage_end(
     assert "eta_seconds" not in status_final
 
 
+# ── Stage-duration calibration (issue 1: instant + honest %/ETA display) ──
+
+
+def _write_calibration_session(
+    root, sid: str, *, audio_seconds: float, stage_wall_s: dict[str, float]
+) -> None:
+    """Write a synthetic outputs/<sid>/{input_16k.wav, timings.json} pair."""
+    session_dir = os.path.join(root, sid)
+    os.makedirs(session_dir, exist_ok=True)
+    sf.write(
+        os.path.join(session_dir, "input_16k.wav"),
+        np.zeros(int(audio_seconds * 16000), dtype="float32"),
+        16000,
+    )
+    stages = {name: {"wall_s": wall_s} for name, wall_s in stage_wall_s.items()}
+    with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
+        json.dump({"stages": stages}, f)
+
+
+def test_compute_stage_calibration_falls_back_when_no_history(tmp_path) -> None:
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_compute_stage_calibration_excludes_pre_windowed_engine_sessions(tmp_path) -> None:
+    """l3_asr wall/audio ratio 10.0 (>= the 2.0 cutoff) marks this a
+    pre-windowed-engine session -- excluded entirely, even for its OTHER
+    stages' otherwise-usable measurements."""
+    _write_calibration_session(
+        tmp_path,
+        "slow-session",
+        audio_seconds=10.0,
+        stage_wall_s={
+            "l2_diarize": 5.0,
+            "l3_asr": 100.0,
+            "l3_5_normalize": 15.0,
+            "l4_extract": 15.0,
+        },
+    )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_compute_stage_calibration_medians_qualifying_sessions(tmp_path) -> None:
+    """Three qualifying sessions with l2_diarize ratios 1.0/2.0/3.0 -> median 2.0."""
+    for i, ratio in enumerate([1.0, 2.0, 3.0]):
+        _write_calibration_session(
+            tmp_path,
+            f"fast-session-{i}",
+            audio_seconds=10.0,
+            stage_wall_s={
+                "l2_diarize": ratio * 10.0,
+                "l3_asr": 1.0 * 10.0,  # ratio 1.0, well under the 2.0 cutoff
+                "l3_5_normalize": 1.5 * 10.0,
+                "l4_extract": 1.2 * 10.0,
+            },
+        )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result["l2_diarize"] == pytest.approx(2.0)
+    assert result["l3_asr"] == pytest.approx(1.0)
+    assert result["l3_5_normalize"] == pytest.approx(1.5)
+    assert result["l4_extract"] == pytest.approx(1.2)
+
+
+def test_compute_stage_calibration_falls_back_per_stage_when_stage_absent(tmp_path) -> None:
+    """A qualifying session missing l4_extract entirely (e.g. it errored
+    before L4) -- l4_extract falls back to the sane constant while the other,
+    measured stages still use the session's own ratio."""
+    _write_calibration_session(
+        tmp_path,
+        "no-l4-session",
+        audio_seconds=10.0,
+        stage_wall_s={"l2_diarize": 8.0, "l3_asr": 5.0, "l3_5_normalize": 12.0},
+    )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result["l2_diarize"] == pytest.approx(0.8)
+    assert (
+        result["l4_extract"]
+        == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND["l4_extract"]
+    )
+
+
+def test_compute_stage_calibration_skips_session_missing_wav(tmp_path) -> None:
+    """A session with timings.json but no *_16k.wav -- duration can't be
+    determined, so it must be skipped, never crash the whole scan."""
+    session_dir = os.path.join(tmp_path, "no-wav-session")
+    os.makedirs(session_dir)
+    with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
+        json.dump({"stages": {"l3_asr": {"wall_s": 5.0}}}, f)
+
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_estimate_audio_seconds_returns_none_on_invalid_audio(tmp_path) -> None:
+    bogus = os.path.join(tmp_path, "bogus.wav")
+    with open(bogus, "wb") as f:
+        f.write(b"not a real wav file, just garbage bytes")
+    assert app_module._estimate_audio_seconds(bogus) is None
+
+
+def test_estimate_audio_seconds_reads_a_real_wav(tmp_path) -> None:
+    wav_path = os.path.join(tmp_path, "consult.wav")
+    sf.write(wav_path, np.zeros(16000 * 3, dtype="float32"), 16000)
+    assert app_module._estimate_audio_seconds(wav_path) == pytest.approx(3.0)
+
+
+def test_process_writes_expected_stage_seconds_scaled_by_audio_duration(
+    client, monkeypatch, tmp_path
+) -> None:
+    """expected_stage_seconds must land in status.json, scaled by THIS
+    clip's own audio duration, before pipeline.run is ever called."""
+    monkeypatch.setattr(
+        app_module,
+        "_STAGE_SECONDS_PER_AUDIO_SECOND",
+        {"l2_diarize": 1.0, "l3_asr": 2.0, "l3_5_normalize": 0.5, "l4_extract": 3.0},
+    )
+    wav_path = os.path.join(tmp_path, "consult.wav")
+    sf.write(wav_path, np.zeros(16000 * 4, dtype="float32"), 16000)  # 4.0s of audio
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
+
+    response = client.post(
+        "/api/sessions", files={"audio": ("consult.wav", wav_bytes, "audio/wav")}
+    )
+    sid = response.json()["session_id"]
+
+    captured_expected: dict = {}
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        status = app_module._read_json(app_module._status_path(session_id))
+        captured_expected.update(status.get("expected_stage_seconds", {}))
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not captured_expected:
+        time.sleep(0.01)
+
+    assert captured_expected == {
+        "l2_diarize": 4.0,
+        "l3_asr": 8.0,
+        "l3_5_normalize": 2.0,
+        "l4_extract": 12.0,
+    }
+
+
+def test_process_skips_expected_stage_seconds_when_duration_cannot_be_estimated(
+    client, monkeypatch
+) -> None:
+    """A fake/corrupt upload (as every other test's _create_session helper
+    writes) must never crash the pipeline thread -- expected_stage_seconds is
+    simply absent."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status["state"] == "review":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    assert "expected_stage_seconds" not in status
+
+
 # ── GET note (note + transcript + provenance + flags) ────────────────────
 
 
@@ -283,6 +470,119 @@ def test_get_note_before_processing_is_404(client) -> None:
     sid = _create_session(client)
     response = client.get(f"/api/sessions/{sid}/note")
     assert response.status_code == 404
+
+
+# ── note_meta precompute cache (issue 2: review-transition dead time) ────
+
+
+def test_compute_and_cache_note_meta_writes_provenance_and_flags(client) -> None:
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint="fever since Monday",
+        history=None,
+        low_confidence_fields=["chief_complaint"],
+    )
+    _write_note(sid, note)
+    _write_transcript(
+        sid,
+        [{"speaker_role": "DOCTOR", "text": "fever since Monday", "start": 0.0, "end": 2.0}],
+    )
+
+    app_module._compute_and_cache_note_meta(sid)
+
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta["provenance"]["chief_complaint"]["turn_index"] == 0
+    assert meta["flags"] == {"chief_complaint": "chief_complaint"}
+
+
+def test_get_note_reads_from_precomputed_cache_when_present(client) -> None:
+    """A sentinel value planted directly in note_meta.json proves GET .../note
+    is reading the cache rather than recomputing (which would never produce
+    this exact value)."""
+    sid = _create_session(client)
+    _write_note(sid, ClinicalNote(chief_complaint="fever", history=None))
+    _write_transcript(sid, [])
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"provenance": {"_sentinel": True}, "flags": {"_sentinel": "yes"}}, f)
+
+    response = client.get(f"/api/sessions/{sid}/note")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provenance"] == {"_sentinel": True}
+    assert body["flags"] == {"_sentinel": "yes"}
+
+
+def test_patch_note_invalidates_precomputed_cache(client) -> None:
+    """Issue 2's cache must never outlive an edit: flags are resolved from
+    CURRENT field values, so a stale cache could keep showing a flag the
+    edit itself just fixed."""
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        medications=[
+            Medication(
+                drug="Azithral", dose=None, frequency=None, timing=None,
+                duration=None, validated=False,
+            )
+        ],
+        low_confidence_fields=["medications.Azithral.unvalidated"],
+    )
+    _write_note(sid, note)
+    app_module._compute_and_cache_note_meta(sid)
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    assert app_module._read_json(meta_path)["flags"] == {
+        "medications[0].drug": "medications.Azithral.unvalidated"
+    }
+
+    client.patch(
+        f"/api/sessions/{sid}/note",
+        json={"edits": [{"field": "medications[0].drug", "old": "Azithral", "new": "Azithromycin"}]},
+    )
+
+    assert not os.path.exists(meta_path)  # cache invalidated
+    response = client.get(f"/api/sessions/{sid}/note")
+    # Recomputed inline against the EDITED note: "Azithral" no longer matches
+    # any medication by name, so the flag is unresolvable -> falls to
+    # _general instead of staying (incorrectly) pinned to medications[0].drug.
+    assert response.json()["flags"] == {"_general": ["medications.Azithral.unvalidated"]}
+
+
+def test_process_precomputes_note_meta_before_review(client, monkeypatch) -> None:
+    """Integration: the pipeline thread must write note_meta.json right after
+    pipeline.run() succeeds, before status flips to "review"."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        _write_note(session_id, ClinicalNote(chief_complaint="fever", history=None))
+        _write_transcript(session_id, [])
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status["state"] == "review":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    meta = app_module._read_json(meta_path)
+    # Empty transcript -> no provenance match possible; no low_confidence_fields
+    # on the stub note -> no flags. The precompute still ran and cached both keys.
+    assert meta == {"provenance": {}, "flags": {}}
 
 
 # ── PATCH note ─────────────────────────────────────────────────────────────
@@ -652,3 +952,353 @@ def test_get_translations_dumps_full_table(client) -> None:
     body = response.json()
     assert set(body) == {"en", "hi", "mr"}
     assert body["hi"]["medications"] == "दवाइयाँ"
+
+
+# ── background verification wiring (web/app.py <-> web/verification.py) ───
+
+
+def test_process_accurate_engine_never_starts_verification(client, monkeypatch) -> None:
+    """FAST_ASR_ENABLED is False (the client fixture's default) — status.json
+    must never gain a "verification" key for the accurate engine."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        assert asr_engine == "accurate"
+        on_stage("l1_preprocess", "start")
+        on_stage("l1_preprocess", "end")
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    calls = []
+    monkeypatch.setattr(verification_module, "run_verification", lambda sid: calls.append(sid))
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status["state"] == "review":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    time.sleep(0.05)  # verification would already have started by now if wired wrong
+    assert calls == []
+    assert "verification" not in client.get(f"/api/sessions/{sid}/status").json()
+
+
+def test_process_fast_engine_starts_verification_and_mirrors_status(client, monkeypatch) -> None:
+    """FAST_ASR_ENABLED=True: pipeline.run receives asr_engine="fast", and
+    once review is reached, web.verification.run_verification is kicked off
+    with its result mirrored into status.json's "verification" key."""
+    monkeypatch.setattr(app_module.config, "FAST_ASR_ENABLED", True)
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        assert asr_engine == "fast"
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    def fake_run_verification(sid):
+        return {
+            "state": "done",
+            "coverage": "full",
+            "fields_differing": [{"field": "medications[0].drug", "fast_value": "a", "accurate_value": "b"}],
+        }
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    monkeypatch.setattr(verification_module, "run_verification", fake_run_verification)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status.get("verification", {}).get("state") == "done":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    assert status["verification"] == {"state": "done", "n_differing": 1, "coverage": "full"}
+
+
+def test_get_verification_before_started_is_404(client) -> None:
+    sid = _create_session(client)
+    response = client.get(f"/api/sessions/{sid}/verification")
+    assert response.status_code == 404
+
+
+def test_get_verification_returns_written_file(client) -> None:
+    sid = _create_session(client)
+    payload = {"state": "done", "fields_differing": [], "coverage": "full"}
+    with open(os.path.join("outputs", sid, "verification.json"), "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+    response = client.get(f"/api/sessions/{sid}/verification")
+    assert response.status_code == 200
+    assert response.json() == payload
+
+
+# ── web/verification.py — targeted second-listen diff logic ──────────────
+
+
+def _write_silence_wav(path: str, duration_s: float, sr: int = 16000) -> None:
+    sf.write(path, np.zeros(int(duration_s * sr), dtype="float32"), sr, subtype="PCM_16")
+
+
+def _fake_decode_factory(canned: list[tuple[float, float, str]]):
+    """Fake for verification_module._decode_window_words_with_guards.
+
+    `canned` is the "ground truth" (start, end, text) for each field's own
+    accurate re-decode, independent of how the production code packs spans
+    into windows. For a requested [start, end) window, returns the words of
+    every canned span that falls entirely within it, each canned span's text
+    split into one word per whitespace token, evenly spaced across its own
+    [start, end) — so _words_in_span can recover exactly that span's text
+    regardless of how the caller padded/merged/packed it.
+    """
+
+    def fake_decode(audio, sr, start, end, repo, decode_kwargs):
+        words: list[tuple[float, float, str]] = []
+        for span_start, span_end, text in canned:
+            if span_start >= start and span_end <= end:
+                tokens = text.split()
+                if not tokens:
+                    continue
+                step = (span_end - span_start) / len(tokens)
+                for i, tok in enumerate(tokens):
+                    w_start = span_start + i * step
+                    words.append((w_start, w_start + step, tok))
+        words.sort(key=lambda w: w[0])
+        return " ".join(w[2] for w in words), words
+
+    return fake_decode
+
+
+def _setup_verification_session(
+    tmp_path,
+    monkeypatch,
+    *,
+    note: ClinicalNote,
+    turns: list[dict],
+    canned_spans: list[tuple[float, float, str]],
+    corrections: list[dict] | None = None,
+    wav_duration_s: float = 150.0,
+) -> str:
+    monkeypatch.chdir(tmp_path)
+    sid = "verify-test"
+    session_dir = os.path.join("outputs", sid)
+    os.makedirs(session_dir, exist_ok=True)
+    _write_note(sid, note)
+    _write_transcript(sid, turns)
+    if corrections:
+        with open(os.path.join(session_dir, "corrections.jsonl"), "w", encoding="utf-8") as f:
+            for c in corrections:
+                f.write(json.dumps(c) + "\n")
+    _write_silence_wav(os.path.join(session_dir, "input_16k.wav"), wav_duration_s)
+    monkeypatch.setattr(
+        verification_module, "_decode_window_words_with_guards", _fake_decode_factory(canned_spans)
+    )
+    monkeypatch.setattr(verification_module, "looks_degenerate", lambda text, audio_seconds: False)
+    return sid
+
+
+def test_run_verification_identical_and_fold_equal_values_are_not_flagged(tmp_path, monkeypatch) -> None:
+    """Identical notes -> zero differing; drug-field fold comparison
+    ("naxdom 500" vs "नक्सडम 500") -> NOT flagged (fold-equal)."""
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        vitals=[Vital(name="BP", value="120/80 mmHg")],
+        diagnosis=[Diagnosis(term="Viral fever", snomed_id=None)],
+        medications=[
+            Medication(
+                drug="naxdom 500", dose="500 mg", frequency="twice daily",
+                timing=None, duration=None, validated=True,
+            )
+        ],
+    )
+    turns = [
+        {"speaker_role": "DOCTOR", "text": "give one naxdom 500 twice daily", "start": 2.0, "end": 4.0},
+        {"speaker_role": "DOCTOR", "text": "BP is 120 over 80 mmHg", "start": 10.0, "end": 12.0},
+        {"speaker_role": "DOCTOR", "text": "looks like viral fever prescribing accordingly", "start": 20.0, "end": 22.0},
+    ]
+    canned_spans = [
+        (2.0, 4.0, "give one नक्सडम 500 twice daily"),  # Devanagari drug spelling, fold-equal
+        (10.0, 12.0, "BP is 120 over 80 mmHg"),
+        (20.0, 22.0, "looks like viral fever prescribing accordingly"),
+    ]
+    sid = _setup_verification_session(tmp_path, monkeypatch, note=note, turns=turns, canned_spans=canned_spans)
+
+    result = verification_module.run_verification(sid)
+
+    assert result["state"] == "done"
+    assert result["fields_differing"] == []
+    assert result["coverage"] == "full"
+    assert result["unverified_by_budget"] == []
+    assert result["doctor_resolved"] == []
+    assert result["verified_seconds"] > 0
+
+
+def test_run_verification_genuinely_different_value_is_flagged(tmp_path, monkeypatch) -> None:
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        medications=[
+            Medication(
+                drug="azithral", dose="250 mg", frequency="once daily",
+                timing=None, duration=None, validated=True,
+            )
+        ],
+    )
+    turns = [
+        {"speaker_role": "DOCTOR", "text": "also give azithral 250 once daily", "start": 2.0, "end": 4.0},
+    ]
+    canned_spans = [(2.0, 4.0, "also give augmentin 250 once daily")]
+    sid = _setup_verification_session(tmp_path, monkeypatch, note=note, turns=turns, canned_spans=canned_spans)
+
+    result = verification_module.run_verification(sid)
+
+    assert result["state"] == "done"
+    differing_fields = {d["field"] for d in result["fields_differing"]}
+    assert differing_fields == {"medications[0].drug"}
+    entry = result["fields_differing"][0]
+    assert entry["fast_value"] == "azithral"
+    assert "augmentin" in entry["accurate_value"]
+    # dose ("250") still present verbatim in the re-decode -> digit-exact match, not flagged.
+
+
+def test_run_verification_doctor_edited_field_excluded_and_resolved(tmp_path, monkeypatch) -> None:
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        medications=[
+            Medication(
+                drug="azithral", dose="250 mg", frequency="once daily",
+                timing=None, duration=None, validated=True,
+            )
+        ],
+    )
+    turns = [
+        {"speaker_role": "DOCTOR", "text": "also give azithral 250 once daily", "start": 2.0, "end": 4.0},
+    ]
+    canned_spans = [(2.0, 4.0, "also give augmentin 250 once daily")]  # would flag drug w/o the correction
+    corrections = [
+        {"ts": "2026-07-11T10:00:00+05:30", "field": "medications[0].drug", "old": "azithral", "new": "augmentin", "lang": "en"}
+    ]
+    sid = _setup_verification_session(
+        tmp_path, monkeypatch, note=note, turns=turns, canned_spans=canned_spans, corrections=corrections
+    )
+
+    result = verification_module.run_verification(sid)
+
+    assert result["fields_differing"] == []
+    assert result["doctor_resolved"] == ["medications[0].drug"]
+    assert result["unverified_by_budget"] == []  # excluded, not counted as unverified either
+
+
+def test_run_verification_partial_coverage_marks_unverified_by_budget(tmp_path, monkeypatch) -> None:
+    """Fields too far apart to share a window under VERIFY_MAX_WINDOWS=1 —
+    the lower-priority one is dropped and reported, not silently discarded."""
+    monkeypatch.setattr(verification_module.config, "VERIFY_MAX_WINDOWS", 1)
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        medications=[
+            Medication(
+                drug="paracetamol", dose=None, frequency=None, timing=None, duration=None, validated=True,
+            )
+        ],
+        diagnosis=[Diagnosis(term="Viral fever", snomed_id=None)],
+    )
+    turns = [
+        {"speaker_role": "DOCTOR", "text": "take paracetamol daily", "start": 2.0, "end": 4.0},
+        {"speaker_role": "DOCTOR", "text": "looks like viral fever today", "start": 100.0, "end": 102.0},
+    ]
+    canned_spans = [
+        (2.0, 4.0, "take paracetamol daily"),
+        (100.0, 102.0, "looks like viral fever today"),
+    ]
+    sid = _setup_verification_session(
+        tmp_path, monkeypatch, note=note, turns=turns, canned_spans=canned_spans, wav_duration_s=150.0
+    )
+
+    result = verification_module.run_verification(sid)
+
+    assert result["coverage"] == "partial"
+    assert result["unverified_by_budget"] == ["diagnosis[0].term"]  # lower priority than the drug
+    assert result["fields_differing"] == []  # the drug that WAS checked matched
+
+
+# ── web/verification.py — span collection / padding / merging / budget ────
+
+
+def test_merge_safety_fields_merges_overlapping_and_keeps_distant_spans_separate() -> None:
+    fields = [
+        verification_module._SafetyField(path="medications[0].drug", value="x", start=10.0, end=11.0, priority=0),
+        verification_module._SafetyField(path="medications[0].dose", value="y", start=10.5, end=11.5, priority=1),
+        verification_module._SafetyField(path="diagnosis[0].term", value="z", start=100.0, end=101.0, priority=3),
+    ]
+
+    merged = verification_module._merge_safety_fields(fields, total_duration=200.0, pad_s=1.5)
+
+    assert len(merged) == 2
+    assert merged[0].start == pytest.approx(8.5)
+    assert merged[0].end == pytest.approx(13.0)
+    assert {f.path for f in merged[0].fields} == {"medications[0].drug", "medications[0].dose"}
+    assert merged[1].fields[0].path == "diagnosis[0].term"
+    # padding clamps to the clip, never goes negative or past total_duration
+    assert merged[1].start == pytest.approx(98.5)
+    assert merged[1].end == pytest.approx(102.5)
+
+
+def test_merge_safety_fields_clamps_padding_to_clip_bounds() -> None:
+    fields = [verification_module._SafetyField(path="vitals[0].value", value="x", start=0.2, end=0.4, priority=2)]
+
+    merged = verification_module._merge_safety_fields(fields, total_duration=5.0, pad_s=1.5)
+
+    assert merged[0].start == 0.0  # start - pad_s would be negative
+    assert merged[0].end == pytest.approx(1.9)
+
+
+def test_select_within_budget_prioritizes_drug_over_dose_over_vital_over_diagnosis() -> None:
+    def span(path: str, priority: int, start: float) -> verification_module._MergedSpan:
+        f = verification_module._SafetyField(path=path, value="x", start=start, end=start + 2.0, priority=priority)
+        return verification_module._MergedSpan(start=start, end=start + 2.0, fields=[f])
+
+    # 40s apart -- no two can ever share a <=28s window.
+    spans_by_priority = [
+        span("medications[0].drug", 0, 0.0),
+        span("medications[0].dose", 1, 40.0),
+        span("vitals[0].value", 2, 80.0),
+        span("diagnosis[0].term", 3, 120.0),
+    ]
+
+    selected, skipped = verification_module._select_within_budget(
+        spans_by_priority, max_windows=1, max_window_s=28.0
+    )
+
+    assert [s.fields[0].path for s in selected] == ["medications[0].drug"]
+    assert {s.fields[0].path for s in skipped} == {
+        "medications[0].dose", "vitals[0].value", "diagnosis[0].term",
+    }
+
+
+def test_select_within_budget_keeps_lower_priority_span_that_fits_a_used_window() -> None:
+    """A later, LOWER-priority span that happens to overlap an already-
+    selected window's budget is still accepted -- priority order decides who
+    gets tried first, not who is allowed in at all."""
+    def span(path: str, priority: int, start: float, end: float) -> verification_module._MergedSpan:
+        f = verification_module._SafetyField(path=path, value="x", start=start, end=end, priority=priority)
+        return verification_module._MergedSpan(start=start, end=end, fields=[f])
+
+    spans_by_priority = [
+        span("medications[0].drug", 0, 0.0, 2.0),
+        span("vitals[0].value", 2, 3.0, 4.0),  # close enough to fit alongside the drug span
+    ]
+
+    selected, skipped = verification_module._select_within_budget(spans_by_priority, max_windows=1, max_window_s=28.0)
+
+    assert {s.fields[0].path for s in selected} == {"medications[0].drug", "vitals[0].value"}
+    assert skipped == []

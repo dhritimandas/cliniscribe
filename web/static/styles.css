@@ -145,8 +145,9 @@ html, body {
 .stage-line.done .tick { display: inline; }
 .stage-line.active { color: var(--teal); opacity: 0.55; }
 
-/* Real transcription %/ETA suffix on the "transcribed" line — always gray,
-   never the teal/amber accents, regardless of the line's own state color. */
+/* Real-time %/ETA suffix, on whichever stage-line is currently active —
+   always gray, never the teal/amber accents, regardless of the line's own
+   state color. */
 .stage-line .progress {
   color: var(--gray-400);
   text-transform: none;
@@ -217,6 +218,44 @@ html, body {
 }
 
 .topbar-controls { display: flex; align-items: center; gap: 0.75rem; }
+
+/* ---------- Background verification banner (fast + background check) ----------
+   Quiet by default (running / all clear / post-sign note); amber only for the
+   live, actionable "N fields to review" state. */
+.verification-banner {
+  padding: 0.5rem 1.5rem;
+  border-bottom: 1px solid var(--gray-200);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+  color: var(--gray-600);
+}
+
+.verification-banner.attention { color: var(--amber); }
+
+.verify-diff {
+  margin-top: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.verify-diff-text { color: var(--gray-600); }
+
+.use-checked-btn {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--teal);
+  background: #fff;
+  color: var(--teal);
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+}
+
+.use-checked-btn:hover { background: rgba(15, 118, 110, 0.08); }
 
 .lang-select {
   font-family: var(--font-mono);
@@ -454,7 +493,7 @@ html, body {
   position: sticky;
   top: 0;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   padding: 0.9rem 1.25rem 0.6rem;
   background: var(--gray-050);
   border-bottom: 1px solid var(--gray-200);
@@ -474,6 +513,20 @@ html, body {
 }
 
 .drawer-close-btn:hover { border-color: var(--gray-400); }
+
+.drawer-toggle-btn {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid var(--gray-200);
+  background: #fff;
+  color: var(--gray-600);
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.drawer-toggle-btn.active { color: var(--teal); border-color: var(--teal); }
 
 .drawer-inner { padding: 1.5rem 1.25rem; }
 

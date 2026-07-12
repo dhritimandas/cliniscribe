@@ -716,3 +716,214 @@ def test_restoration_noop_on_empty_transcript() -> None:
     from src.l4_extract import _restore_drug_spelling
 
     assert _restore_drug_spelling("नक्सडम 500", "") == "नक्सडम 500"
+
+
+# ── Grounding guard (invented-drug-name backstop) ───────────────────────────
+#
+# Real incident (outputs/20260711-184756-36c330/): the doctor said "naxdom
+# 500" but Whisper wrote a spelling variant ("नैक्स्टोम"/"नेक्स्टोम") absent
+# from the L3.5 curated table. L3.5 could not normalize it, and qwen2.5:3b
+# then INVENTED "nasal spray" as the drug name — a full fabrication with no
+# source in the transcript, which _restore_drug_spelling cannot catch (it
+# only restores fold-matches >= 0.80; an invention matches nothing). The
+# grounding guard is the systemic fix: any drug name below fold-similarity
+# 0.60 to every transcript window is converted to the numbered "unnamed
+# medication N" form instead of rendering as a real drug.
+
+
+def test_invented_drug_name_becomes_unnamed_with_ungrounded_flag() -> None:
+    """A drug name with no plausible source in the transcript must never
+    render as a real drug — it is converted to an unnamed row instead."""
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: aur ek naxdom 500 khaiyega"
+    data = {"medications": [{"drug": "budecort inhaler", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "unnamed medication 1"
+    assert "medications.unnamed medication 1.ungrounded" in note.low_confidence_fields
+
+
+def test_generic_check_precedence_over_grounding_for_nasal_spray() -> None:
+    """Real case: the LLM invented "nasal spray" as a drug name. It is now
+    also a whole-string generic term (fix: defense in depth), and the generic
+    check runs BEFORE the grounding guard (unchanged precedence) — so the row
+    becomes unnamed via the .unnamed flag, and the .ungrounded path is never
+    reached for this specific string. Both paths converge on the same safe
+    outcome (never a real drug name), but only one flag fires.
+    """
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: aur ek naxdom 500 khaiyega"
+    data = {"medications": [{"drug": "nasal spray", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "unnamed medication 1"
+    flags = note.low_confidence_fields
+    assert any(f.endswith(".unnamed") for f in flags)
+    assert not any(f.endswith(".ungrounded") for f in flags)
+
+
+def test_grounded_drug_name_left_untouched() -> None:
+    """A drug name that DOES appear in the transcript must pass through
+    unchanged — the guard must not flag real, spoken drug names."""
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: paracetamol lijiye roz do baar"
+    data = {"medications": [{"drug": "paracetamol", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "paracetamol"
+    assert not any(f.endswith(".ungrounded") for f in note.low_confidence_fields)
+
+
+def test_grounding_guard_skipped_on_empty_transcript() -> None:
+    """Empty transcript => skip the guard entirely (tests/eval call
+    _build_note without a transcript)."""
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "budecort inhaler", "dose": None}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "budecort inhaler"
+    assert not any(f.endswith(".ungrounded") for f in note.low_confidence_fields)
+
+
+# ── Dose-provenance flag (cross-attribution backstop) ───────────────────────
+#
+# Real incident (same session): the doctor never stated a paracetamol dose
+# ("पैरसेट मॉल दिन में दो बार" — no number), but the LLM attached "500 mg" to
+# paracetamol anyway — the 500 belongs to naxdom, spoken elsewhere in the
+# transcript. This flag is flag-only: it never modifies the extracted dose,
+# it only tells the reviewing physician to check.
+
+
+def test_dose_unattributed_fires_when_dose_far_from_drug_mention() -> None:
+    from src.l4_extract import _build_note
+
+    transcript = (
+        "[UNKNOWN]: paracetamol lijiye subah shaam roz\n"
+        "[UNKNOWN]: aur ek naxdom 500 khaiyega roz ek baar"
+    )
+    data = {
+        "medications": [
+            {"drug": "paracetamol", "dose": "500 mg", "frequency": "twice daily"}
+        ]
+    }
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].dose == "500 mg"  # value is never altered
+    assert "medications.paracetamol.dose_unattributed" in note.low_confidence_fields
+
+
+def test_dose_unattributed_does_not_fire_when_dose_adjacent_to_drug() -> None:
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: paracetamol 500 mg subah shaam roz"
+    data = {
+        "medications": [
+            {"drug": "paracetamol", "dose": "500 mg", "frequency": "twice daily"}
+        ]
+    }
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].dose == "500 mg"
+    assert not any(
+        f.endswith(".dose_unattributed") for f in note.low_confidence_fields
+    )
+
+
+def test_dose_unattributed_skipped_for_unnamed_medication_rows() -> None:
+    """An ungrounded/generic row has no real drug mention to be "near" — the
+    dose-provenance check must not fire for it."""
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: aur ek naxdom 500 khaiyega"
+    data = {"medications": [{"drug": "nasal spray", "dose": "500 mg"}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "unnamed medication 1"
+    assert not any(
+        f.endswith(".dose_unattributed") for f in note.low_confidence_fields
+    )
+
+
+# ── Condition guard (category-error backstop) ───────────────────────────────
+#
+# Real incident (outputs/20260712-124506-715247, 2026-07-12): patient said
+# "मेरा BP (Hypertension) भी हाई है" — L3.5 correctly glossed "BP" with its
+# clinical name "(Hypertension)", and qwen2.5:3b then extracted the
+# parenthetical itself as a MEDICATION drug name. The grounding guard passes
+# this string (it IS in the transcript) — grounding catches inventions, not
+# category errors. The condition guard drops the row entirely: it is a
+# clinical condition, not a drug, and the information is already captured
+# elsewhere in the note (history/diagnosis).
+
+
+def test_condition_gloss_dropped_from_medications() -> None:
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: मेरा BP (Hypertension) भी हाई है"
+    data = {"medications": [{"drug": "(Hypertension) भी", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications == []
+    assert "medications.(Hypertension) भी.condition_in_rx" in note.low_confidence_fields
+
+
+def test_condition_raw_english_variant_dropped() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "Hypertension", "dose": None}]}
+    note = _build_note(data, transcript="[UNKNOWN]: Hypertension noted")
+    assert note.medications == []
+    assert "medications.Hypertension.condition_in_rx" in note.low_confidence_fields
+
+
+def test_condition_guard_precedence_over_generic_check_unaffected() -> None:
+    """Generic-term check still runs first — a generic term must still become
+    an unnamed row, not fall through to the condition check."""
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "दवाई", "dose": None}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+
+
+def test_condition_guard_does_not_drop_real_drug() -> None:
+    """A real, grounded drug name must pass through untouched."""
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: paracetamol lijiye roz do baar"
+    data = {"medications": [{"drug": "paracetamol", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "paracetamol"
+    assert not any(f.endswith(".condition_in_rx") for f in note.low_confidence_fields)
+
+
+def test_condition_guard_does_not_false_positive_on_substring_brand() -> None:
+    """A real brand name containing a condition-ish substring ("cheston
+    cold" contains "cold") must not be dropped — the guard requires an
+    EXACT fold match (or an exact-matching parenthetical gloss), never a
+    substring match, precisely to avoid this false positive."""
+    from src.l4_extract import _is_condition_term
+
+    assert _is_condition_term("cheston cold") is False
+
+
+def test_no_drug_lexicon_entry_matches_condition_set() -> None:
+    """Collision check (brief requirement): no canonical drug-lexicon entry
+    must fold-match a condition term. If this ever fires, drug-lexicon
+    membership takes precedence (see _is_condition_term) — the failing
+    entry would need to be handled there, not by shrinking the condition set.
+    """
+    from src.l4_extract import _CONDITION_TERMS, _fold_drug
+    from src.drug_lexicon import DRUG_LEXICON
+
+    collisions = [
+        d for d in DRUG_LEXICON if _fold_drug(d).replace(" ", "") in _CONDITION_TERMS
+    ]
+    assert collisions == [], f"Drug entries collide with conditions: {collisions}"
+
+
+def test_drug_lexicon_precedence_wins_over_condition_set(monkeypatch) -> None:
+    """Direct test of the precedence rule itself (no natural collision exists
+    today — see test above): if a fold key were ever a member of BOTH sets,
+    drug-lexicon membership must win and the row must NOT be dropped.
+    """
+    import src.l4_extract as l4
+
+    monkeypatch.setattr(l4, "_DRUG_LEXICON_FOLDS", frozenset({"hypertension"}))
+    assert l4._is_condition_term("Hypertension") is False

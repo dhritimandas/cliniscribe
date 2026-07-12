@@ -73,11 +73,21 @@ const MOCK_TRANSLATIONS = {
 const UI_STRINGS = {
   use_audio_file: "use audio file instead",
   save: "save",
-  draft_pdf: "draft pdf",
+  draft_pdf: "draft pdf and print",
   download_pdf: "download pdf",
   original: "original",
   editing_original: "editing original",
   live_preview_label: "LIVE PREVIEW — final transcript follows",
+  // Background verification (fast + background check architecture).
+  verify_running: "background check running…",
+  verify_clear: "background check: all clear",
+  verify_fields_prefix: "background check: ",
+  verify_fields_suffix: " fields to review",
+  verify_partial_suffix: " · partial check",
+  verify_after_sign_prefix: "check completed after signing: ",
+  verify_after_sign_suffix: " differences logged",
+  use_checked_version: "use checked version",
+  checked_transcript: "checked transcript",
 };
 function u(key) { return UI_STRINGS[key]; }
 
@@ -265,6 +275,14 @@ let pendingEdits = {};     // { path: {field, old, new} }
 let translatedValues = {};      // { path: translated text }
 let translatedTranscript = [];  // [translated text] aligned to transcriptData
 let translationsByLang = {};    // client-side cache: { lang: {note_values, transcript} }
+
+// Background verification (fast + background check architecture): the fast
+// engine's note is reviewable immediately; a daemon-thread "second listen"
+// (web/verification.py) re-checks safety-critical fields and reports here.
+let verificationData = null;       // full GET .../verification body, once fetched
+let lastVerificationState = null;  // dedupes re-fetching on every 1s status poll
+let lastVerificationStatusObj = null;  // last {state, n_differing, coverage} from status.json
+let showCheckedTranscript = false; // drawer toggle: original transcript vs. checked spans
 
 function t(key) {
   const table = translations[currentLang] || {};
@@ -563,9 +581,8 @@ function setStageLine(stageKey, state) {
   if (state) el.classList.add(state);
 }
 
-// Real transcription %/ETA suffix on the "transcribed" line (spec: appears
-// only once the first progress datum arrives, disappears when l3_asr ends —
-// status.json's "progress"/"eta_seconds" are absent outside that window).
+// %/ETA suffix, on whichever stage-line is active (spec: appears the instant
+// a calibrated stage starts, disappears the moment it ends).
 function formatEtaSuffix(etaSeconds) {
   if (typeof etaSeconds !== "number") return "";
   const rounded = etaSeconds < 60
@@ -574,16 +591,110 @@ function formatEtaSuffix(etaSeconds) {
   return ` · ${rounded}`;
 }
 
-function updateTranscribeProgress(status) {
-  const el = stageLinesEl.querySelector('[data-stage="transcribed"] .progress');
-  if (status.stage !== "l3_asr" || typeof status.progress !== "number") {
-    el.hidden = true;
-    el.textContent = "";
+/* ---------- Calibrated + real-time stage progress (issue 1) ----------
+ * Three DOM stage-lines (index.html: data-stage="transcribed"/"speakers"/
+ * "drafting") map to four BACKEND stage names that can carry a %/ETA suffix.
+ * l1_preprocess is intentionally excluded: it is fast and low-variance
+ * (never had a %/ETA display even before this fix — see web/app.py's
+ * calibration comment) and is not one of the four stages the server
+ * calibrates.
+ *
+ * l3_asr is the ONLY stage with a real per-window progress callback
+ * (src/fast_asr.py's on_progress, mirrored into status.json's
+ * "progress"/"eta_seconds"). l2_diarize, l3_5_normalize, and l4_extract have
+ * no internal callback at all — calibrated interpolation against the
+ * server's expected_stage_seconds is the whole story for them, which is
+ * honest because they are short, low-variance stages where a calibrated
+ * median is a reasonable stand-in for "how far along am I".
+ *
+ * Instantness is bounded by the status-poll cadence (500ms-1s): a stage's
+ * suffix can only appear once the SPA has polled and observed that stage is
+ * active. There is no push channel here (out of scope) to do better than
+ * that. Once observed, though, the suffix itself is not poll-cadence-limited
+ * — a separate, faster interval (renderSmoothProgress) advances the display
+ * every SMOOTH_PROGRESS_INTERVAL_MS by wall-clock time alone, so it never
+ * visibly freezes between polls. */
+const STAGE_TO_LINE = {
+  l2_diarize: "transcribed",
+  l3_asr: "transcribed",
+  l3_5_normalize: "speakers",
+  l4_extract: "drafting",
+};
+
+// Client-side fallback, used only if the server never wrote
+// status.expected_stage_seconds (e.g. it could not estimate the upload's
+// audio duration) — rough seconds, NOT audio-scaled, just enough to keep the
+// display honest-ish rather than blank.
+const FALLBACK_STAGE_SECONDS = { l2_diarize: 10, l3_asr: 15, l3_5_normalize: 18, l4_extract: 20 };
+
+const SMOOTH_PROGRESS_INTERVAL_MS = 200;
+
+let expectedStageSeconds = {};  // status.expected_stage_seconds, cached once per session
+let stageProgressModel = null;  // { stage, clientStart, expectedSeconds, real: {...}|null }
+let smoothProgressHandle = null;
+
+function updateStageProgressFromStatus(status) {
+  if (status.expected_stage_seconds) expectedStageSeconds = status.expected_stage_seconds;
+
+  const stage = STAGE_TO_LINE[status.stage] ? status.stage : null;
+  if (!stage) {
+    stageProgressModel = null;
     return;
   }
-  const pct = Math.round(status.progress * 100);
-  el.textContent = ` · ${pct}%${formatEtaSuffix(status.eta_seconds)}`;
-  el.hidden = false;
+  if (!stageProgressModel || stageProgressModel.stage !== stage) {
+    stageProgressModel = {
+      stage,
+      clientStart: Date.now(),
+      expectedSeconds: expectedStageSeconds[stage] || FALLBACK_STAGE_SECONDS[stage] || 15,
+      real: null,
+    };
+  }
+  if (stage === "l3_asr" && typeof status.progress === "number") {
+    stageProgressModel.real = {
+      progress: status.progress,
+      etaSeconds: typeof status.eta_seconds === "number" ? status.eta_seconds : 0,
+      capturedAtMs: Date.now(),
+    };
+  }
+}
+
+// Blend rule: a real progress/eta datum (l3_asr only) always wins the moment
+// it arrives; between polls, both the real-anchored model and the
+// calibration-only model advance by wall-clock time alone. Both branches
+// compute the SAME two numbers (pct, etaSeconds) from one implied total
+// duration, so they can never visibly disagree with each other.
+function currentStageDisplay(nowMs) {
+  const model = stageProgressModel;
+  if (!model) return null;
+
+  let totalExpected, elapsedTotal;
+  if (model.real) {
+    const { progress, etaSeconds, capturedAtMs } = model.real;
+    const dt = (nowMs - capturedAtMs) / 1000;
+    totalExpected = progress < 1 ? etaSeconds / (1 - progress) : (nowMs - model.clientStart) / 1000;
+    elapsedTotal = totalExpected - etaSeconds + dt;
+  } else {
+    totalExpected = model.expectedSeconds;
+    elapsedTotal = (nowMs - model.clientStart) / 1000;
+  }
+  if (!(totalExpected > 0)) return null;
+
+  const pct = Math.min(0.95, Math.max(0, elapsedTotal / totalExpected));
+  return { line: STAGE_TO_LINE[model.stage], pct, etaSeconds: totalExpected * (1 - pct) };
+}
+
+function renderSmoothProgress() {
+  const display = currentStageDisplay(Date.now());
+  for (const line of ["transcribed", "speakers", "drafting"]) {
+    const el = stageLinesEl.querySelector(`[data-stage="${line}"] .progress`);
+    if (display && display.line === line) {
+      el.textContent = ` · ${Math.round(display.pct * 100)}%${formatEtaSuffix(display.etaSeconds)}`;
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+      el.textContent = "";
+    }
+  }
 }
 
 function applyStatus(status) {
@@ -592,35 +703,123 @@ function applyStatus(status) {
 
   const transcribedDone = done.has("l1_preprocess") && done.has("l2_diarize") && done.has("l3_asr");
   setStageLine("transcribed", transcribedDone ? "done" : (stage && ["l1_preprocess", "l2_diarize", "l3_asr"].includes(stage) ? "active" : ""));
-  updateTranscribeProgress(status);
 
   const speakersDone = done.has("l3_5_normalize");
   setStageLine("speakers", speakersDone ? "done" : (stage === "l3_5_normalize" ? "active" : ""));
 
   const draftingDone = done.has("l4_extract");
   setStageLine("drafting", draftingDone ? "done" : (stage === "l4_extract" ? "active" : ""));
+
+  updateStageProgressFromStatus(status);
+}
+
+// (d) Background verification is polled on this SAME status timer — no new
+// timer. Once "review" is reached the SPA keeps polling (instead of
+// stopping, as it did before verification existed) so it can learn when a
+// fast-engine session's background check finishes; it stops once
+// verification reaches a terminal state, or after a short grace window if
+// this session never gets a "verification" key at all (the accurate engine
+// never starts one — see web/app.py's _run_pipeline_thread).
+const VERIFICATION_POLL_GRACE_TICKS = 5;
+let reviewLoaded = false;
+let verificationPollGraceTicks = 0;
+
+// Issue 2: poll faster once L4/L5 are in play, so the SPA notices "review"
+// (and the note itself, via maybePrefetchNote below) sooner than the
+// standard 1s cadence — cheap, since these are the LAST couple of stages.
+const STATUS_POLL_NORMAL_MS = 1000;
+const STATUS_POLL_FAST_MS = 500;
+let pollingActive = false;
+
+function isFastPollPhase(status) {
+  const done = status.stages_done || [];
+  return status.stage === "l4_extract" || status.stage === "l5_render" || done.includes("l4_extract");
+}
+
+// Issue 2: kick off GET .../note as soon as L4 has finished — well before
+// status flips to "review" (L5 render + note_meta precompute + a poll tick
+// still stand between the two) — so the note is often already in hand by
+// the time the SPA notices "review".
+let notePrefetchPromise = null;
+let notePrefetchStartedForSid = null;
+
+async function fetchNoteJson() {
+  const res = await api(`/api/sessions/${sessionId}/note`);
+  if (!res.ok) throw new Error(`note fetch failed: ${res.status}`);
+  return res.json();
+}
+
+function maybePrefetchNote(status) {
+  if (reviewLoaded) return;
+  if (!(status.stages_done || []).includes("l4_extract")) return;
+  if (notePrefetchStartedForSid === sessionId) return;  // already in flight or resolved
+  notePrefetchStartedForSid = sessionId;
+  notePrefetchPromise = fetchNoteJson().catch((err) => {
+    // Likely a tight race with L5/note_meta not written yet -- clear the
+    // guard so the next poll tick (still the 500ms "fast" phase) retries.
+    notePrefetchStartedForSid = null;
+    throw err;
+  });
+}
+
+function stopStatusPolling() {
+  pollingActive = false;
+  if (smoothProgressHandle) { clearInterval(smoothProgressHandle); smoothProgressHandle = null; }
+  stageProgressModel = null;
+  renderSmoothProgress();
+}
+
+async function runStatusPoll() {
+  if (!pollingActive) return;
+  let nextDelayMs = STATUS_POLL_NORMAL_MS;
+  // A transient 500 (e.g. a status.json write in progress server-side) must
+  // never break polling — swallow and silently retry next tick.
+  try {
+    const res = await api(`/api/sessions/${sessionId}/status`);
+    if (res.ok) {
+      const status = await res.json();
+      applyStatus(status);
+      if (isFastPollPhase(status)) nextDelayMs = STATUS_POLL_FAST_MS;
+      maybePrefetchNote(status);
+      if (status.state === "review" && !reviewLoaded) {
+        reviewLoaded = true;
+        await loadNoteAndShowReview();
+      }
+      if (reviewLoaded || status.state === "signed") {
+        if (status.verification) {
+          handleVerificationStatus(status.verification);
+          if (status.verification.state === "done" || status.verification.state === "failed") {
+            stopStatusPolling();
+            return;
+          }
+        } else {
+          verificationPollGraceTicks += 1;
+          if (verificationPollGraceTicks > VERIFICATION_POLL_GRACE_TICKS) {
+            stopStatusPolling();
+            return;
+          }
+        }
+      }
+      // status.error is surfaced only via console — no dashboard element per spec.
+      if (status.error) console.error("pipeline error:", status.error);
+    }
+  } catch (err) {
+    console.error("status poll failed, retrying next tick:", err);
+  }
+  if (pollingActive) statusPollHandle = setTimeout(runStatusPoll, nextDelayMs);
 }
 
 function startStatusPolling() {
   applyStatus({ state: "processing", stage: null, stages_done: [] });
-  statusPollHandle = setInterval(async () => {
-    // A transient 500 (e.g. a status.json write in progress server-side)
-    // must never break polling — swallow and silently retry next tick.
-    try {
-      const res = await api(`/api/sessions/${sessionId}/status`);
-      if (!res.ok) return;
-      const status = await res.json();
-      applyStatus(status);
-      if (status.state === "review") {
-        clearInterval(statusPollHandle);
-        await loadNoteAndShowReview();
-      }
-      // status.error is surfaced only via console — no dashboard element per spec.
-      if (status.error) console.error("pipeline error:", status.error);
-    } catch (err) {
-      console.error("status poll failed, retrying next tick:", err);
-    }
-  }, 1000);
+  reviewLoaded = false;
+  verificationPollGraceTicks = 0;
+  expectedStageSeconds = {};
+  stageProgressModel = null;
+  notePrefetchPromise = null;
+  notePrefetchStartedForSid = null;
+  pollingActive = true;
+  smoothProgressHandle = setInterval(renderSmoothProgress, SMOOTH_PROGRESS_INTERVAL_MS);
+  statusPollHandle = setTimeout(runStatusPoll, STATUS_POLL_NORMAL_MS);
 }
 
 micRing.addEventListener("click", () => {
@@ -659,6 +858,8 @@ const noteGrid = document.getElementById("note-grid");
 const generalFlagsEl = document.getElementById("general-flags");
 const drawerEl = document.getElementById("drawer");
 const drawerTurnsEl = document.getElementById("drawer-turns");
+const verificationBannerEl = document.getElementById("verification-banner");
+const checkedTranscriptToggleEl = document.getElementById("checked-transcript-toggle");
 
 // Bug 1 (target-language-absolute): cheap client-side check for whether the
 // note/transcript carries any non-Latin (Devanagari or Arabic) script, so a
@@ -681,9 +882,134 @@ function noteHasNonLatinScript(note, turns) {
   return texts.some((text) => NON_LATIN_SCRIPT_RE.test(text));
 }
 
-async function loadNoteAndShowReview() {
-  const res = await api(`/api/sessions/${sessionId}/note`);
+/* =====================================================================
+ * Background verification (fast + background check architecture)
+ * ===================================================================== */
+
+function isSignedNow() {
+  return !signedPanel.hidden;
+}
+
+// Three banner states (spec): running / all clear / N fields to review, plus
+// a fourth, read-only wording once the doctor has already signed — the note
+// is final at that point, so this is informational only, never actionable.
+function verificationBannerText(verification, signed) {
+  if (!verification) return null;
+  const n = verification.n_differing || 0;
+  const partialSuffix = verification.coverage === "partial" ? u("verify_partial_suffix") : "";
+  if (signed) {
+    if (verification.state !== "done") return null;
+    return `${u("verify_after_sign_prefix")}${n}${u("verify_after_sign_suffix")}`;
+  }
+  if (verification.state === "running") return u("verify_running");
+  if (verification.state === "done") {
+    return n === 0
+      ? `${u("verify_clear")} ✓${partialSuffix}`
+      : `${u("verify_fields_prefix")}${n}${u("verify_fields_suffix")}${partialSuffix}`;
+  }
+  return null; // "failed": no banner line, per spec's three live states
+}
+
+function updateVerificationBanner(verification) {
+  const text = verificationBannerText(verification, isSignedNow());
+  if (!text) {
+    verificationBannerEl.hidden = true;
+    return;
+  }
+  verificationBannerEl.hidden = false;
+  verificationBannerEl.textContent = text;
+  verificationBannerEl.classList.toggle(
+    "attention",
+    !isSignedNow() && verification.state === "done" && (verification.n_differing || 0) > 0
+  );
+}
+
+function updateCheckedTranscriptToggle() {
+  const available = !!(verificationData && (verificationData.transcript_accurate || []).length);
+  checkedTranscriptToggleEl.hidden = !available;
+  checkedTranscriptToggleEl.textContent = u("checked_transcript");
+  checkedTranscriptToggleEl.classList.toggle("active", showCheckedTranscript);
+}
+
+async function fetchVerificationDetails() {
+  try {
+    const res = await api(`/api/sessions/${sessionId}/verification`);
+    if (!res.ok) return;
+    verificationData = await res.json();
+  } catch (err) {
+    console.error("verification fetch failed:", err);
+    return;
+  }
+  updateCheckedTranscriptToggle();
+  if (screenReview.classList.contains("active")) {
+    renderReview();
+    renderDrawer();
+  }
+}
+
+// Called on every status poll tick once the review screen has loaded (or the
+// session is signed) — (d) "poll verification state on the same status poll,
+// no new timer". Fetches the full diff/transcript detail only once, the
+// first time verification reaches a terminal state.
+function handleVerificationStatus(verification) {
+  lastVerificationStatusObj = verification;
+  updateVerificationBanner(verification);
+  if (!verification || verification.state === lastVerificationState) return;
+  lastVerificationState = verification.state;
+  if (verification.state === "done" || verification.state === "failed") {
+    fetchVerificationDetails();
+  }
+}
+
+// A field is flagged if either the original L4 note flags it OR background
+// verification found a difference — but never after signing (note.json is
+// final; no more flags-editing, per the sign-interplay rule).
+function verificationDiffFor(path) {
+  if (!verificationData || isSignedNow()) return null;
+  return (verificationData.fields_differing || []).find((d) => d.field === path) || null;
+}
+
+function isFlagged(path) {
+  return !!flagsData[path] || !!verificationDiffFor(path);
+}
+
+async function applyCheckedVersion(path) {
+  const diff = verificationDiffFor(path);
+  if (!diff) return;
+  const oldVal = baselineValues[path] === "" ? null : baselineValues[path];
+  const newVal = diff.accurate_value;
+  const res = await api(`/api/sessions/${sessionId}/note`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edits: [{ field: path, old: oldVal, new: newVal }] }),
+  });
   const data = await res.json();
+  noteData = data.note;
+  baselineValues[path] = newVal ?? "";
+  delete pendingEdits[path];
+  if (verificationData) {
+    verificationData.fields_differing = (verificationData.fields_differing || []).filter(
+      (d) => d.field !== path
+    );
+  }
+  renderReview();
+}
+
+async function loadNoteAndShowReview() {
+  // Issue 2: reuse the in-flight/already-resolved prefetch kicked off by
+  // maybePrefetchNote as soon as l4_extract finished, instead of always
+  // paying for a fresh GET .../note round trip here. A prefetch failure
+  // (e.g. the tight race before L5/note_meta finished writing) falls back to
+  // a normal fetch, exactly as before this change.
+  let data = null;
+  if (notePrefetchPromise) {
+    try {
+      data = await notePrefetchPromise;
+    } catch (err) {
+      data = null;
+    }
+  }
+  if (!data) data = await fetchNoteJson();
   noteData = data.note;
   transcriptData = data.transcript || [];
   provenanceData = data.provenance || {};
@@ -693,6 +1019,11 @@ async function loadNoteAndShowReview() {
   translatedValues = {};
   translatedTranscript = [];
   translationsByLang = {};
+  verificationData = null;
+  lastVerificationState = null;
+  showCheckedTranscript = false;
+  updateVerificationBanner(null);
+  updateCheckedTranscriptToggle();
   // Bug 1: the selected language (default "en") may mismatch the note's
   // dominant script (e.g. a Hindi/Urdu-script consultation with English
   // still selected) — fire the translation immediately so the first paint
@@ -738,14 +1069,14 @@ function valueCellHtml(path, rawValue) {
 
 function scalarFieldCell(labelKey, path) {
   const raw = getValueAtPath(noteData, path);
-  const flagReason = flagsData[path];
-  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, raw);
+  const flagged = isFlagged(path);
+  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, raw) || verificationDiffFor(path);
 
   return `
-  <div class="cell field ${flagReason ? "flagged" : ""}" data-path="${path}">
+  <div class="cell field ${flagged ? "flagged" : ""}" data-path="${path}">
     <div class="label">
       <span>${t(labelKey)}</span>
-      ${flagReason ? `<span class="badge">${t("verify")}</span>` : ""}
+      ${flagged ? `<span class="badge">${t("verify")}</span>` : ""}
       ${hasDetail ? `<button class="prov-trigger" data-prov-path="${path}">source</button>` : ""}
     </div>
     ${valueCellHtml(path, raw)}
@@ -754,15 +1085,15 @@ function scalarFieldCell(labelKey, path) {
 }
 
 function itemRow(path, rawValue, detailText, leadingLabel) {
-  const flagReason = flagsData[path];
-  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, rawValue);
+  const flagged = isFlagged(path);
+  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, rawValue) || verificationDiffFor(path);
 
   return `
-  <div class="item-row ${flagReason ? "flagged" : ""}" data-path="${path}">
+  <div class="item-row ${flagged ? "flagged" : ""}" data-path="${path}">
     ${leadingLabel ? `<span class="item-detail">${escapeHtml(leadingLabel)}</span>` : ""}
     ${hasDetail ? `<button class="prov-trigger" data-prov-path="${path}">source</button>` : ""}
     ${valueCellHtml(path, rawValue)}
-    ${flagReason ? `<span class="badge">${t("verify")}</span>` : ""}
+    ${flagged ? `<span class="badge">${t("verify")}</span>` : ""}
     ${detailText ? `<span class="item-detail">${escapeHtml(detailText)}</span>` : ""}
   </div>
   <div class="prov" data-prov-for="${path}" hidden></div>`;
@@ -832,13 +1163,13 @@ function medicationsCellHtml() {
       const isEmpty = raw === null || raw === undefined || raw === "";
       const display = isEmpty ? t("empty") : escapeHtml(raw);
       baselineValues[path] = isEmpty ? "" : String(raw);
-      const flagReason = flagsData[path];
-      const hasProv = provenanceData[path];
-      return `<td class="${flagReason ? "flagged" : ""}" data-path="${path}">
+      const flagged = isFlagged(path);
+      const hasProv = provenanceData[path] || verificationDiffFor(path);
+      return `<td class="${flagged ? "flagged" : ""}" data-path="${path}">
         <div class="rx-cell-wrap">
           ${hasProv ? `<button class="prov-trigger" data-prov-path="${path}">source</button>` : ""}
           <div class="value" contenteditable="true" data-path="${path}" data-empty="${isEmpty}">${display}</div>
-          ${flagReason ? `<span class="badge">${t("verify")}</span>` : ""}
+          ${flagged ? `<span class="badge">${t("verify")}</span>` : ""}
         </div>
         <div class="prov" data-prov-for="${path}" hidden></div>
       </td>`;
@@ -973,11 +1304,32 @@ function toggleProvenance(path) {
       `<div class="source-line">${escapeHtml(prov.snippet)} ${formatTs(prov.start, prov.end)}</div>`
     );
   }
+  const diff = verificationDiffFor(path);
+  if (diff) {
+    const diffText = `fast: ${diff.fast_value ?? ""} / check: ${diff.accurate_value ?? ""}`;
+    parts.push(
+      `<div class="verify-diff"><span class="verify-diff-text">${escapeHtml(diffText)}</span>` +
+        `<button class="use-checked-btn" data-use-checked-path="${escapeHtml(path)}">${u("use_checked_version")}</button></div>`
+    );
+  }
   if (!parts.length) return;
   panel.innerHTML = parts.join("");
   panel.hidden = false;
   if (prov) scrollDrawerToTurn(prov.turn_index);
 }
+
+// Event delegation: the "use checked version" button lives inside a .prov
+// panel that is rendered on demand (toggleProvenance), long after
+// attachFieldHandlers() ran — attached once on the stable noteGrid container
+// rather than per-render, since noteGrid.innerHTML is replaced wholesale on
+// every renderReview() call but noteGrid itself never is.
+noteGrid.addEventListener("click", (e) => {
+  const btn = e.target.closest(".use-checked-btn");
+  if (!btn) return;
+  applyCheckedVersion(btn.dataset.useCheckedPath).catch((err) =>
+    console.error("use checked version failed:", err)
+  );
+});
 
 /* ---------- Save (PATCH) ---------- */
 
@@ -995,9 +1347,70 @@ document.getElementById("save-btn").addEventListener("click", async () => {
   pendingEdits = {};
 });
 
+/* ---------- Draft PDF (print, staying on the review page) ----------
+ * "DRAFT PDF AND PRINT" must overlay the browser's print dialog on the
+ * CURRENT review page — no new tab, no focus jump. The /pdf endpoint always
+ * answers with Content-Disposition: attachment (web/app.py get_pdf) so
+ * pointing a plain iframe.src straight at that URL only forces a file
+ * download — there is never an inline, printable document to call .print()
+ * on. Fetching the bytes ourselves and handing the browser a blob: URL
+ * (which carries no Content-Disposition) sidesteps that and renders inline.
+ * Printing is done from a hidden iframe's own 'load' event: verified against
+ * headless Chrome that Chromium's built-in PDF viewer never initializes
+ * (and 'load' never fires) inside a zero-area frame, hence the real
+ * off-screen size below, not 0x0. A new tab is opened ONLY as a fallback, if
+ * the iframe's print() itself throws (or the fetch/blob step fails) — never
+ * as a matter of course.
+ */
+document.getElementById("draft-pdf-link").addEventListener("click", async (event) => {
+  if (!sessionId) return;
+  event.preventDefault();
+  const url = event.currentTarget.href;
+  try {
+    const res = await api(url);
+    if (!res.ok) throw new Error(`pdf fetch failed: ${res.status}`);
+    const blobUrl = URL.createObjectURL(await res.blob());
+    printBlobViaHiddenIframe(blobUrl, url);
+  } catch (err) {
+    console.error("draft pdf fetch failed, falling back to opening a new tab:", err);
+    window.open(url, "_blank");
+  }
+});
+
+function printBlobViaHiddenIframe(blobUrl, fallbackUrl) {
+  const iframe = document.createElement("iframe");
+  iframe.style.cssText = "position:fixed; left:-9999px; top:-9999px; width:600px; height:800px; border:0;";
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.addEventListener("load", () => {
+    try {
+      iframe.contentWindow.print();
+    } catch (err) {
+      console.error("draft pdf print() failed, falling back to opening a new tab:", err);
+      window.open(fallbackUrl, "_blank");
+    }
+    setTimeout(() => {
+      iframe.remove();
+      URL.revokeObjectURL(blobUrl);
+    }, 2000);
+  });
+  iframe.src = blobUrl;
+  document.body.appendChild(iframe);
+}
+
 /* ---------- Transcript drawer ---------- */
 
 function renderDrawer() {
+  updateCheckedTranscriptToggle();
+  if (showCheckedTranscript && verificationData) {
+    drawerTurnsEl.innerHTML = (verificationData.transcript_accurate || []).map((w) => `
+      <div class="turn">
+        <span class="role">${escapeHtml(u("checked_transcript"))}</span>
+        ${escapeHtml(w.text)}
+        <span class="ts">${formatTs(w.start, w.end)}</span>
+      </div>
+    `).join("");
+    return;
+  }
   drawerTurnsEl.innerHTML = transcriptData.map((turn, i) => {
     const overlay = translatedTranscript[i];
     const translated = overlay !== undefined && overlay !== turn.text ? overlay : undefined;
@@ -1011,6 +1424,11 @@ function renderDrawer() {
   `;
   }).join("");
 }
+
+checkedTranscriptToggleEl.addEventListener("click", () => {
+  showCheckedTranscript = !showCheckedTranscript;
+  renderDrawer();
+});
 
 function scrollDrawerToTurn(turnIndex) {
   drawerEl.classList.add("open");
@@ -1135,6 +1553,13 @@ document.getElementById("sign-submit-btn").addEventListener("click", async () =>
   signForm.hidden = true;
   signBtn.hidden = true;
   signedPanel.hidden = false;
+  // Sign interplay: note.json is now final — re-render the verification
+  // banner immediately in its read-only, post-sign wording (if a result
+  // already exists) rather than waiting for the next 1s poll tick, and drop
+  // any live per-field flags/edit affordance verificationDiffFor() gates on
+  // isSignedNow().
+  updateVerificationBanner(lastVerificationStatusObj);
+  renderReview();
   document.getElementById("signed-label").textContent = t("signed");
   const link = document.getElementById("signed-pdf-link");
   link.textContent = u("download_pdf");
@@ -1178,6 +1603,23 @@ async function init() {
   if (sessionMatch) {
     sessionId = sessionMatch[1];
     await loadNoteAndShowReview();
+    // One-shot verification check (no live poll on this restore path, same
+    // as every other field on a restored session — see (d)'s "same status
+    // poll" note, which only applies to the live capture->review flow).
+    try {
+      const res = await api(`/api/sessions/${sessionId}/status`);
+      if (res.ok) {
+        const status = await res.json();
+        if (status.verification) {
+          handleVerificationStatus(status.verification);
+          if (status.verification.state === "done" || status.verification.state === "failed") {
+            await fetchVerificationDetails();
+          }
+        }
+      }
+    } catch (err) {
+      console.error("verification status check failed:", err);
+    }
     return;
   }
   showScreen("capture");

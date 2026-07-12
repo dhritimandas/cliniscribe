@@ -1122,3 +1122,183 @@ form. Those logs, joined with corrections.jsonl, give a labeled dataset of
 exactly the token-fidelity failures an extraction fine-tune (or a
 constrained-decoding scheme locking drug spans to transcript substrings)
 should be evaluated against.
+
+---
+
+## Drug Canonicalization Phase — Skeletons, crowded streets, and the audit the metric couldn't do (2026-07-11)
+
+### (a) What this phase does
+This phase replaced the losing game of hand-listing every possible drug
+misspelling with a matcher that absorbs variants automatically: every drug
+name (546 now, up from 163) is reduced to a phonetic "sound skeleton" —
+script, vowel marks, doubling, and spacing stripped away, leaving the
+consonant backbone that speech recognition reliably preserves — and incoming
+words are matched skeleton-to-skeleton, with a bounded allowance for
+distortion. The same phase built the safety apparatus that makes fuzzy
+matching tolerable in medicine at all: an exhaustive substitution audit, a
+length floor, and an ambiguity guard. It also hardened extraction so that a
+drug name the model invents (like "nasal spray" for नैक्स्टोम) can never
+render as a real drug.
+
+### (b) Hardest bugs
+
+1. **The matcher turned "two-three" into a drug, and the accuracy score
+   could not see it.** With the initially specified tolerance (one letter of
+   slack from skeleton length 5), the new tier converted दो तीन ("two-three")
+   into Drotin, a fragment around "vital" into Revital, and a doctor's
+   surname (Pandey) into Pan-D — three invented drugs. The headline accuracy
+   number was byte-identical with and without them, because that metric only
+   asks "how many REAL drugs did we find?" — inserting a wrong drug removes
+   no real one. Root cause, in two layers: (i) metric blindness — recall
+   cannot see false alarms; and (ii) the geometry of short words — the space
+   of short skeletons is crowded (everyday words live there), so any short
+   drug skeleton has innocent neighbors one step away, while long skeletons
+   sit in nearly empty space where a near-miss is almost certainly the drug
+   itself. The catch came from a dedicated substitution audit: run the whole
+   test set with the new tier ON and OFF, diff to isolate every substitution
+   the new code made, and adjudicate each one against the recording's
+   human-written answer key (similarity explains why the machine guessed;
+   only the answer key says whether the guess is TRUE). The fix was a rule,
+   not a blacklist: raise the floor — no fuzzy matching below skeleton
+   length 9, exact match only — accepting the loss of one correct short
+   match (टिल्मा→Telma) to eliminate all three wrong ones, because the cost
+   matrix is asymmetric: an unmatched drug shows as "unnamed — VERIFY" and
+   costs the doctor five seconds; a wrong drug prints on a prescription.
+   Re-audit after the fix: zero wrong substitutions across all 59 cached
+   recordings. Second rail: if a skeleton sits within tolerance of TWO
+   different drugs (albendazole/mebendazole, one letter apart, both real),
+   the system refuses to choose and flags instead.
+
+2. **The fast engine hallucinated fluent Portuguese on Hindi speech — and
+   the repetition detector was structurally blind to it.** The fast-ASR
+   gate run surfaced a hallucination class beyond the documented repetition
+   loops: confident, fluent, wrong-language text ("Obrigada", Turkish,
+   Indonesian) on Hindi clinical audio. It isn't repetitive, dense, or
+   empty, so every lexical signal (compression ratio, n-gram repeats,
+   chars/sec) passes it. Root cause of the blindness: the detector was
+   built from the failure taxonomy we had OBSERVED, and a new failure class
+   sat outside it. The mitigating fact discovered in the same run: the
+   engine itself reports its detected language — the misdetection is
+   sitting in the metadata, so an allowlist (we support exactly hi/en/mr)
+   plus a forced-Hindi re-decode catches it deterministically, the same
+   pattern that fixed the Urdu-script incident. Bonus root cause from the
+   same gate: ~9-10s FIXED cost per decode call regardless of audio length
+   (Whisper pads every input to a 30-second window), so latency scales
+   with segment COUNT, not duration — the fix is fewer, fuller windows,
+   not a faster model.
+
+### (c) Fine-tuning hook
+The substitution audit is reusable as a standing harness: any future change
+to drug matching (or a fine-tuned extraction model) can be diff-audited the
+same way — every changed drug decision logged and adjudicated against gold —
+turning "did the score move?" into "show me every action you took."
+Meanwhile the audit's false-alarm examples (दो तीन→Drotin class) are exactly
+the hard negatives a learned drug-NER or constrained-decoding scheme should
+train against, and the wrong-language hallucination clips join the
+repetition-loop clips (f2096fbd, 1ae62262) in the acceptance set any
+fine-tuned ASR must clear.
+
+---
+
+## Fast Transcription Phase — The 90-second constraint that redesigned the checker (2026-07-12)
+
+### (a) What this phase does
+This phase shipped the speed the clinic actually needs: the web app now
+transcribes with the window-packed fast engine (a 28-second recording's
+speech-to-text runs in ~16 seconds; the full note lands in 65-77 seconds),
+protected by two guards proven earlier — the wrong-language allowlist and the
+repetition-loop ladder — plus a background "second listen" that re-checks
+only the safety-critical seconds of audio. The decisive design force was a
+product constraint, not a technical one: appointments run 2-3 minutes, so a
+checker that takes longer than ~90 seconds is furniture. That single sentence
+from the user invalidated the obvious design (re-run the accurate engine on
+everything: 20-60 minutes) and produced a better one.
+
+### (b) Hardest bugs
+
+1. **The obvious verification design was uselessly correct.** Re-transcribing
+   the whole recording with the accurate engine gives the best possible
+   second opinion — arriving half an hour after the patient has left. Root
+   cause: engineering for maximum verification quality without pricing the
+   clinical workflow's time budget; correctness that misses its deadline is
+   indistinguishable from absence. The redesign inverts the question from
+   "how do we verify everything?" to "what is worth verifying inside 90
+   seconds?" — answer: the seconds of audio that produced drugs, doses,
+   vitals, and diagnoses (the note's provenance already knows them), padded,
+   merged, packed into one decode window, checked by a bigger decorrelated
+   model, with a hard budget cap and an honest "partial check" label when
+   spans overflow it. Measured: 57-59 seconds, full coverage, on the real
+   incident session. Lesson: a verifier is a product feature with a latency
+   SLO, not an offline benchmark — design it from the deadline backward.
+
+2. **The checker's first real run flagged almost every diagnosis — because
+   of our own annotations.** The pipeline glosses lay terms with clinical
+   ones ("बुखार (Fever)"), so diagnosis VALUES carry a suffix that no raw
+   re-decode of the audio will ever contain; fold-comparison saw permanent
+   disagreement. Root cause: comparing a value from one representational
+   layer (post-gloss) against text from another (raw decode) — the two sides
+   of a diff must be brought to the same representation before comparing.
+   Fixed by stripping the gloss suffix pre-comparison; caught only because
+   the E2E ran on real session data rather than synthetic fixtures. Lesson:
+   any diff across pipeline stages must normalize both sides to a common
+   form first, and false-positive floods in a verifier are as damaging as
+   misses — doctors stop reading flags that cry wolf.
+
+### (c) Fine-tuning hook
+Every background-check disagreement is now logged with both readings (fast
+vs checked span text), and every "use checked version" tap is a
+doctor-adjudicated label between two ASR hypotheses on identical audio —
+accumulating exactly the preference data a future ASR fine-tune or reranker
+needs, at zero annotation cost, in the deployment domain the frozen bench
+can't represent.
+
+---
+
+## QA Hardening Phase — Category errors and the incident suite (2026-07-12)
+
+### (a) What this phase does
+This phase closed the user-reported defect round with a QA doctrine: every
+real production failure becomes a permanent, model-free regression test
+(tests/test_incidents.py), so no fixed bug can silently return. The marquee
+fix: "my BP is high" had produced a MEDICATION row reading "(Hypertension)
+भी" — a category error the grounding guard rightly passed (the string WAS
+spoken; grounding catches inventions, not miscategorization). A deterministic
+condition guard now drops any drug-field value that fold-matches the clinical
+concepts table, with real-drug precedence proven collision-free across all
+546 lexicon entries. The same round restored and expanded live progress to
+all three pipeline stages, removed the note-appearance dead time, and pinned
+the print dialog to the review page.
+
+### (b) Hardest bugs
+
+1. **Every guard was right, and the condition still landed in the Rx table.**
+   The generic-term guard, grounding guard, and lexicon each did their job —
+   none of them owns the question "is this string a DISEASE?". Root cause: a
+   taxonomy gap between defenses, each built from a previous incident's shape
+   (invented names, generic words, misspellings) — while the model found a
+   fourth shape: correctly-transcribed, well-grounded, wrong CATEGORY.
+   Defenses built from incident shapes will always trail the model's
+   creativity by one shape; the countermeasure is a defense per FIELD
+   SEMANTICS (what may a drug field contain?) rather than per failure story —
+   plus the incident suite so each new shape is at least never repeated.
+
+2. **The progress display existed, worked, and was never visible.** The fast
+   engine reports progress once per decode window; short clinic clips pack
+   into ONE window, so the single progress event raced the stage-end event
+   that clears it — technically alive, observably dead (934 of 934 DOM
+   samples empty). Root cause: an interface contract ("callback fires during
+   the stage") that silently degenerated when the implementation's
+   granularity (per-window) collapsed to one unit. The fix blends calibrated
+   expectation (per-stage medians from real session history, shown instantly,
+   capped at 95%) with true events wherever they exist. Lesson: progress
+   reporting is a product surface with its own liveness requirement — test
+   "is it VISIBLE at t=2s?", not "does the callback fire?".
+
+### (c) Fine-tuning hook
+The BP incident is the clearest argument yet for constrained extraction: the
+model had the right information in the right fields (history captured "BP is
+high") and STILL emitted a spurious medication row. A future fine-tune or
+constrained-decoding scheme should be evaluated not just on recall but on a
+category-confusion matrix (condition-in-Rx, drug-in-diagnosis, etc.) — and
+tests/test_incidents.py plus the corrections flywheel now accumulate exactly
+those labeled confusions from real use.
