@@ -839,3 +839,91 @@ def test_dose_unattributed_skipped_for_unnamed_medication_rows() -> None:
     assert not any(
         f.endswith(".dose_unattributed") for f in note.low_confidence_fields
     )
+
+
+# ── Condition guard (category-error backstop) ───────────────────────────────
+#
+# Real incident (outputs/20260712-124506-715247, 2026-07-12): patient said
+# "मेरा BP (Hypertension) भी हाई है" — L3.5 correctly glossed "BP" with its
+# clinical name "(Hypertension)", and qwen2.5:3b then extracted the
+# parenthetical itself as a MEDICATION drug name. The grounding guard passes
+# this string (it IS in the transcript) — grounding catches inventions, not
+# category errors. The condition guard drops the row entirely: it is a
+# clinical condition, not a drug, and the information is already captured
+# elsewhere in the note (history/diagnosis).
+
+
+def test_condition_gloss_dropped_from_medications() -> None:
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: मेरा BP (Hypertension) भी हाई है"
+    data = {"medications": [{"drug": "(Hypertension) भी", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications == []
+    assert "medications.(Hypertension) भी.condition_in_rx" in note.low_confidence_fields
+
+
+def test_condition_raw_english_variant_dropped() -> None:
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "Hypertension", "dose": None}]}
+    note = _build_note(data, transcript="[UNKNOWN]: Hypertension noted")
+    assert note.medications == []
+    assert "medications.Hypertension.condition_in_rx" in note.low_confidence_fields
+
+
+def test_condition_guard_precedence_over_generic_check_unaffected() -> None:
+    """Generic-term check still runs first — a generic term must still become
+    an unnamed row, not fall through to the condition check."""
+    from src.l4_extract import _build_note
+
+    data = {"medications": [{"drug": "दवाई", "dose": None}]}
+    note = _build_note(data)
+    assert note.medications[0].drug == "unnamed medication 1"
+
+
+def test_condition_guard_does_not_drop_real_drug() -> None:
+    """A real, grounded drug name must pass through untouched."""
+    from src.l4_extract import _build_note
+
+    transcript = "[UNKNOWN]: paracetamol lijiye roz do baar"
+    data = {"medications": [{"drug": "paracetamol", "dose": None}]}
+    note = _build_note(data, transcript=transcript)
+    assert note.medications[0].drug == "paracetamol"
+    assert not any(f.endswith(".condition_in_rx") for f in note.low_confidence_fields)
+
+
+def test_condition_guard_does_not_false_positive_on_substring_brand() -> None:
+    """A real brand name containing a condition-ish substring ("cheston
+    cold" contains "cold") must not be dropped — the guard requires an
+    EXACT fold match (or an exact-matching parenthetical gloss), never a
+    substring match, precisely to avoid this false positive."""
+    from src.l4_extract import _is_condition_term
+
+    assert _is_condition_term("cheston cold") is False
+
+
+def test_no_drug_lexicon_entry_matches_condition_set() -> None:
+    """Collision check (brief requirement): no canonical drug-lexicon entry
+    must fold-match a condition term. If this ever fires, drug-lexicon
+    membership takes precedence (see _is_condition_term) — the failing
+    entry would need to be handled there, not by shrinking the condition set.
+    """
+    from src.l4_extract import _CONDITION_TERMS, _fold_drug
+    from src.drug_lexicon import DRUG_LEXICON
+
+    collisions = [
+        d for d in DRUG_LEXICON if _fold_drug(d).replace(" ", "") in _CONDITION_TERMS
+    ]
+    assert collisions == [], f"Drug entries collide with conditions: {collisions}"
+
+
+def test_drug_lexicon_precedence_wins_over_condition_set(monkeypatch) -> None:
+    """Direct test of the precedence rule itself (no natural collision exists
+    today — see test above): if a fold key were ever a member of BOTH sets,
+    drug-lexicon membership must win and the row must NOT be dropped.
+    """
+    import src.l4_extract as l4
+
+    monkeypatch.setattr(l4, "_DRUG_LEXICON_FOLDS", frozenset({"hypertension"}))
+    assert l4._is_condition_term("Hypertension") is False

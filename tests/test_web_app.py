@@ -257,6 +257,183 @@ def test_progress_callbacks_compute_eta_throttle_and_clear_on_stage_end(
     assert "eta_seconds" not in status_final
 
 
+# ── Stage-duration calibration (issue 1: instant + honest %/ETA display) ──
+
+
+def _write_calibration_session(
+    root, sid: str, *, audio_seconds: float, stage_wall_s: dict[str, float]
+) -> None:
+    """Write a synthetic outputs/<sid>/{input_16k.wav, timings.json} pair."""
+    session_dir = os.path.join(root, sid)
+    os.makedirs(session_dir, exist_ok=True)
+    sf.write(
+        os.path.join(session_dir, "input_16k.wav"),
+        np.zeros(int(audio_seconds * 16000), dtype="float32"),
+        16000,
+    )
+    stages = {name: {"wall_s": wall_s} for name, wall_s in stage_wall_s.items()}
+    with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
+        json.dump({"stages": stages}, f)
+
+
+def test_compute_stage_calibration_falls_back_when_no_history(tmp_path) -> None:
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_compute_stage_calibration_excludes_pre_windowed_engine_sessions(tmp_path) -> None:
+    """l3_asr wall/audio ratio 10.0 (>= the 2.0 cutoff) marks this a
+    pre-windowed-engine session -- excluded entirely, even for its OTHER
+    stages' otherwise-usable measurements."""
+    _write_calibration_session(
+        tmp_path,
+        "slow-session",
+        audio_seconds=10.0,
+        stage_wall_s={
+            "l2_diarize": 5.0,
+            "l3_asr": 100.0,
+            "l3_5_normalize": 15.0,
+            "l4_extract": 15.0,
+        },
+    )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_compute_stage_calibration_medians_qualifying_sessions(tmp_path) -> None:
+    """Three qualifying sessions with l2_diarize ratios 1.0/2.0/3.0 -> median 2.0."""
+    for i, ratio in enumerate([1.0, 2.0, 3.0]):
+        _write_calibration_session(
+            tmp_path,
+            f"fast-session-{i}",
+            audio_seconds=10.0,
+            stage_wall_s={
+                "l2_diarize": ratio * 10.0,
+                "l3_asr": 1.0 * 10.0,  # ratio 1.0, well under the 2.0 cutoff
+                "l3_5_normalize": 1.5 * 10.0,
+                "l4_extract": 1.2 * 10.0,
+            },
+        )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result["l2_diarize"] == pytest.approx(2.0)
+    assert result["l3_asr"] == pytest.approx(1.0)
+    assert result["l3_5_normalize"] == pytest.approx(1.5)
+    assert result["l4_extract"] == pytest.approx(1.2)
+
+
+def test_compute_stage_calibration_falls_back_per_stage_when_stage_absent(tmp_path) -> None:
+    """A qualifying session missing l4_extract entirely (e.g. it errored
+    before L4) -- l4_extract falls back to the sane constant while the other,
+    measured stages still use the session's own ratio."""
+    _write_calibration_session(
+        tmp_path,
+        "no-l4-session",
+        audio_seconds=10.0,
+        stage_wall_s={"l2_diarize": 8.0, "l3_asr": 5.0, "l3_5_normalize": 12.0},
+    )
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result["l2_diarize"] == pytest.approx(0.8)
+    assert (
+        result["l4_extract"]
+        == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND["l4_extract"]
+    )
+
+
+def test_compute_stage_calibration_skips_session_missing_wav(tmp_path) -> None:
+    """A session with timings.json but no *_16k.wav -- duration can't be
+    determined, so it must be skipped, never crash the whole scan."""
+    session_dir = os.path.join(tmp_path, "no-wav-session")
+    os.makedirs(session_dir)
+    with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
+        json.dump({"stages": {"l3_asr": {"wall_s": 5.0}}}, f)
+
+    result = app_module._compute_stage_calibration(root=str(tmp_path))
+    assert result == app_module._FALLBACK_STAGE_SECONDS_PER_AUDIO_SECOND
+
+
+def test_estimate_audio_seconds_returns_none_on_invalid_audio(tmp_path) -> None:
+    bogus = os.path.join(tmp_path, "bogus.wav")
+    with open(bogus, "wb") as f:
+        f.write(b"not a real wav file, just garbage bytes")
+    assert app_module._estimate_audio_seconds(bogus) is None
+
+
+def test_estimate_audio_seconds_reads_a_real_wav(tmp_path) -> None:
+    wav_path = os.path.join(tmp_path, "consult.wav")
+    sf.write(wav_path, np.zeros(16000 * 3, dtype="float32"), 16000)
+    assert app_module._estimate_audio_seconds(wav_path) == pytest.approx(3.0)
+
+
+def test_process_writes_expected_stage_seconds_scaled_by_audio_duration(
+    client, monkeypatch, tmp_path
+) -> None:
+    """expected_stage_seconds must land in status.json, scaled by THIS
+    clip's own audio duration, before pipeline.run is ever called."""
+    monkeypatch.setattr(
+        app_module,
+        "_STAGE_SECONDS_PER_AUDIO_SECOND",
+        {"l2_diarize": 1.0, "l3_asr": 2.0, "l3_5_normalize": 0.5, "l4_extract": 3.0},
+    )
+    wav_path = os.path.join(tmp_path, "consult.wav")
+    sf.write(wav_path, np.zeros(16000 * 4, dtype="float32"), 16000)  # 4.0s of audio
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
+
+    response = client.post(
+        "/api/sessions", files={"audio": ("consult.wav", wav_bytes, "audio/wav")}
+    )
+    sid = response.json()["session_id"]
+
+    captured_expected: dict = {}
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        status = app_module._read_json(app_module._status_path(session_id))
+        captured_expected.update(status.get("expected_stage_seconds", {}))
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not captured_expected:
+        time.sleep(0.01)
+
+    assert captured_expected == {
+        "l2_diarize": 4.0,
+        "l3_asr": 8.0,
+        "l3_5_normalize": 2.0,
+        "l4_extract": 12.0,
+    }
+
+
+def test_process_skips_expected_stage_seconds_when_duration_cannot_be_estimated(
+    client, monkeypatch
+) -> None:
+    """A fake/corrupt upload (as every other test's _create_session helper
+    writes) must never crash the pipeline thread -- expected_stage_seconds is
+    simply absent."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status["state"] == "review":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    assert "expected_stage_seconds" not in status
+
+
 # ── GET note (note + transcript + provenance + flags) ────────────────────
 
 
@@ -293,6 +470,119 @@ def test_get_note_before_processing_is_404(client) -> None:
     sid = _create_session(client)
     response = client.get(f"/api/sessions/{sid}/note")
     assert response.status_code == 404
+
+
+# ── note_meta precompute cache (issue 2: review-transition dead time) ────
+
+
+def test_compute_and_cache_note_meta_writes_provenance_and_flags(client) -> None:
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint="fever since Monday",
+        history=None,
+        low_confidence_fields=["chief_complaint"],
+    )
+    _write_note(sid, note)
+    _write_transcript(
+        sid,
+        [{"speaker_role": "DOCTOR", "text": "fever since Monday", "start": 0.0, "end": 2.0}],
+    )
+
+    app_module._compute_and_cache_note_meta(sid)
+
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    with open(meta_path, encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta["provenance"]["chief_complaint"]["turn_index"] == 0
+    assert meta["flags"] == {"chief_complaint": "chief_complaint"}
+
+
+def test_get_note_reads_from_precomputed_cache_when_present(client) -> None:
+    """A sentinel value planted directly in note_meta.json proves GET .../note
+    is reading the cache rather than recomputing (which would never produce
+    this exact value)."""
+    sid = _create_session(client)
+    _write_note(sid, ClinicalNote(chief_complaint="fever", history=None))
+    _write_transcript(sid, [])
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump({"provenance": {"_sentinel": True}, "flags": {"_sentinel": "yes"}}, f)
+
+    response = client.get(f"/api/sessions/{sid}/note")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provenance"] == {"_sentinel": True}
+    assert body["flags"] == {"_sentinel": "yes"}
+
+
+def test_patch_note_invalidates_precomputed_cache(client) -> None:
+    """Issue 2's cache must never outlive an edit: flags are resolved from
+    CURRENT field values, so a stale cache could keep showing a flag the
+    edit itself just fixed."""
+    sid = _create_session(client)
+    note = ClinicalNote(
+        chief_complaint=None,
+        history=None,
+        medications=[
+            Medication(
+                drug="Azithral", dose=None, frequency=None, timing=None,
+                duration=None, validated=False,
+            )
+        ],
+        low_confidence_fields=["medications.Azithral.unvalidated"],
+    )
+    _write_note(sid, note)
+    app_module._compute_and_cache_note_meta(sid)
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    assert app_module._read_json(meta_path)["flags"] == {
+        "medications[0].drug": "medications.Azithral.unvalidated"
+    }
+
+    client.patch(
+        f"/api/sessions/{sid}/note",
+        json={"edits": [{"field": "medications[0].drug", "old": "Azithral", "new": "Azithromycin"}]},
+    )
+
+    assert not os.path.exists(meta_path)  # cache invalidated
+    response = client.get(f"/api/sessions/{sid}/note")
+    # Recomputed inline against the EDITED note: "Azithral" no longer matches
+    # any medication by name, so the flag is unresolvable -> falls to
+    # _general instead of staying (incorrectly) pinned to medications[0].drug.
+    assert response.json()["flags"] == {"_general": ["medications.Azithral.unvalidated"]}
+
+
+def test_process_precomputes_note_meta_before_review(client, monkeypatch) -> None:
+    """Integration: the pipeline thread must write note_meta.json right after
+    pipeline.run() succeeds, before status flips to "review"."""
+    sid = _create_session(client)
+
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+        _write_note(session_id, ClinicalNote(chief_complaint="fever", history=None))
+        _write_transcript(session_id, [])
+        return os.path.join("outputs", session_id, "draft_rx.pdf")
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+
+    client.post(f"/api/sessions/{sid}/process")
+
+    deadline = time.monotonic() + 2.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/sessions/{sid}/status").json()
+        if status["state"] == "review":
+            break
+        time.sleep(0.01)
+
+    assert status["state"] == "review"
+    meta_path = os.path.join("outputs", sid, "note_meta.json")
+    assert os.path.exists(meta_path)
+    meta = app_module._read_json(meta_path)
+    # Empty transcript -> no provenance match possible; no low_confidence_fields
+    # on the stub note -> no flags. The precompute still ran and cached both keys.
+    assert meta == {"provenance": {}, "flags": {}}
 
 
 # ── PATCH note ─────────────────────────────────────────────────────────────

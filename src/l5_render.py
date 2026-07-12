@@ -124,6 +124,11 @@ _FLAG_PATTERNS: list[tuple[re.Pattern, str]] = [
         "Dose for {x} could not be located next to it in the conversation — confirm",
     ),
     (
+        re.compile(r"^medications\.(?P<x>.+)\.condition_in_rx$"),
+        "A medical condition ({x}) appeared in the medication list and was "
+        "removed — review medications and diagnosis",
+    ),
+    (
         re.compile(r"^diagnosis\.(?P<x>.+)\.no_transcript_overlap$"),
         "Diagnosis '{x}' lacks clear support in the conversation — confirm",
     ),

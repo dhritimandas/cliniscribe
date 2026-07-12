@@ -581,9 +581,8 @@ function setStageLine(stageKey, state) {
   if (state) el.classList.add(state);
 }
 
-// Real transcription %/ETA suffix on the "transcribed" line (spec: appears
-// only once the first progress datum arrives, disappears when l3_asr ends —
-// status.json's "progress"/"eta_seconds" are absent outside that window).
+// %/ETA suffix, on whichever stage-line is active (spec: appears the instant
+// a calibrated stage starts, disappears the moment it ends).
 function formatEtaSuffix(etaSeconds) {
   if (typeof etaSeconds !== "number") return "";
   const rounded = etaSeconds < 60
@@ -592,16 +591,110 @@ function formatEtaSuffix(etaSeconds) {
   return ` · ${rounded}`;
 }
 
-function updateTranscribeProgress(status) {
-  const el = stageLinesEl.querySelector('[data-stage="transcribed"] .progress');
-  if (status.stage !== "l3_asr" || typeof status.progress !== "number") {
-    el.hidden = true;
-    el.textContent = "";
+/* ---------- Calibrated + real-time stage progress (issue 1) ----------
+ * Three DOM stage-lines (index.html: data-stage="transcribed"/"speakers"/
+ * "drafting") map to four BACKEND stage names that can carry a %/ETA suffix.
+ * l1_preprocess is intentionally excluded: it is fast and low-variance
+ * (never had a %/ETA display even before this fix — see web/app.py's
+ * calibration comment) and is not one of the four stages the server
+ * calibrates.
+ *
+ * l3_asr is the ONLY stage with a real per-window progress callback
+ * (src/fast_asr.py's on_progress, mirrored into status.json's
+ * "progress"/"eta_seconds"). l2_diarize, l3_5_normalize, and l4_extract have
+ * no internal callback at all — calibrated interpolation against the
+ * server's expected_stage_seconds is the whole story for them, which is
+ * honest because they are short, low-variance stages where a calibrated
+ * median is a reasonable stand-in for "how far along am I".
+ *
+ * Instantness is bounded by the status-poll cadence (500ms-1s): a stage's
+ * suffix can only appear once the SPA has polled and observed that stage is
+ * active. There is no push channel here (out of scope) to do better than
+ * that. Once observed, though, the suffix itself is not poll-cadence-limited
+ * — a separate, faster interval (renderSmoothProgress) advances the display
+ * every SMOOTH_PROGRESS_INTERVAL_MS by wall-clock time alone, so it never
+ * visibly freezes between polls. */
+const STAGE_TO_LINE = {
+  l2_diarize: "transcribed",
+  l3_asr: "transcribed",
+  l3_5_normalize: "speakers",
+  l4_extract: "drafting",
+};
+
+// Client-side fallback, used only if the server never wrote
+// status.expected_stage_seconds (e.g. it could not estimate the upload's
+// audio duration) — rough seconds, NOT audio-scaled, just enough to keep the
+// display honest-ish rather than blank.
+const FALLBACK_STAGE_SECONDS = { l2_diarize: 10, l3_asr: 15, l3_5_normalize: 18, l4_extract: 20 };
+
+const SMOOTH_PROGRESS_INTERVAL_MS = 200;
+
+let expectedStageSeconds = {};  // status.expected_stage_seconds, cached once per session
+let stageProgressModel = null;  // { stage, clientStart, expectedSeconds, real: {...}|null }
+let smoothProgressHandle = null;
+
+function updateStageProgressFromStatus(status) {
+  if (status.expected_stage_seconds) expectedStageSeconds = status.expected_stage_seconds;
+
+  const stage = STAGE_TO_LINE[status.stage] ? status.stage : null;
+  if (!stage) {
+    stageProgressModel = null;
     return;
   }
-  const pct = Math.round(status.progress * 100);
-  el.textContent = ` · ${pct}%${formatEtaSuffix(status.eta_seconds)}`;
-  el.hidden = false;
+  if (!stageProgressModel || stageProgressModel.stage !== stage) {
+    stageProgressModel = {
+      stage,
+      clientStart: Date.now(),
+      expectedSeconds: expectedStageSeconds[stage] || FALLBACK_STAGE_SECONDS[stage] || 15,
+      real: null,
+    };
+  }
+  if (stage === "l3_asr" && typeof status.progress === "number") {
+    stageProgressModel.real = {
+      progress: status.progress,
+      etaSeconds: typeof status.eta_seconds === "number" ? status.eta_seconds : 0,
+      capturedAtMs: Date.now(),
+    };
+  }
+}
+
+// Blend rule: a real progress/eta datum (l3_asr only) always wins the moment
+// it arrives; between polls, both the real-anchored model and the
+// calibration-only model advance by wall-clock time alone. Both branches
+// compute the SAME two numbers (pct, etaSeconds) from one implied total
+// duration, so they can never visibly disagree with each other.
+function currentStageDisplay(nowMs) {
+  const model = stageProgressModel;
+  if (!model) return null;
+
+  let totalExpected, elapsedTotal;
+  if (model.real) {
+    const { progress, etaSeconds, capturedAtMs } = model.real;
+    const dt = (nowMs - capturedAtMs) / 1000;
+    totalExpected = progress < 1 ? etaSeconds / (1 - progress) : (nowMs - model.clientStart) / 1000;
+    elapsedTotal = totalExpected - etaSeconds + dt;
+  } else {
+    totalExpected = model.expectedSeconds;
+    elapsedTotal = (nowMs - model.clientStart) / 1000;
+  }
+  if (!(totalExpected > 0)) return null;
+
+  const pct = Math.min(0.95, Math.max(0, elapsedTotal / totalExpected));
+  return { line: STAGE_TO_LINE[model.stage], pct, etaSeconds: totalExpected * (1 - pct) };
+}
+
+function renderSmoothProgress() {
+  const display = currentStageDisplay(Date.now());
+  for (const line of ["transcribed", "speakers", "drafting"]) {
+    const el = stageLinesEl.querySelector(`[data-stage="${line}"] .progress`);
+    if (display && display.line === line) {
+      el.textContent = ` · ${Math.round(display.pct * 100)}%${formatEtaSuffix(display.etaSeconds)}`;
+      el.hidden = false;
+    } else {
+      el.hidden = true;
+      el.textContent = "";
+    }
+  }
 }
 
 function applyStatus(status) {
@@ -610,13 +703,14 @@ function applyStatus(status) {
 
   const transcribedDone = done.has("l1_preprocess") && done.has("l2_diarize") && done.has("l3_asr");
   setStageLine("transcribed", transcribedDone ? "done" : (stage && ["l1_preprocess", "l2_diarize", "l3_asr"].includes(stage) ? "active" : ""));
-  updateTranscribeProgress(status);
 
   const speakersDone = done.has("l3_5_normalize");
   setStageLine("speakers", speakersDone ? "done" : (stage === "l3_5_normalize" ? "active" : ""));
 
   const draftingDone = done.has("l4_extract");
   setStageLine("drafting", draftingDone ? "done" : (stage === "l4_extract" ? "active" : ""));
+
+  updateStageProgressFromStatus(status);
 }
 
 // (d) Background verification is polled on this SAME status timer — no new
@@ -630,18 +724,63 @@ const VERIFICATION_POLL_GRACE_TICKS = 5;
 let reviewLoaded = false;
 let verificationPollGraceTicks = 0;
 
-function startStatusPolling() {
-  applyStatus({ state: "processing", stage: null, stages_done: [] });
-  reviewLoaded = false;
-  verificationPollGraceTicks = 0;
-  statusPollHandle = setInterval(async () => {
-    // A transient 500 (e.g. a status.json write in progress server-side)
-    // must never break polling — swallow and silently retry next tick.
-    try {
-      const res = await api(`/api/sessions/${sessionId}/status`);
-      if (!res.ok) return;
+// Issue 2: poll faster once L4/L5 are in play, so the SPA notices "review"
+// (and the note itself, via maybePrefetchNote below) sooner than the
+// standard 1s cadence — cheap, since these are the LAST couple of stages.
+const STATUS_POLL_NORMAL_MS = 1000;
+const STATUS_POLL_FAST_MS = 500;
+let pollingActive = false;
+
+function isFastPollPhase(status) {
+  const done = status.stages_done || [];
+  return status.stage === "l4_extract" || status.stage === "l5_render" || done.includes("l4_extract");
+}
+
+// Issue 2: kick off GET .../note as soon as L4 has finished — well before
+// status flips to "review" (L5 render + note_meta precompute + a poll tick
+// still stand between the two) — so the note is often already in hand by
+// the time the SPA notices "review".
+let notePrefetchPromise = null;
+let notePrefetchStartedForSid = null;
+
+async function fetchNoteJson() {
+  const res = await api(`/api/sessions/${sessionId}/note`);
+  if (!res.ok) throw new Error(`note fetch failed: ${res.status}`);
+  return res.json();
+}
+
+function maybePrefetchNote(status) {
+  if (reviewLoaded) return;
+  if (!(status.stages_done || []).includes("l4_extract")) return;
+  if (notePrefetchStartedForSid === sessionId) return;  // already in flight or resolved
+  notePrefetchStartedForSid = sessionId;
+  notePrefetchPromise = fetchNoteJson().catch((err) => {
+    // Likely a tight race with L5/note_meta not written yet -- clear the
+    // guard so the next poll tick (still the 500ms "fast" phase) retries.
+    notePrefetchStartedForSid = null;
+    throw err;
+  });
+}
+
+function stopStatusPolling() {
+  pollingActive = false;
+  if (smoothProgressHandle) { clearInterval(smoothProgressHandle); smoothProgressHandle = null; }
+  stageProgressModel = null;
+  renderSmoothProgress();
+}
+
+async function runStatusPoll() {
+  if (!pollingActive) return;
+  let nextDelayMs = STATUS_POLL_NORMAL_MS;
+  // A transient 500 (e.g. a status.json write in progress server-side) must
+  // never break polling — swallow and silently retry next tick.
+  try {
+    const res = await api(`/api/sessions/${sessionId}/status`);
+    if (res.ok) {
       const status = await res.json();
       applyStatus(status);
+      if (isFastPollPhase(status)) nextDelayMs = STATUS_POLL_FAST_MS;
+      maybePrefetchNote(status);
       if (status.state === "review" && !reviewLoaded) {
         reviewLoaded = true;
         await loadNoteAndShowReview();
@@ -650,21 +789,37 @@ function startStatusPolling() {
         if (status.verification) {
           handleVerificationStatus(status.verification);
           if (status.verification.state === "done" || status.verification.state === "failed") {
-            clearInterval(statusPollHandle);
+            stopStatusPolling();
+            return;
           }
         } else {
           verificationPollGraceTicks += 1;
           if (verificationPollGraceTicks > VERIFICATION_POLL_GRACE_TICKS) {
-            clearInterval(statusPollHandle);
+            stopStatusPolling();
+            return;
           }
         }
       }
       // status.error is surfaced only via console — no dashboard element per spec.
       if (status.error) console.error("pipeline error:", status.error);
-    } catch (err) {
-      console.error("status poll failed, retrying next tick:", err);
     }
-  }, 1000);
+  } catch (err) {
+    console.error("status poll failed, retrying next tick:", err);
+  }
+  if (pollingActive) statusPollHandle = setTimeout(runStatusPoll, nextDelayMs);
+}
+
+function startStatusPolling() {
+  applyStatus({ state: "processing", stage: null, stages_done: [] });
+  reviewLoaded = false;
+  verificationPollGraceTicks = 0;
+  expectedStageSeconds = {};
+  stageProgressModel = null;
+  notePrefetchPromise = null;
+  notePrefetchStartedForSid = null;
+  pollingActive = true;
+  smoothProgressHandle = setInterval(renderSmoothProgress, SMOOTH_PROGRESS_INTERVAL_MS);
+  statusPollHandle = setTimeout(runStatusPoll, STATUS_POLL_NORMAL_MS);
 }
 
 micRing.addEventListener("click", () => {
@@ -841,8 +996,20 @@ async function applyCheckedVersion(path) {
 }
 
 async function loadNoteAndShowReview() {
-  const res = await api(`/api/sessions/${sessionId}/note`);
-  const data = await res.json();
+  // Issue 2: reuse the in-flight/already-resolved prefetch kicked off by
+  // maybePrefetchNote as soon as l4_extract finished, instead of always
+  // paying for a fresh GET .../note round trip here. A prefetch failure
+  // (e.g. the tight race before L5/note_meta finished writing) falls back to
+  // a normal fetch, exactly as before this change.
+  let data = null;
+  if (notePrefetchPromise) {
+    try {
+      data = await notePrefetchPromise;
+    } catch (err) {
+      data = null;
+    }
+  }
+  if (!data) data = await fetchNoteJson();
   noteData = data.note;
   transcriptData = data.transcript || [];
   provenanceData = data.provenance || {};
@@ -1180,23 +1347,20 @@ document.getElementById("save-btn").addEventListener("click", async () => {
   pendingEdits = {};
 });
 
-/* ---------- Draft PDF (open + print) ----------
- * "DRAFT PDF AND PRINT" must both open the current draft in a new tab and
- * pop the browser's print dialog for it. The /pdf endpoint always answers
- * with Content-Disposition: attachment (web/app.py get_pdf) so pointing a
- * plain window.open()/iframe.src straight at that URL only forces a file
+/* ---------- Draft PDF (print, staying on the review page) ----------
+ * "DRAFT PDF AND PRINT" must overlay the browser's print dialog on the
+ * CURRENT review page — no new tab, no focus jump. The /pdf endpoint always
+ * answers with Content-Disposition: attachment (web/app.py get_pdf) so
+ * pointing a plain iframe.src straight at that URL only forces a file
  * download — there is never an inline, printable document to call .print()
  * on. Fetching the bytes ourselves and handing the browser a blob: URL
  * (which carries no Content-Disposition) sidesteps that and renders inline.
- * Printing is done from a hidden iframe's own 'load' event rather than
- * win.addEventListener('load', () => win.print()) on the window.open()
- * result: verified against headless Chrome that a popup Window showing a
- * PDF does not reliably fire 'load', while an iframe navigated to the same
- * blob URL does. If print() throws, the tab opened above (independent of
- * print's success) is left as the manual-print fallback. The iframe is
- * given a real off-screen size, not 0x0: verified against headless Chrome
- * that Chromium's built-in PDF viewer never initializes (and 'load' never
- * fires) inside a zero-area frame.
+ * Printing is done from a hidden iframe's own 'load' event: verified against
+ * headless Chrome that Chromium's built-in PDF viewer never initializes
+ * (and 'load' never fires) inside a zero-area frame, hence the real
+ * off-screen size below, not 0x0. A new tab is opened ONLY as a fallback, if
+ * the iframe's print() itself throws (or the fetch/blob step fails) — never
+ * as a matter of course.
  */
 document.getElementById("draft-pdf-link").addEventListener("click", async (event) => {
   if (!sessionId) return;
@@ -1206,15 +1370,14 @@ document.getElementById("draft-pdf-link").addEventListener("click", async (event
     const res = await api(url);
     if (!res.ok) throw new Error(`pdf fetch failed: ${res.status}`);
     const blobUrl = URL.createObjectURL(await res.blob());
-    window.open(blobUrl, "_blank");
-    printBlobViaHiddenIframe(blobUrl);
+    printBlobViaHiddenIframe(blobUrl, url);
   } catch (err) {
-    console.error("draft pdf open/print failed, falling back to plain download:", err);
+    console.error("draft pdf fetch failed, falling back to opening a new tab:", err);
     window.open(url, "_blank");
   }
 });
 
-function printBlobViaHiddenIframe(blobUrl) {
+function printBlobViaHiddenIframe(blobUrl, fallbackUrl) {
   const iframe = document.createElement("iframe");
   iframe.style.cssText = "position:fixed; left:-9999px; top:-9999px; width:600px; height:800px; border:0;";
   iframe.setAttribute("aria-hidden", "true");
@@ -1222,7 +1385,8 @@ function printBlobViaHiddenIframe(blobUrl) {
     try {
       iframe.contentWindow.print();
     } catch (err) {
-      console.error("draft pdf print() failed:", err);
+      console.error("draft pdf print() failed, falling back to opening a new tab:", err);
+      window.open(fallbackUrl, "_blank");
     }
     setTimeout(() => {
       iframe.remove();
