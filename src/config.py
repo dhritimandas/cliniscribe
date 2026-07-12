@@ -56,3 +56,82 @@ EXTRACT_NUM_PREDICT = 2048
 # session) instead of Ollama's default unload; also enables the L3.5-time
 # preload. Whisper is always released before the LLM loads (pipeline order).
 EXTRACT_KEEP_ALIVE = "15m"
+
+# ── L3-fast ASR (mlx-whisper, gated) ─────────────────────────────────────────
+# Chunk-local detect+retry engine (src/fast_asr.py), built to answer the
+# Deployment Latency Phase's four negative results (see LEARNINGS.md): faster
+# engines/merged windows/decode-param tweaks/VAD pre-slicing all failed the
+# frozen-bench gate outright. This flag stays False — the production path
+# keeps using src.l3_asr.transcribe — until eval/fast_asr_gate.py reports a
+# PASS; the caller (src/pipeline.py) flips it, this file does not.
+FAST_ASR_ENABLED = False
+
+FAST_ASR_MODEL = "mlx-community/whisper-large-v3-turbo"  # per-segment primary decode
+FAST_ASR_FALLBACK_MODEL = "mlx-community/whisper-large-v3-mlx"  # retry-ladder step3
+# temperature=0.0 (scalar, not the 6-rung fallback ladder) + no conditioning:
+# measured no worse than the stock ladder on the known-bad clips (both still
+# loop either way — see eval/engine_study.py probe_antihallu), and faster.
+FAST_ASR_DECODE_KWARGS: dict = {"temperature": 0.0, "condition_on_previous_text": False}
+
+# Degeneration-detector thresholds (src/fast_asr.py::looks_degenerate), tuned
+# against the real repetition-loop hallucinations cached in
+# outputs/engine_study.json ("college college college...", "झाल झाल झाल...")
+# with zero false positives across all 20 fw-large-v3 hypotheses in
+# outputs/beam_study.json (see tests/test_fast_asr.py for the sweep).
+DEGEN_COMPRESSION_RATIO = 2.4  # zlib text-compression ratio above this = looping
+DEGEN_MIN_LEN_FOR_RATIO = 20  # chars; below this, zlib overhead makes the ratio noisy
+DEGEN_NGRAM_SIZES = (1, 2, 3, 4)  # phrase lengths checked for back-to-back repetition
+DEGEN_NGRAM_MIN_REPEAT = 4  # same phrase repeated >= this many times consecutively
+DEGEN_MAX_CHARS_PER_SECOND = 30.0  # implausible decode density for hi/en/mr speech
+DEGEN_EMPTY_ON_VOICED_MIN_S = 1.0  # empty decode on a segment this long+ is suspect
+
+# Retry-ladder step knobs (src/fast_asr.py::_retry_ladder). Step1's boundary
+# shift is a measured loop-breaker; step2's temperature/conditioning change is
+# the other cheap lever tried before escalating to a bigger model in step3.
+RETRY_BOUNDARY_SHIFT_S = 0.4
+RETRY_TEMP_STEP2 = 0.2
+
+# ── L3-fast v2, Fix 1: language-allowlist guard ──────────────────────────────
+# mlx-whisper's per-window language auto-detection occasionally locks onto a
+# WRONG but fluent language -- not a repetition loop, so looks_degenerate()
+# cannot see it. Observed on the v1 frozen-bench gate (outputs/fast_asr_gate.json):
+# "Obrigada" (Portuguese), "işte sulta" / "Bu, sayıda" (Turkish), "saya
+# menikmati" (Indonesian) decoded confidently over Hindi speech. We only
+# support hi/en/mr; any other detected language token is always a
+# misdetection. Checked on every decode, belt-and-braces alongside
+# ASR_SCRIPT_GUARD (which only catches the Arabic-script case) -- see
+# src/fast_asr.py::_decode_with_script_guard.
+ASR_LANGUAGE_ALLOWLIST = frozenset({"hi", "en", "mr"})
+
+# ── L3-fast v2, Fix 2: window-packed decoding ────────────────────────────────
+# Measured root cause of the ~10-20x-realtime slowdown: mlx-whisper pads every
+# input to a 30s window before encoding regardless of content length (its
+# transcribe() always calls pad_or_trim(mel, N_FRAMES, ...) where N_FRAMES is
+# a fixed 30s), so one decode call costs a near-constant ~7-9s whether it
+# decodes 2s or 25s of audio -- cost is per WINDOW, not per second (measured
+# directly on warm calls; see LEARNINGS.md). fast_transcribe_windowed() packs
+# diarized segments into <= WINDOW_MAX_SPAN_S windows and decodes each ONCE,
+# cutting call count from one-per-segment to one-per-window.
+WINDOW_MAX_SPAN_S = 28.0
+# Minimum silence gap -- or any speaker change -- preferred as a window break
+# point when a window must close before reaching the cap (see
+# src/fast_asr.py::_pack_segments_into_windows).
+WINDOW_MIN_BREAK_GAP_S = 0.8
+
+# Which fast-ASR entry point to use once FAST_ASR_ENABLED flips True: either
+# "per_segment" (src.fast_asr.fast_transcribe) or "windowed"
+# (src.fast_asr.fast_transcribe_windowed) -- whichever passes
+# eval/fast_asr_gate.py's frozen-bench gate fastest. NEITHER passed the v2
+# gate (outputs/fast_asr_gate_v2.json, both engines run 2026-07-11):
+# per_segment  corpus_wer 0.6613 > 0.5388, keyword_wer 0.6429 > 0.5814
+#              (drug_wer_folded 0.5714 <= 0.8571 -- the only metric that passed)
+# windowed     corpus_wer 0.9059 > 0.5388, keyword_wer 0.6905 > 0.5814
+#              (drug_wer_folded 0.7143 <= 0.8571 -- also passed)
+# windowed's much worse corpus_wer traces to whole-clip windows drifting into
+# English PARAPHRASE/translation of code-switched Hindi speech rather than
+# transcription (e.g. "सर दर्द" -> "How severe is your heart?"), a distinct
+# and worse failure mode than the anticipated Devanagari-absorption risk (zero
+# absorption candidates were found -- see eval/fast_asr_gate.py). This value
+# is a placeholder, inert until a future attempt clears the gate; no caller
+# reads it while FAST_ASR_ENABLED is False.
+FAST_ASR_MODE = "per_segment"
