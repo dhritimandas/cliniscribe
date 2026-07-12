@@ -140,6 +140,13 @@ _DEVA_CURATED: dict[str, str] = {
     "पैन-डी": "pan d",
     "मॉक्सीक्लाव": "moxclav",
     "बाइफिलैक": "bifilac",
+    "नैक्सडॉम": "naxdom",
+    "नक्सडोम": "naxdom",
+    "नेक्सडोम": "naxdom",
+    "नेक्स डॉम": "naxdom",
+    "नैक्सडॉम 500": "naxdom 500",
+    "नेक्स डॉम 500": "naxdom 500",
+    "नैक्सडॉम 250": "naxdom 250",
 }
 
 _DEVA_RE = re.compile(r"[ऀ-ॿ]")
