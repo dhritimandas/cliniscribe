@@ -7,7 +7,7 @@ from pypdf import PdfReader
 
 import src.l5_render as l5_render
 from src.l5_render import _flag_sentence, render
-from src.types import ClinicalNote, Medication, Symptom
+from src.types import ClinicalNote, Medication, Symptom, Vital
 
 # Stub for web/translations.LABELS (contract: docs/frontend_contracts.md
 # "Ownership of shared modules"). That module is built in parallel by another
@@ -181,6 +181,110 @@ def test_devanagari_symptom_value_renders_without_error(
     out = str(tmp_path / f"rx_{lang}.pdf")
     path = render(note, out_path=out, lang=lang)
     assert os.path.exists(path)
+
+
+def test_arabic_script_advice_renders_without_error_and_in_text_layer(
+    tmp_path,
+) -> None:
+    """Bug 4: an Arabic/Urdu-script value (e.g. a legacy ASR misdetection)
+    must render as visible glyphs, not crash and not vanish silently.
+
+    Reportlab has no bidi/shaping engine, so the extracted glyph order is not
+    guaranteed to match the logical reading order (known, documented
+    limitation) — this only asserts that genuine Arabic-range characters
+    made it into the PDF's text layer, not an exact substring match.
+    """
+    note = _simple_note(advice="اس کو دو بار لیں")
+    out = str(tmp_path / "rx_arabic.pdf")
+    path = render(note, out_path=out)
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert any("؀" <= ch <= "ۿ" for ch in text)
+
+
+def test_devanagari_drug_name_renders_in_medications_table(tmp_path) -> None:
+    """Table cells (not just Paragraph fields) must route through the same
+    script-run wrapping — a raw string in a Table cell renders in a single
+    Latin-only font, so a Devanagari drug name would be tofu."""
+    note = _simple_note(
+        medications=[
+            Medication(
+                drug="नेक्स डॉम 500",
+                dose="500 mg",
+                frequency="1-0-1",
+                timing="after food",
+                duration="5 days",
+                validated=True,
+            )
+        ]
+    )
+    out = str(tmp_path / "rx_deva_drug.pdf")
+    path = render(note, out_path=out)
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert any("ऀ" <= ch <= "ॿ" for ch in text)
+
+
+def test_arabic_drug_name_renders_in_medications_table(tmp_path) -> None:
+    note = _simple_note(
+        medications=[
+            Medication(
+                drug="باراسیٹامول",
+                dose="500 mg",
+                frequency="1-0-1",
+                timing="after food",
+                duration="5 days",
+                validated=False,
+            )
+        ]
+    )
+    out = str(tmp_path / "rx_arabic_drug.pdf")
+    path = render(note, out_path=out)
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert any("؀" <= ch <= "ۿ" for ch in text)
+
+
+def test_hindi_medications_header_label_renders_in_table(
+    stub_labels, tmp_path
+) -> None:
+    """Table header rows are the same defect class as data rows: _label()
+    returns Devanagari for lang="hi"/"mr", so a plain-string header cell
+    would render as tofu just like a plain-string drug-name cell.
+
+    "दवा" ("drug", the header) is a substring of "दवाइयाँ" ("medications",
+    the section heading, already wrapped before this fix) — so a plain
+    `"दवा" in text` check would pass even without the header-row fix. This
+    counts occurrences instead: 1 from the heading alone (pre-fix) vs. 2
+    once the header cell itself also renders (post-fix).
+    """
+    out = str(tmp_path / "rx_hi_header.pdf")
+    path = render(_simple_note(), out_path=out, lang="hi")
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert text.count("दवा") >= 2
+
+
+def test_devanagari_vital_value_renders_in_vitals_table(tmp_path) -> None:
+    note = _simple_note(vitals=[Vital(name="BP", value="१२०/८० mmHg")])
+    out = str(tmp_path / "rx_deva_vital.pdf")
+    path = render(note, out_path=out)
+    assert os.path.exists(path)
+    text = "".join(page.extract_text() for page in PdfReader(path).pages)
+    assert any("ऀ" <= ch <= "ॿ" for ch in text)
+
+
+def test_mixed_devanagari_arabic_latin_string_wraps_each_script_run() -> None:
+    """Each script run gets its own font face; Latin text passes through
+    unwrapped — mixed-script safety in all three directions at once."""
+    arabic_word = "بخار"  # بخار
+    devanagari_word = "बुखार"  # बुखार
+    wrapped = l5_render._wrap_scripts(f"Take {arabic_word} {devanagari_word} now")
+    assert wrapped.count("<font") == 2
+    assert 'face="NotoNaskhArabic"' in wrapped
+    assert 'face="NotoSansDevanagari"' in wrapped
+    assert wrapped.startswith("Take ")
+    assert wrapped.endswith(" now")
 
 
 def test_real_web_translations_module_wires_up_correctly(tmp_path) -> None:

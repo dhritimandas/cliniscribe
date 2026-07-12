@@ -580,6 +580,27 @@ const generalFlagsEl = document.getElementById("general-flags");
 const drawerEl = document.getElementById("drawer");
 const drawerTurnsEl = document.getElementById("drawer-turns");
 
+// Bug 1 (target-language-absolute): cheap client-side check for whether the
+// note/transcript carries any non-Latin (Devanagari or Arabic) script, so a
+// note-load can immediately fire a translation to the (default "en")
+// selected language when the two mismatch, without a wasted round trip when
+// the note is already Latin-script. Same script ranges as web/app.py's
+// _needs_translation_to_en / src/l5_render.py's _SCRIPT_RUN_RE.
+const NON_LATIN_SCRIPT_RE = /[ऀ-ॿ؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/;
+
+function noteHasNonLatinScript(note, turns) {
+  const texts = [];
+  for (const key of ["chief_complaint", "history", "examination", "advice", "follow_up"]) {
+    if (note[key]) texts.push(note[key]);
+  }
+  (note.symptoms || []).forEach((s) => { if (s.name) texts.push(s.name); });
+  (note.diagnosis || []).forEach((d) => { if (d.term) texts.push(d.term); });
+  (note.investigations || []).forEach((v) => { if (v) texts.push(v); });
+  (note.diagnostic_results || []).forEach((v) => { if (v) texts.push(v); });
+  (turns || []).forEach((turn) => { if (turn.text) texts.push(turn.text); });
+  return texts.some((text) => NON_LATIN_SCRIPT_RE.test(text));
+}
+
 async function loadNoteAndShowReview() {
   const res = await api(`/api/sessions/${sessionId}/note`);
   const data = await res.json();
@@ -592,17 +613,34 @@ async function loadNoteAndShowReview() {
   translatedValues = {};
   translatedTranscript = [];
   translationsByLang = {};
+  // Bug 1: the selected language (default "en") may mismatch the note's
+  // dominant script (e.g. a Hindi/Urdu-script consultation with English
+  // still selected) — fire the translation immediately so the first paint
+  // is already in the selected language, not a tap-to-translate surprise.
+  if (noteHasNonLatinScript(noteData, transcriptData)) {
+    await refreshTranslations();
+  }
   renderReview();
   renderDrawer();
   showScreen("review");
 }
 
-// Fix 4: resolve what to *show* for a field — the translated overlay when one
-// exists for the current language, else the source value. Medications/vitals
-// paths never have a translatedValues entry (backend/mock never populate
-// them), so they fall through to the original value unconditionally.
+// Fix 4 / Bug 1 (target-language-absolute): resolve what to *show* for a
+// field — the translated overlay when one exists AND actually differs from
+// the source (a pass-through entry — the source was already in the target
+// language/script — is not "translated" for display purposes), else the raw
+// value. "en" is a real target like hi/mr now, so this is not gated on
+// currentLang at all: translatedValues is always the CURRENT language's
+// overlay (populated by refreshTranslations(), including for "en").
+// Medications/vitals paths never have a translatedValues entry (backend/mock
+// never populate them), so they always fall through to the original value.
+function hasTranslatedOverlay(path, rawValue) {
+  const translated = translatedValues[path];
+  return translated !== undefined && translated !== rawValue;
+}
+
 function displayedText(path, rawValue) {
-  if (currentLang !== "en" && translatedValues[path] !== undefined) {
+  if (hasTranslatedOverlay(path, rawValue)) {
     return { text: translatedValues[path], isTranslated: true };
   }
   return { text: rawValue, isTranslated: false };
@@ -621,7 +659,7 @@ function valueCellHtml(path, rawValue) {
 function scalarFieldCell(labelKey, path) {
   const raw = getValueAtPath(noteData, path);
   const flagReason = flagsData[path];
-  const hasDetail = provenanceData[path] || (currentLang !== "en" && translatedValues[path] !== undefined);
+  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, raw);
 
   return `
   <div class="cell field ${flagReason ? "flagged" : ""}" data-path="${path}">
@@ -637,7 +675,7 @@ function scalarFieldCell(labelKey, path) {
 
 function itemRow(path, rawValue, detailText, leadingLabel) {
   const flagReason = flagsData[path];
-  const hasDetail = provenanceData[path] || (currentLang !== "en" && translatedValues[path] !== undefined);
+  const hasDetail = provenanceData[path] || hasTranslatedOverlay(path, rawValue);
 
   return `
   <div class="item-row ${flagReason ? "flagged" : ""}" data-path="${path}">
@@ -819,7 +857,7 @@ function onFieldBlur(el) {
   // Unchanged and a translation exists for this language: editing is done,
   // resume showing the translated overlay (the original was only shown
   // transiently while the field had focus).
-  if (newVal === oldVal && currentLang !== "en" && translatedValues[path] !== undefined) {
+  if (newVal === oldVal && hasTranslatedOverlay(path, baselineValues[path])) {
     el.textContent = translatedValues[path];
   }
 }
@@ -833,7 +871,7 @@ function toggleProvenance(path) {
     return;
   }
   const parts = [];
-  if (currentLang !== "en" && translatedValues[path] !== undefined) {
+  if (hasTranslatedOverlay(path, baselineValues[path])) {
     parts.push(
       `<div class="original-line">${u("original")}: ${escapeHtml(baselineValues[path] || "")}</div>`
     );
@@ -870,7 +908,8 @@ document.getElementById("save-btn").addEventListener("click", async () => {
 
 function renderDrawer() {
   drawerTurnsEl.innerHTML = transcriptData.map((turn, i) => {
-    const translated = currentLang !== "en" ? translatedTranscript[i] : undefined;
+    const overlay = translatedTranscript[i];
+    const translated = overlay !== undefined && overlay !== turn.text ? overlay : undefined;
     return `
     <div class="turn" data-turn-index="${i}">
       <span class="role">${escapeHtml(turn.speaker_role)}</span>
@@ -897,14 +936,37 @@ document.getElementById("view-transcript-btn").addEventListener("click", () => {
   drawerEl.classList.toggle("open");
 });
 
+// Bug 2: the drawer must never trap the user — close via the pinned CLOSE
+// button, Escape, or a click anywhere outside it.
+function closeDrawer() {
+  drawerEl.classList.remove("open");
+}
+
+document.getElementById("drawer-close-btn").addEventListener("click", closeDrawer);
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && drawerEl.classList.contains("open")) closeDrawer();
+});
+
+document.addEventListener("click", (e) => {
+  if (!drawerEl.classList.contains("open")) return;
+  if (drawerEl.contains(e.target)) return;
+  // Elements that legitimately OPEN the drawer as part of this same click
+  // must not immediately re-close it via this outside-click handler.
+  if (e.target.closest("#view-transcript-btn, .prov-trigger")) return;
+  closeDrawer();
+});
+
 /* ---------- Language switching ---------- */
 
 document.getElementById("lang-select").addEventListener("change", async (e) => {
   currentLang = e.target.value;
-  // Switching back to en needs no server call — originals are always held
-  // locally in noteData/transcriptData; translatedValues/translatedTranscript
-  // are simply not consulted for display when currentLang === "en".
-  if (currentLang !== "en") await refreshTranslations();
+  // Bug 1 (target-language-absolute): "en" is a real target like hi/mr —
+  // a Devanagari/Arabic-script note still needs translating TO English, so
+  // every switch (including back to en) refreshes the overlay. Cached per
+  // lang server-side and client-side, so repeated en<->hi<->mr switching
+  // never re-hits Ollama for a language already fetched this session.
+  await refreshTranslations();
   renderReview();
   renderDrawer();
 });
@@ -931,11 +993,16 @@ const signBtn = document.getElementById("sign-btn");
 const signForm = document.getElementById("sign-form");
 const signedPanel = document.getElementById("signed-panel");
 
+// Bug 3: the review page (note-grid + footer) commonly runs taller than the
+// browser viewport, so toggling sign-form/signed-panel visible produced no
+// change *within the user's current view* — indistinguishable from "the
+// button did nothing". Scroll the newly-shown element into view every time.
 signBtn.addEventListener("click", () => {
   signForm.hidden = !signForm.hidden;
   document.getElementById("sign-doctor-name").value = localStorage.getItem("cliniscribe_doctor_name") || "";
   document.getElementById("sign-reg-no").value = localStorage.getItem("cliniscribe_reg_no") || "";
   document.getElementById("sign-clinic").value = localStorage.getItem("cliniscribe_clinic") || "";
+  if (!signForm.hidden) signForm.scrollIntoView({ block: "center", behavior: "smooth" });
 });
 
 document.getElementById("sign-submit-btn").addEventListener("click", async () => {
@@ -947,11 +1014,23 @@ document.getElementById("sign-submit-btn").addEventListener("click", async () =>
   localStorage.setItem("cliniscribe_reg_no", regNo);
   localStorage.setItem("cliniscribe_clinic", clinic);
 
-  const res = await api(`/api/sessions/${sessionId}/sign`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lang: currentLang, doctor: { name, reg_no: regNo, clinic } }),
-  });
+  let res;
+  try {
+    res = await api(`/api/sessions/${sessionId}/sign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lang: currentLang, doctor: { name, reg_no: regNo, clinic } }),
+    });
+  } catch (err) {
+    console.error("sign request failed:", err);
+    return;
+  }
+  if (!res.ok) {
+    // Never silently claim "signed" on a server-side failure — leave the
+    // form open so the physician can see something went wrong and retry.
+    console.error("sign request returned", res.status);
+    return;
+  }
   const data = await res.json();
 
   signForm.hidden = true;
@@ -961,6 +1040,7 @@ document.getElementById("sign-submit-btn").addEventListener("click", async () =>
   const link = document.getElementById("signed-pdf-link");
   link.textContent = u("download_pdf");
   link.href = data.pdf_url || `/api/sessions/${sessionId}/pdf?lang=${currentLang}`;
+  signedPanel.scrollIntoView({ block: "center", behavior: "smooth" });
 });
 
 /* =====================================================================

@@ -410,6 +410,34 @@ html, body {
 
 .drawer.open { transform: translateX(0); }
 
+/* Bug 2: CLOSE is pinned at the drawer's top (sticky within the drawer's own
+   scroll container) so it stays reachable regardless of scroll position —
+   the drawer must never trap the user. */
+.drawer-header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0.9rem 1.25rem 0.6rem;
+  background: var(--gray-050);
+  border-bottom: 1px solid var(--gray-200);
+  z-index: 1;
+}
+
+.drawer-close-btn {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border: 1px solid var(--gray-200);
+  background: #fff;
+  color: var(--gray-900);
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.drawer-close-btn:hover { border-color: var(--gray-400); }
+
 .drawer-inner { padding: 1.5rem 1.25rem; }
 
 .turn {
