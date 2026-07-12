@@ -286,3 +286,89 @@ def test_hindi_timing_phrase_canonicalizes_to_english() -> None:
     }
     note = _build_note(data, transcript="[UNKNOWN]: paracetamol 500 mg खाने के बाद")
     assert note.medications[0].timing == "after food"
+
+
+# ── (11) Devanagari drug names stayed Devanagari and unvalidated, outputs/
+# 20260712-194649-763e13, 2026-07-12 ────────────────────────────────────────
+# Root cause: src/drug_lexicon.py's fold turned Devanagari into a PHONETIC
+# Latin skeleton, but the Latin lexicon keys kept ENGLISH ORTHOGRAPHY ('x'
+# never became 'ks'; 'th'/'ph'/'ch'/'c'/'y' never normalized) — a real drug
+# spoken in Devanagari (नौरफलोक्स, एजित्रोमाइसिन) folded nowhere near its own
+# English lexicon entry (norflox, azithromycin). Fixed with a Latin-
+# orthography normalization pass, applied identically to BOTH sides, that
+# was previously duplicated three ways (src/drug_lexicon.py,
+# src/l4_extract.py, eval/drug_bench.py) and is now ONE shared fold (see
+# tests/test_fold_parity.py) — required, not optional: the display fix
+# below replaces a Devanagari drug name with its canonical Latin spelling
+# BEFORE the grounding guard checks it against the (still-Devanagari)
+# transcript, so the guard's own fold must be the SAME fold that resolved
+# the name, or a correctly-resolved real drug gets wrongly demoted to an
+# "unnamed medication" row.
+
+
+def test_norflox_devanagari_resolves_and_canonicalizes_for_display() -> None:
+    """नौरफलोक्स -> norflox via the expanded-lexicon fuzzy fold tier (0.7778
+    confidence, below 1.0) — fuzzy display substitutions get their own
+    low-confidence flag (advisor ruling 4), distinct from .unvalidated."""
+    assert canonicalize_drug_span("नौरफलोक्स") == ("norflox", 0.7778)
+
+    data = {"medications": [{"drug": "नौरफलोक्स", "dose": None}]}
+    note = _build_note(
+        data,
+        transcript="[UNKNOWN]: नौरफलोक्स, रात में एक बार सोने से पहले, ठीक है?",
+    )
+    assert note.medications[0].drug == "norflox"
+    assert note.medications[0].validated is True
+    assert "medications.norflox.canonicalized_fuzzy" in note.low_confidence_fields
+
+
+def test_azithromycin_no_aspirate_spelling_canonicalizes_with_dose() -> None:
+    """एजित्रोमाइसिन 500 -> azithromycin 500, dose digit preserved.
+
+    This specific ASR spelling (missing the थ aspirate AND the ज़ nukta) is
+    NOT recovered by the general fuzzy-fold tier: its fold key sits within
+    the fuzzy bound of BOTH azithromycin and erythromycin (two genuinely
+    distinct antibiotics) — a real ambiguity from the missing information,
+    not a rule gap. canonicalize_drug_span() correctly declines (returns
+    None) rather than guess; the fix is a curated-table entry (the same
+    zero-risk mechanism the नैक्सडॉम family already uses for a known, seen
+    distortion), checked before the fuzzy tier.
+    """
+    assert canonicalize_drug_span("एजित्रोमाइसिन") is None  # ambiguous, declined
+
+    result = _normalize_drug_text("एजित्रोमाइसिन 500, दिन में दो बार")
+    assert "azithromycin 500" in result
+
+    data = {"medications": [{"drug": "एजित्रोमाइसिन 500", "dose": None}]}
+    note = _build_note(
+        data, transcript="[UNKNOWN]: एजित्रोमाइसिन 500, दिन में दो बार,"
+    )
+    assert note.medications[0].drug == "azithromycin 500"
+    assert note.medications[0].validated is True
+    assert not any(
+        f.endswith(".canonicalized_fuzzy") for f in note.low_confidence_fields
+    )
+
+
+def test_canonical_display_survives_the_grounding_guard_against_devanagari() -> None:
+    """The advisor's blocker scenario, as a regression test: _isolate_drug_span
+    canonicalizes a filler-glued Devanagari span to its Latin display name
+    BEFORE the grounding guard runs (src/l4_extract.py's medications loop).
+    With three separately-hand-maintained folds, the guard's OWN fold could
+    disagree with the one that resolved the name, folding the Latin
+    canonical far from the still-Devanagari transcript and wrongly demoting
+    a correctly-resolved real drug to "unnamed medication N". With one
+    shared fold (src/drug_lexicon.py's, imported by src/l4_extract.py), the
+    guard agrees with the resolution and the row survives.
+    """
+    data = {"medications": [{"drug": "एक एजित्रोमाइसिन 500 एक", "dose": None}]}
+    note = _build_note(
+        data, transcript="[UNKNOWN]: एक एजित्रोमाइसिन 500 एक खा लो"
+    )
+    assert note.medications[0].drug == "azithromycin 500"
+    assert not any(f.endswith(".ungrounded") for f in note.low_confidence_fields)
+
+    data2 = {"medications": [{"drug": "एक नौरफलोक्स एक", "dose": None}]}
+    note2 = _build_note(data2, transcript="[UNKNOWN]: एक नौरफलोक्स एक खा लो")
+    assert note2.medications[0].drug == "norflox"
+    assert not any(f.endswith(".ungrounded") for f in note2.low_confidence_fields)

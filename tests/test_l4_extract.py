@@ -611,11 +611,16 @@ def test_unnamed_medication_not_double_flagged_unvalidated() -> None:
 
 
 def test_real_drug_name_untouched_by_generic_filter() -> None:
+    """Paracetamol must not be caught by the generic-term guard. It IS
+    lower-cased to "paracetamol" downstream — the canonical-Latin display
+    precedence resolves it via the lexicon (exact match) and displays the
+    canonical spelling; see the "Canonical-Latin display precedence"
+    section in src/l4_extract.py."""
     from src.l4_extract import _build_note
 
     data = {"medications": [{"drug": "Paracetamol", "dose": "650 mg"}]}
     note = _build_note(data)
-    assert note.medications[0].drug == "Paracetamol"
+    assert note.medications[0].drug == "paracetamol"
 
 
 # ── Prompt-example leakage guard ──────────────────────────────────────────────
