@@ -219,3 +219,13 @@ FAST_ENGINE_RESIDENT = True
 # rather than an unconditional "never both" rule. ~7-8GB resident + headroom
 # on the 24GB target machine.
 RESIDENT_PEAK_RSS_BUDGET_MB = 14000
+
+# ── Latency Wave 3: incremental capture (web/incremental.py) ────────────────
+# Audio more than this far behind the growing buffer's edge is considered
+# SETTLED and gets decoded+frozen during recording (never re-decoded at
+# finalize). Smaller = less work left at stop time, but a settled window's
+# decode must still be safely behind the live edge — too small risks
+# decoding audio the doctor is still mid-word on. 10s matches the plan's
+# budget table; tune once real capture-loop timing data exists (docs/
+# incremental_capture_design.md's precondition 2).
+INCREMENTAL_SETTLE_MARGIN_S = 10.0
