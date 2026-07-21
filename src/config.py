@@ -200,3 +200,22 @@ VERIFY_MAX_WINDOWS = 2 if 2 * VERIFY_DECODE_S_PER_WINDOW_ESTIMATE <= VERIFY_BUDG
 # never reads this value — kept for eval/ harnesses that still compare both
 # configs, not as a live production switch.
 FAST_ASR_MODE = "per_segment"
+
+# ── Latency Wave 2: fast-engine model residency (src/model_registry.py) ─────
+# CLAUDE.md's "load one model, release it — never hold ASR and LLM resident
+# simultaneously" rule was written for the accurate CPU path (faster-whisper
+# large-v3, ~3GB int8, coexisting with Qwen would risk OOM on 24GB). The fast
+# engine's models are far smaller (pyannote ~0.5GB, parrotlet ~1GB, mlx-turbo
+# ~1.6GB; Qwen lives in Ollama's separate process either way) — resident
+# together they measure well inside the budget below. This flag is the
+# carve-out: it keeps pyannote's Pipeline and parrotlet's _EmbeddingBackend
+# loaded across sessions (src/model_registry.py) instead of reloading them
+# every pipeline.run() call, cutting L2 and most of L3.5's wall time. Gated to
+# asr_engine="fast" only in src/pipeline.py — the accurate CLI path is
+# unaffected regardless of this flag's value.
+FAST_ENGINE_RESIDENT = True
+# Enforcement mechanism replacing the blanket rule for the fast engine: a
+# measured peak-RSS ceiling (bench/stop_to_note_bench.py asserts against it)
+# rather than an unconditional "never both" rule. ~7-8GB resident + headroom
+# on the 24GB target machine.
+RESIDENT_PEAK_RSS_BUDGET_MB = 14000

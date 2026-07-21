@@ -1,7 +1,13 @@
 """Full CliniScribe pipeline: audio → draft prescription PDF.
 
-Stages execute sequentially. Each model is loaded, used, and released before
-the next stage begins — never hold ASR and LLM in memory simultaneously.
+Stages execute sequentially. ASR (L3) and the LLM (L4) never coexist in
+memory for either engine — that discipline is unconditional. For the fast
+engine only (asr_engine="fast"), L2's pyannote pipeline and L3.5's parrotlet
+backend are process-resident across sessions instead of load-use-release per
+call (src/model_registry.py, src/config.py's FAST_ENGINE_RESIDENT) — the
+latency-plan carve-out to CLAUDE.md's original blanket rule, enforced by a
+peak-RSS budget instead. The accurate CLI path (asr_engine="accurate", the
+default) always loads, uses, and releases every model, unchanged.
 
 All artifacts of one consultation live under outputs/<session_id>/:
 the preprocessed audio, the speaker-attributed transcript, the structured
@@ -22,7 +28,7 @@ from dotenv import load_dotenv
 
 import threading
 
-from src import telemetry
+from src import config, model_registry, telemetry
 from src.fast_asr import fast_transcribe_windowed
 from src.l1_preprocess import preprocess
 from src.l2_diarize import diarize
@@ -94,6 +100,15 @@ def run(
         raise ValueError(f"asr_engine must be 'accurate' or 'fast', got {asr_engine!r}")
     transcribe_fn = fast_transcribe_windowed if asr_engine == "fast" else transcribe
 
+    # Latency Wave 2: resident pyannote + parrotlet for the fast engine only
+    # (src/model_registry.py, src/config.py's FAST_ENGINE_RESIDENT docstring).
+    # The accurate CLI path always loads-uses-releases, unchanged.
+    resident = asr_engine == "fast" and config.FAST_ENGINE_RESIDENT
+    diarize_kwargs = {"pipeline": model_registry.get_pyannote_pipeline()} if resident else {}
+    normalize_kwargs = (
+        {"backend": model_registry.get_embedding_backend()} if resident else {}
+    )
+
     stop_ts_source = "stop_event"
     if stop_monotonic_ts is None:
         stop_monotonic_ts = time.monotonic()
@@ -125,7 +140,7 @@ def run(
     wav_path = _staged("l1_preprocess", preprocess, in_path, out_dir=session_dir)
 
     logger.info("L2: diarizing %s", wav_path)
-    segments = _staged("l2_diarize", diarize, wav_path)
+    segments = _staged("l2_diarize", diarize, wav_path, **diarize_kwargs)
 
     logger.info("L3: transcribing %d segments (engine=%s)", len(segments), asr_engine)
     turns = _staged("l3_asr", transcribe_fn, wav_path, segments, on_progress=on_progress)
@@ -138,7 +153,7 @@ def run(
         warm_thread.start()
 
     logger.info("L3.5: normalizing %d turns", len(turns))
-    turns = _staged("l3_5_normalize", normalize, turns)
+    turns = _staged("l3_5_normalize", normalize, turns, **normalize_kwargs)
     _write_turns(turns, os.path.join(session_dir, "transcript.json"))
 
     with telemetry.timer("l4.warm_join_wait"):

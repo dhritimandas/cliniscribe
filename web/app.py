@@ -280,11 +280,16 @@ async def create_session(audio: UploadFile = File(...)) -> dict[str, str]:
         _status_path(sid),
         {"state": "idle", "stage": None, "stages_done": [], "error": None},
     )
-    # A finished recording is uploaded here — the live-preview model (if it
-    # was loaded during recording) is no longer needed; release it before
-    # the production faster-whisper (L3) or Ollama (L4) models load, so the
-    # load-one-release-one memory discipline holds at its peak.
-    live_asr.release_model()
+    # A finished recording is uploaded here. On the accurate path, the
+    # live-preview mlx model (if loaded during recording) is no longer
+    # needed and is released before faster-whisper/Ollama load, so
+    # load-one-release-one holds at its peak. On the fast + resident path
+    # (production default — src/config.py's FAST_ENGINE_RESIDENT), this is
+    # SKIPPED deliberately: fast_transcribe_windowed (L3) decodes through the
+    # SAME mlx_whisper.transcribe.ModelHolder the preview just warmed, so
+    # releasing it here would only force an immediate, wasted reload.
+    if not (config.FAST_ASR_ENABLED and config.FAST_ENGINE_RESIDENT):
+        live_asr.release_model()
     return {"session_id": sid}
 
 
