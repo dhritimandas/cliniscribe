@@ -55,6 +55,7 @@ def run(
     on_stage: Callable[[str, str], None] | None = None,
     on_progress: Callable[[float, float], None] | None = None,
     asr_engine: str = "accurate",
+    stop_monotonic_ts: float | None = None,
 ) -> str:
     """Run the full pipeline on an audio file and return the PDF path.
 
@@ -78,6 +79,12 @@ def run(
             frontend passes "fast" once that flag is on, then runs a
             background verification pass (web/verification.py) that
             re-checks safety-critical fields against a second, slower decode.
+        stop_monotonic_ts: time.monotonic() value captured at the moment the
+            recording stopped (for the web flow: when the upload completed).
+            Enables the stop_to_note_s / stop_to_pdf_s metrics in
+            timings.json — the perceived-latency numbers the sub-10s goal is
+            gated on. When None (CLI), the metrics are measured from run()
+            entry instead and timings.json marks stop_ts_source="run_start".
 
     Returns:
         Path to the generated draft prescription PDF
@@ -86,6 +93,11 @@ def run(
     if asr_engine not in ("accurate", "fast"):
         raise ValueError(f"asr_engine must be 'accurate' or 'fast', got {asr_engine!r}")
     transcribe_fn = fast_transcribe_windowed if asr_engine == "fast" else transcribe
+
+    stop_ts_source = "stop_event"
+    if stop_monotonic_ts is None:
+        stop_monotonic_ts = time.monotonic()
+        stop_ts_source = "run_start"
 
     session_id = session_id or new_session_id()
     session_dir = os.path.join(OUTPUTS_ROOT, session_id)
@@ -136,23 +148,29 @@ def run(
     note = _staged("l4_extract", extract, turns)
     with open(os.path.join(session_dir, "note.json"), "w", encoding="utf-8") as f:
         json.dump(dataclasses.asdict(note), f, ensure_ascii=False, indent=2)
+    stop_to_note_s = round(time.monotonic() - stop_monotonic_ts, 2)
 
     logger.info("L5: rendering prescription PDF")
     pdf_path = _staged(
         "l5_render", render, note, out_path=os.path.join(session_dir, "draft_rx.pdf")
     )
+    stop_to_pdf_s = round(time.monotonic() - stop_monotonic_ts, 2)
 
     timings = {
         "stages": stage_report,
         "sub_timings": telemetry.snapshot(),  # model loads recorded by stages
         "total_wall_s": round(sum(s["wall_s"] for s in stage_report.values()), 2),
         "peak_rss_mb": telemetry.peak_rss_mb(),
+        "stop_ts_source": stop_ts_source,
+        "stop_to_note_s": stop_to_note_s,
+        "stop_to_pdf_s": stop_to_pdf_s,
     }
     with open(os.path.join(session_dir, "timings.json"), "w", encoding="utf-8") as f:
         json.dump(timings, f, indent=2)
     logger.info(
-        "Timings: total %.1fs, peak RSS %.0f MB — %s",
+        "Timings: total %.1fs, stop_to_note %.1fs, peak RSS %.0f MB — %s",
         timings["total_wall_s"],
+        timings["stop_to_note_s"],
         timings["peak_rss_mb"],
         {k: v["wall_s"] for k, v in stage_report.items()},
     )

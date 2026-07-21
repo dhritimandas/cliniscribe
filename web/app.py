@@ -131,6 +131,14 @@ _STAGE_SECONDS_PER_AUDIO_SECOND = _compute_stage_calibration()
 
 _status_lock = threading.Lock()
 
+# Latency instrumentation (see bench/stop_to_note_bench.py): the "stop
+# recording" proxy in today's batch-upload flow is upload completion — the
+# closest thing we have to a stop event until incremental capture (W3)
+# exists. Ephemeral, in-memory only: this is a perceived-latency metric, not
+# session state that needs to survive a server restart.
+_stop_ts_lock = threading.Lock()
+_stop_ts_by_session: dict[str, float] = {}
+
 app = FastAPI(title="CliniScribe")
 
 
@@ -266,6 +274,8 @@ async def create_session(audio: UploadFile = File(...)) -> dict[str, str]:
     os.makedirs(session_dir, exist_ok=True)
     with open(os.path.join(session_dir, f"input.{ext}"), "wb") as f:
         f.write(await audio.read())
+    with _stop_ts_lock:
+        _stop_ts_by_session[sid] = time.monotonic()
     _write_json(
         _status_path(sid),
         {"state": "idle", "stage": None, "stages_done": [], "error": None},
@@ -495,11 +505,14 @@ def _run_pipeline_thread(sid: str, in_path: str) -> None:
     audio_seconds = _estimate_audio_seconds(in_path)
     if audio_seconds is not None:
         _write_expected_stage_seconds(sid, audio_seconds)
+    with _stop_ts_lock:
+        stop_monotonic_ts = _stop_ts_by_session.pop(sid, None)
     try:
         pipeline.run(
             in_path,
             session_id=sid,
             on_stage=on_stage,
+            stop_monotonic_ts=stop_monotonic_ts,
             on_progress=on_progress,
             asr_engine=asr_engine,
         )
