@@ -492,6 +492,41 @@ def _pack_segments_into_windows(
     return windows
 
 
+def pack_duration_into_windows(
+    total_duration_s: float, max_window_s: float = 28.0
+) -> list[tuple[float, float]]:
+    """Partition [0, total_duration_s) into <=max_window_s windows, no segments needed.
+
+    Used by web/incremental.py (latency Wave 3): during live capture, only a
+    PROVISIONAL diarization exists and keeps changing as more audio arrives,
+    so windows cannot be packed from diarized segments the way
+    _pack_segments_into_windows does for the batch path. This is safe because
+    ASR and diarization are already decoupled here — a window's decode
+    produces word timestamps that get re-attributed to whatever the FINAL
+    diarization turns out to be (_assign_words_to_turns), so the window
+    boundary only affects where a decode call is cut, never which speaker a
+    word is attributed to.
+
+    Args:
+        total_duration_s: Total audio duration to cover, in seconds.
+        max_window_s: Maximum span of one decode window, in seconds.
+
+    Returns:
+        List of (start, end) tuples covering [0, total_duration_s) with no
+        gaps or overlaps, each span <= max_window_s. Empty if
+        total_duration_s <= 0.
+    """
+    if total_duration_s <= 0:
+        return []
+    windows = []
+    start = 0.0
+    while start < total_duration_s:
+        end = min(start + max_window_s, total_duration_s)
+        windows.append((start, end))
+        start = end
+    return windows
+
+
 # ── Word <-> segment attribution ─────────────────────────────────────────────
 # Adapted from the whisperX-alignment helpers on
 # worktree-agent-a9241a6fe03e8de65:src/l3_asr.py (unmerged branch; that
@@ -948,33 +983,9 @@ def fast_transcribe_windowed(
     all_words: list[Word] = []
     for group in window_groups:
         window_start, window_end = group[0].start, group[-1].end
-        text, words = _decode_window_words_with_guards(
-            audio,
-            sr,
-            window_start,
-            window_end,
-            config.FAST_ASR_MODEL,
-            config.FAST_ASR_DECODE_KWARGS,
+        words = _decode_one_window_with_ladder(
+            audio, sr, window_start, window_end, total_duration, on_progress=on_progress
         )
-        if looks_degenerate(text, window_end - window_start):
-            text, words, step = _retry_ladder_windowed(
-                audio,
-                sr,
-                window_start,
-                window_end,
-                total_duration,
-                initial_text=text,
-                initial_words=words,
-                on_progress=on_progress,
-                done_seconds_before_window=done_seconds,
-                total_seconds=total_seconds,
-            )
-            logger.warning(
-                "fast_asr windowed ladder fired at [%.2f, %.2f]s — resolved by %s",
-                window_start,
-                window_end,
-                step,
-            )
         all_words.extend(words)
 
         done_seconds += sum(max(0.0, s.end - s.start) for s in group)
@@ -982,3 +993,73 @@ def fast_transcribe_windowed(
 
     raw_turns = _assign_words_to_turns(all_words, segments)
     return _build_turns_with_roles(raw_turns)
+
+
+def _decode_one_window_with_ladder(
+    audio: np.ndarray,
+    sr: int,
+    window_start: float,
+    window_end: float,
+    total_duration: float,
+    *,
+    on_progress: Callable[[float, float], None] | None = None,
+    done_seconds_before_window: float = 0.0,
+    total_seconds: float = 0.0,
+) -> list[Word]:
+    """Decode one window (guards + degeneration ladder), return its words.
+
+    Factored out of fast_transcribe_windowed's loop body so
+    decode_windows_words (segment-free, latency Wave 3's incremental capture)
+    can share the exact same guard/ladder behavior per window without
+    depending on diarized segments — this function never touches Segment.
+    """
+    text, words = _decode_window_words_with_guards(
+        audio,
+        sr,
+        window_start,
+        window_end,
+        config.FAST_ASR_MODEL,
+        config.FAST_ASR_DECODE_KWARGS,
+    )
+    if looks_degenerate(text, window_end - window_start):
+        text, words, step = _retry_ladder_windowed(
+            audio,
+            sr,
+            window_start,
+            window_end,
+            total_duration,
+            initial_text=text,
+            initial_words=words,
+            on_progress=on_progress,
+            done_seconds_before_window=done_seconds_before_window,
+            total_seconds=total_seconds,
+        )
+        logger.warning(
+            "fast_asr windowed ladder fired at [%.2f, %.2f]s — resolved by %s",
+            window_start,
+            window_end,
+            step,
+        )
+    return words
+
+
+def decode_windows_words(
+    audio: np.ndarray, sr: int, windows: list[tuple[float, float]]
+) -> list[Word]:
+    """Decode a list of (start, end) windows (see pack_duration_into_windows),
+    guards + ladder applied per window, and return all words concatenated in
+    chronological order.
+
+    Segment-free counterpart to fast_transcribe_windowed's per-window loop —
+    used by web/incremental.py, which cannot pack windows from diarized
+    segments (only a provisional, still-changing diarization exists during
+    live capture). No progress callback: incremental capture reports its own
+    progress via partial_turns(), not this per-window mechanism.
+    """
+    total_duration = len(audio) / sr
+    all_words: list[Word] = []
+    for window_start, window_end in windows:
+        all_words.extend(
+            _decode_one_window_with_ladder(audio, sr, window_start, window_end, total_duration)
+        )
+    return all_words

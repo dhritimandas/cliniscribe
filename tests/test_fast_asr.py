@@ -47,9 +47,11 @@ from src.fast_asr import (
     _retry_ladder,
     _retry_ladder_windowed,
     _segment_index_for_midpoint,
+    decode_windows_words,
     fast_transcribe,
     fast_transcribe_windowed,
     looks_degenerate,
+    pack_duration_into_windows,
 )
 from src.types import Segment, Turn
 
@@ -631,6 +633,59 @@ def test_pack_windows_invariants_on_a_longer_synthetic_session() -> None:
     assert [seg for group in windows for seg in group] == segs
     for group in windows:
         assert group[-1].end - group[0].start <= 10.0
+
+
+# ── Segment-free window partitioner (latency Wave 3, incremental capture) ───
+
+
+def test_pack_duration_zero_or_negative_returns_empty_list() -> None:
+    assert pack_duration_into_windows(0.0) == []
+    assert pack_duration_into_windows(-5.0) == []
+
+
+def test_pack_duration_shorter_than_cap_is_one_window() -> None:
+    assert pack_duration_into_windows(12.0, max_window_s=28.0) == [(0.0, 12.0)]
+
+
+def test_pack_duration_exact_multiple_of_cap() -> None:
+    assert pack_duration_into_windows(56.0, max_window_s=28.0) == [
+        (0.0, 28.0),
+        (28.0, 56.0),
+    ]
+
+
+def test_pack_duration_covers_full_span_with_no_gaps_or_overlaps() -> None:
+    windows = pack_duration_into_windows(97.3, max_window_s=28.0)
+    assert windows[0][0] == 0.0
+    assert windows[-1][1] == 97.3
+    for (_, prev_end), (next_start, _) in zip(windows, windows[1:], strict=False):
+        assert prev_end == next_start  # no gap, no overlap
+    for start, end in windows:
+        assert end - start <= 28.0
+
+
+def test_decode_windows_words_concatenates_across_windows(monkeypatch) -> None:
+    """decode_windows_words must call the SAME per-window guard+ladder path
+    fast_transcribe_windowed uses (not a reimplementation) — verified here by
+    faking that shared function and checking it's invoked once per window
+    with the right bounds, in order."""
+    import src.fast_asr as fast_asr_module
+
+    calls = []
+
+    def fake_decode_one_window(audio, sr, start, end, total_duration, **kwargs):
+        calls.append((start, end))
+        return [(start, start + 0.5, f"word@{start:.0f}")]
+
+    monkeypatch.setattr(
+        fast_asr_module, "_decode_one_window_with_ladder", fake_decode_one_window
+    )
+
+    audio = np.zeros(16000 * 10, dtype=np.float32)
+    words = decode_windows_words(audio, 16000, [(0.0, 5.0), (5.0, 10.0)])
+
+    assert calls == [(0.0, 5.0), (5.0, 10.0)]
+    assert words == [(0.0, 0.5, "word@0"), (5.0, 5.5, "word@5")]
 
 
 # ── Word <-> segment attribution ─────────────────────────────────────────────

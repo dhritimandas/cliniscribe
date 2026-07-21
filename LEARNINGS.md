@@ -1658,3 +1658,89 @@ dominant cost, not the model weights themselves being reloaded. If a future
 change needs to claw back memory budget, dropping backend residency while
 keeping the reference-matrix cache is a safe, low-cost fallback that gives up
 only a fraction of this phase's gain, not all of it.
+
+## Latency Phase 4 — Incremental Capture: a backend primitive, and two bugs the equivalence test earned its keep on (2026-07-20)
+
+### (a) What this phase does
+`web/incremental.py`'s `IncrementalSession` (`feed` / `partial_turns` /
+`finalize`) implements docs/incremental_capture_design.md's L1+L2+L3 backend
+with one deliberate departure from that design: instead of one whole-file
+re-decode at stop, settled windows are decoded once during `feed()` calls
+and FROZEN — production's fast-path decode is deterministic
+(`temperature=0.0`, no conditioning), so re-decoding identical audio would
+reproduce identical text, making a whole-file re-decode provably redundant
+work. `finalize()` decodes only the un-settled tail, concurrently with one
+final full-file pyannote pass (two threads, joined) — the actual mechanism
+behind collapsing stop-time cost to roughly `max(tail decode, final
+diarize)`. A new segment-free windowing primitive
+(`src.fast_asr.pack_duration_into_windows` + `decode_windows_words`) makes
+this possible: diarization is only PROVISIONAL during live capture and keeps
+changing, so windows are cut by fixed duration instead of diarized natural
+breaks, relying on the fact that word-to-speaker attribution was already
+decoupled from decode-window boundaries (`_assign_words_to_turns`) before
+this phase touched anything. This wave is deliberately scoped to the backend
+primitive only — no FastAPI routes or browser capture-loop wiring, since
+nothing exists yet to drive them (see docs/incremental_capture_design.md's
+"Preconditions before HTTP/browser wiring").
+
+### (b) Hardest bugs
+
+1. **A benchmark-quality real-audio equivalence test caught a real design
+   flaw that every unit test with a fake decoder had no way to see.** The
+   first version of `_decode_newly_settled_locked` decoded on every single
+   `feed()` tick, however little new audio had settled. On an 11.3s test
+   clip with a 4s settle margin, this produced 2-5 SECOND decode windows —
+   and the real-audio equivalence test's word-overlap against the batch path
+   collapsed to 31% (batch words were genuinely different content:
+   `{medicines, put, giving, morning...}` vs incremental's `{argumenting,
+   subhash, reasons...}` on the same audio). Root cause: firing a decode call
+   for every ~10s tick interval creates MORE, SMALLER mlx_whisper.transcribe()
+   calls than the batch path's ~28s-capped windows — directly working
+   against Fix 2's whole rationale (src/fast_asr.py's module docstring: a
+   decode call costs a near-constant ~7-9s regardless of how much audio it
+   covers, so fewer/bigger calls is the entire point of windowing). Every
+   pure-Python unit test with a faked `decode_windows_words` passed
+   throughout, because none of them could observe that windows were
+   pathologically small — only feeding real audio through the real decode
+   path and comparing against a real reference exposed it. Fixed by
+   accumulating settled-but-undecoded backlog across `feed()` calls until it
+   holds at least one full `max_window_s` chunk, packing as many complete
+   windows as the backlog supports in ONE `decode_windows_words` call, and
+   leaving any sub-window remainder for the next tick — `finalize()`'s tail
+   decode is exempt from this gate since no more audio is coming. Overlap
+   jumped to 69% on a properly-proportioned second test (realistic ~70s
+   fixture, production settle margin, ~25s feed ticks) — the residual gap is
+   the ACCEPTED, DESIGNED-FOR divergence between incremental's fixed
+   28s-boundary cuts and batch's diarization-natural-break cuts (documented
+   in the original latency plan's risk register), not a defect.
+
+2. **`src/model_registry.py` depended on a side effect from a module it
+   might never be imported alongside.** `get_pyannote_pipeline()` needs
+   `HF_TOKEN`, which `src/pipeline.py` loads via `load_dotenv()` at import
+   time — but `model_registry.py` itself never called `load_dotenv()`, so it
+   silently relied on SOME other already-imported module having done so
+   first. The real-audio equivalence test imports `web.incremental` directly
+   (never `src.pipeline`), so `HF_TOKEN` was genuinely absent from
+   `os.environ` when `finalize()`'s background diarize thread ran, surfacing
+   as `OSError: HF_TOKEN not set` inside a `PytestUnhandledThreadExceptionWarning`
+   rather than a clean top-level failure (background-thread exceptions don't
+   propagate to the caller — another reason this class of bug hides easily).
+   Root cause: an import-order dependency masquerading as "it just works" —
+   any module that NEEDS an environment variable should load it itself,
+   not assume a sibling module's import already did. Fixed by adding
+   `load_dotenv()` directly to `model_registry.py`, mirroring
+   `src/pipeline.py`'s own pattern; the module is now self-sufficient
+   regardless of what else has been imported.
+
+### (c) Fine-tuning hook
+Not applicable to model weights — this phase is architecture, not a model
+change. The forward hook is about test methodology: bug #1 was invisible to
+every fast unit test and only surfaced through a slow, real-model
+equivalence test — a concrete argument for keeping at least one real-audio
+integration test per major architectural change, even though (per this
+project's own testing discipline) the default suite must stay fast and
+fake-decoder-based. The two-tier pattern used here — extensive fast unit
+tests for logic, one marked-slow real-audio test for the assembly — is the
+template worth reusing for Wave 5/6's ASR-adjacent changes, which carry the
+same class of risk (a fake decoder cannot see a pathological windowing
+decision, only a real one can).
