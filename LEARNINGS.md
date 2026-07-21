@@ -1565,3 +1565,96 @@ deployment-mic recordings HANDOFF's open item 0b already calls out as needed
 to diverge from clinic-mic behavior; the same domain gap likely applies to
 retry-ladder trigger rates, not just WER). Until then, treat L2/L3.5/L4/L5's
 baseline figures as load-bearing and L3's as a known-inflated placeholder.
+
+## Latency Phase 3 — Model Residency: the CLAUDE.md carve-out, spent on the right thing (2026-07-20)
+
+### (a) What this phase does
+This phase amends CLAUDE.md's "load one model, release it — never hold ASR
+and LLM resident simultaneously" rule for the fast engine only (user-approved
+carve-out, recorded in CLAUDE.md itself): `src/model_registry.py` keeps
+pyannote's diarization `Pipeline` and parrotlet's `_EmbeddingBackend` loaded
+across sessions within one server process, instead of `diarize()`/`normalize()`
+each loading and releasing their model on every single call. `src/pipeline.py`
+fetches both from the registry and passes them through (`pipeline=`, `backend=`
+kwargs both already existed as optional params on `diarize()`; `normalize()`
+gained one) whenever `asr_engine="fast"` and `config.FAST_ENGINE_RESIDENT` is
+True — the accurate CLI path is untouched regardless of the flag. A second,
+independent change lands in the same phase: `l3_5_normalize._encode_reference_matrices()`
+re-encodes every CONCEPTS canonical term/variant/hard-negative through the
+model on EVERY call, even though that content never changes between sessions —
+this is now served from a content-addressed disk cache
+(`_get_reference_matrices`, keyed by MODEL_ID + a hash of the CONCEPTS table,
+so it self-invalidates on any concept edit) unconditionally, independent of
+the residency flag. mlx-whisper needed no new code at all — `mlx_whisper.
+transcribe.ModelHolder` already caches at module scope for free; the only
+change was to stop `web/app.py`'s `create_session()` from deliberately
+clearing that cache on every upload when resident mode is active.
+
+**Measured, on the real pipeline (fast engine, 30s fixture, two consecutive
+sessions in one process — see LEARNINGS' own verification script, not
+committed):**
+
+| Stage | Before (Wave-1 baseline, same fixture) | After: 1st call (cold) | After: 2nd call (warm) |
+|---|---|---|---|
+| L3.5 normalize | 21.8–25.4s | 3.39s | **2.77s** |
+| stop_to_note_s | 123.2s | 89.9s | **68.6s** |
+
+L3.5 normalize dropped **~8x** — the single largest lever in the whole
+latency plan, exactly matching an independent, much earlier finding already
+sitting in this project's own (gitignored) working handoff: "L3.5 latency
+(~19s) is now the biggest stop-to-review item — parrotlet model residency /
+preload during ASR would cut most of it." That note was written 2026-07-12
+and sat unactioned for over a week; this phase is the fix it was asking for.
+L2 diarize's per-stage number (7.6–8.9s) is **not directly comparable** to
+pre-Wave-2 numbers: `model_registry.get_pyannote_pipeline()` is called
+*before* the L2 stage timer starts, so model-load time that used to be
+attributed to the `l2_diarize` bucket is now attributed to nothing (absorbed
+into `stop_to_note_s` but invisible in the per-stage breakdown) on a cold
+call, and genuinely doesn't exist on a warm one. Anyone diffing per-stage
+JSON across this phase boundary needs to know that, or L2 will look like it
+regressed when it didn't.
+
+### (b) Hardest bugs
+
+1. **The residency wiring silently broke the "stubbed stages, no models
+   loaded" invariant of the existing pipeline test suite — not because the
+   stub functions had the wrong signature, but because a THIRD, unstubbed
+   call path was introduced.** `pipeline.run()`'s new resident-kwargs
+   construction (`model_registry.get_pyannote_pipeline()` /
+   `get_embedding_backend()`) happens *before* `diarize()`/`normalize()` are
+   even invoked — so `tests/test_pipeline.py`'s `stubbed_stages` fixture,
+   which monkeypatches `pipeline.diarize` and `pipeline.normalize` directly,
+   did nothing to prevent a REAL pyannote HF download attempt from firing
+   inside a supposedly fully-mocked unit test (visible as a real HTTP call in
+   the failing test's captured stderr). Root cause: residency added a second,
+   independent way to reach the real model-loading code, and only one of the
+   two paths was covered by the existing stub discipline. Fix: the fixture
+   now also stubs `pipeline.model_registry.get_pyannote_pipeline` and
+   `get_embedding_backend`, mirroring how every other stage is already
+   stubbed — the general lesson being that adding a new call site to
+   already-mocked functionality means finding and updating every fixture
+   that mocks the OLD call site, not just checking the new code compiles.
+
+2. **The Ollama Metal defect from Latency Phase 2 was not a one-off — it
+   directly gated whether this phase's residency numbers could be trusted at
+   all, and very nearly produced a second round of the same mistake.** The
+   real two-session verification run for this phase depends on L4 extract
+   being fast (otherwise it would dominate and mask the L3.5 signal this
+   phase is actually testing). Because the `ollama-app` cask fix from Phase 2
+   was already in place, L4 measured 23.44s cold / 14.45s warm here — sane
+   numbers that didn't need re-diagnosing. This is recorded not because
+   anything new broke, but because it is the second LEARNINGS entry in two
+   phases where an unrelated-looking latency phase's validity turned out to
+   depend on that fix being present — worth flagging for whoever next resets
+   this environment.
+
+### (c) Fine-tuning hook
+Not applicable — no model changed. The forward hook: the reference-matrices
+disk cache and backend residency are independent levers, and this phase
+proves the disk cache alone (which requires no held-open device memory, no
+CLAUDE.md carve-out, and works even on the accurate/CPU path) already
+captures most of the win — re-encoding hundreds of reference texts was the
+dominant cost, not the model weights themselves being reloaded. If a future
+change needs to claw back memory budget, dropping backend residency while
+keeping the reference-matrix cache is a safe, low-cost fallback that gives up
+only a fraction of this phase's gain, not all of it.
