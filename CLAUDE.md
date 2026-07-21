@@ -32,6 +32,8 @@ audio → L1 preprocess → L2 diarize → L3 ASR → L3.5 normalize → L4 extr
 
 The batch design exists to make sequential loading clean within 24 GB. This is not optional — violating it will OOM on target hardware.
 
+**Carve-out (2026-07-20, user-approved, latency plan Wave 2):** this rule applies unconditionally to the **accurate** CPU path (faster-whisper large-v3, ~3GB int8 — the OOM risk the rule was written for). For the **fast** engine only (`asr_engine="fast"`, `src.config.FAST_ENGINE_RESIDENT`), `src/model_registry.py` keeps pyannote's Pipeline and parrotlet's `_EmbeddingBackend` resident across sessions — both are small (~0.5GB and ~1GB) and Qwen lives in Ollama's separate process regardless, so together they measure well inside a 24GB budget. The blanket "never both" rule is replaced, for this path only, by a measured enforcement mechanism: `src.config.RESIDENT_PEAK_RSS_BUDGET_MB` (~14GB), asserted by `bench/stop_to_note_bench.py`. mlx-whisper needs no explicit residency code — `mlx_whisper.transcribe.ModelHolder` already caches at module scope for free; the fast engine's L3 decode and the live-preview (`web/live_asr.py`) share the same cache, so the only change was to stop deliberately clearing it after every upload (see `web/app.py`'s `create_session`).
+
 ## Module Interfaces (spec §7)
 
 All inter-stage communication uses these stable contracts. Do not change signatures without updating all callers.

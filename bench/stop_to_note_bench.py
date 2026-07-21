@@ -38,7 +38,7 @@ import time
 import numpy as np
 import soundfile as sf
 
-from src import pipeline
+from src import config, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,8 @@ def run_bench(n: int = _DEFAULT_N, fixture_seconds: float = _DEFAULT_FIXTURE_SEC
         "acceptance": {
             "target_p95_s": 10.0,
             "passed": _percentile(stop_to_note, 95) < 10.0,
+            "rss_budget_mb": config.RESIDENT_PEAK_RSS_BUDGET_MB,
+            "rss_within_budget": max(peak_rss) < config.RESIDENT_PEAK_RSS_BUDGET_MB,
         },
     }
 
@@ -184,12 +186,18 @@ def main() -> None:
 
     summary = run_bench(n=args.n, fixture_seconds=args.fixture_seconds)
     print(json.dumps(summary, indent=2))
-    verdict = "PASS" if summary["acceptance"]["passed"] else "FAIL"
+    acc = summary["acceptance"]
+    verdict = "PASS" if acc["passed"] else "FAIL"
     print(
         f"\n{verdict}: stop_to_note_s p50={summary['stop_to_note_s']['p50']:.2f}s "
         f"p95={summary['stop_to_note_s']['p95']:.2f}s (target p95 < 10.0s)"
     )
-    sys.exit(0 if summary["acceptance"]["passed"] else 1)
+    rss_verdict = "PASS" if acc["rss_within_budget"] else "FAIL"
+    print(
+        f"{rss_verdict}: peak_rss_mb max={summary['peak_rss_mb']['max']:.0f} "
+        f"(budget < {acc['rss_budget_mb']:.0f} MB)"
+    )
+    sys.exit(0 if acc["passed"] and acc["rss_within_budget"] else 1)
 
 
 if __name__ == "__main__":

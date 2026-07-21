@@ -37,12 +37,18 @@ def stubbed_stages(monkeypatch, tmp_path):
         return path
 
     monkeypatch.setattr(pipeline, "preprocess", fake_preprocess)
-    monkeypatch.setattr(pipeline, "diarize", lambda wav: [Segment(0.0, 2.0, "S0")])
+    monkeypatch.setattr(pipeline, "diarize", lambda wav, **kwargs: [Segment(0.0, 2.0, "S0")])
     monkeypatch.setattr(pipeline, "transcribe", lambda wav, segs, on_progress=None: [_TURN])
-    monkeypatch.setattr(pipeline, "normalize", lambda turns: turns)
+    monkeypatch.setattr(pipeline, "normalize", lambda turns, **kwargs: turns)
     monkeypatch.setattr(pipeline, "extract", lambda turns: _NOTE)
     monkeypatch.setattr(pipeline, "render", fake_render)
     monkeypatch.setattr(pipeline, "warm_llm", lambda: None)  # no Ollama in tests
+    # Wave 2 residency (src/model_registry.py): asr_engine="fast" makes run()
+    # fetch resident models BEFORE calling diarize/normalize above, so those
+    # getters need stubbing too, or a "fast" test would load a real pyannote
+    # pipeline despite diarize() itself being faked.
+    monkeypatch.setattr(pipeline.model_registry, "get_pyannote_pipeline", lambda: "fake-pipeline")
+    monkeypatch.setattr(pipeline.model_registry, "get_embedding_backend", lambda: "fake-backend")
     return tmp_path
 
 
@@ -137,6 +143,85 @@ def test_run_asr_engine_fast_uses_fast_transcribe_windowed(stubbed_stages, monke
 def test_run_rejects_unknown_asr_engine(stubbed_stages) -> None:
     with pytest.raises(ValueError):
         pipeline.run("consult.mp3", session_id="engine-bad", asr_engine="bogus")
+
+
+# ── Wave 2: model residency (src/model_registry.py) ───────────────────────
+
+
+def test_run_fast_engine_passes_resident_models_to_diarize_and_normalize(
+    stubbed_stages, monkeypatch
+) -> None:
+    """asr_engine="fast" + FAST_ENGINE_RESIDENT must fetch resident models
+    and forward them into diarize()/normalize() as pipeline=/backend=."""
+    monkeypatch.setattr(pipeline.config, "FAST_ENGINE_RESIDENT", True)
+    received = {}
+
+    def fake_diarize(wav, **kwargs):
+        received["diarize_kwargs"] = kwargs
+        return [Segment(0.0, 2.0, "S0")]
+
+    def fake_normalize(turns, **kwargs):
+        received["normalize_kwargs"] = kwargs
+        return turns
+
+    monkeypatch.setattr(pipeline, "diarize", fake_diarize)
+    monkeypatch.setattr(pipeline, "normalize", fake_normalize)
+    monkeypatch.setattr(pipeline, "fast_transcribe_windowed", lambda wav, segs, on_progress=None: [_TURN])
+
+    pipeline.run("consult.mp3", session_id="resident-fast", asr_engine="fast")
+
+    assert received["diarize_kwargs"] == {"pipeline": "fake-pipeline"}
+    assert received["normalize_kwargs"] == {"backend": "fake-backend"}
+
+
+def test_run_accurate_engine_never_touches_model_registry(stubbed_stages, monkeypatch) -> None:
+    """The accurate CLI path must not fetch resident models even when
+    FAST_ENGINE_RESIDENT is True — residency is fast-engine-only."""
+    monkeypatch.setattr(pipeline.config, "FAST_ENGINE_RESIDENT", True)
+    registry_calls = []
+    monkeypatch.setattr(
+        pipeline.model_registry,
+        "get_pyannote_pipeline",
+        lambda: registry_calls.append("pyannote"),
+    )
+    monkeypatch.setattr(
+        pipeline.model_registry,
+        "get_embedding_backend",
+        lambda: registry_calls.append("embedding"),
+    )
+    received = {}
+    monkeypatch.setattr(
+        pipeline, "diarize", lambda wav, **kwargs: received.setdefault("diarize", kwargs) or [Segment(0.0, 2.0, "S0")]
+    )
+    monkeypatch.setattr(
+        pipeline, "normalize", lambda turns, **kwargs: received.setdefault("normalize", kwargs) or turns
+    )
+
+    pipeline.run("consult.mp3", session_id="resident-accurate")  # default asr_engine
+
+    assert registry_calls == []
+    assert received["diarize"] == {}
+    assert received["normalize"] == {}
+
+
+def test_run_fast_engine_skips_resident_models_when_flag_off(stubbed_stages, monkeypatch) -> None:
+    monkeypatch.setattr(pipeline.config, "FAST_ENGINE_RESIDENT", False)
+    registry_calls = []
+    monkeypatch.setattr(
+        pipeline.model_registry,
+        "get_pyannote_pipeline",
+        lambda: registry_calls.append("pyannote"),
+    )
+    received = {}
+    monkeypatch.setattr(
+        pipeline, "diarize", lambda wav, **kwargs: received.setdefault("diarize", kwargs) or [Segment(0.0, 2.0, "S0")]
+    )
+    monkeypatch.setattr(pipeline, "fast_transcribe_windowed", lambda wav, segs, on_progress=None: [_TURN])
+
+    pipeline.run("consult.mp3", session_id="resident-off", asr_engine="fast")
+
+    assert registry_calls == []
+    assert received["diarize"] == {}
 
 
 # ── stop_to_note_s / stop_to_pdf_s latency instrumentation ───────────────

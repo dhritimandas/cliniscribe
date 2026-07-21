@@ -10,6 +10,7 @@ Two passes in sequence:
 
 import difflib
 import gc
+import hashlib
 import logging
 import os
 import re
@@ -678,6 +679,77 @@ def _encode_reference_matrices(backend: _EmbeddingBackend) -> _RefMatrices:
     return ref_matrix, ref_ci_arr, hardneg_matrix, hardneg_idx_arr, hardneg_word_counts
 
 
+_REF_MATRICES_CACHE_DIR = os.path.join("outputs", "cache")
+
+
+def _ref_matrices_cache_key() -> str:
+    """Deterministic key over MODEL_ID + the full CONCEPTS table content.
+
+    Any edit to a concept's term/variants/hard_negatives (or a MODEL_ID swap)
+    changes the key, so a stale cache is never served — the cache invalidates
+    itself rather than requiring a manual bump.
+    """
+    payload = repr(
+        (MODEL_ID, [(c.term, c.variants, c.hard_negatives) for c in CONCEPTS])
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _ref_matrices_cache_path() -> str:
+    return os.path.join(_REF_MATRICES_CACHE_DIR, f"parrotlet_ref_{_ref_matrices_cache_key()}.npz")
+
+
+def _load_ref_matrices_cache() -> _RefMatrices | None:
+    """Return cached reference matrices for the current CONCEPTS table, or None."""
+    path = _ref_matrices_cache_path()
+    if not os.path.exists(path):
+        return None
+    data = np.load(path)
+    hardneg_matrix = data["hardneg_matrix"] if data["has_hardneg"] else None
+    hardneg_idx_arr = data["hardneg_idx_arr"] if data["has_hardneg"] else None
+    hardneg_word_counts = data["hardneg_word_counts"] if data["has_hardneg"] else None
+    return (
+        data["ref_matrix"],
+        data["ref_ci_arr"],
+        hardneg_matrix,
+        hardneg_idx_arr,
+        hardneg_word_counts,
+    )
+
+
+def _save_ref_matrices_cache(matrices: _RefMatrices) -> None:
+    ref_matrix, ref_ci_arr, hardneg_matrix, hardneg_idx_arr, hardneg_word_counts = matrices
+    os.makedirs(_REF_MATRICES_CACHE_DIR, exist_ok=True)
+    has_hardneg = hardneg_matrix is not None
+    np.savez(
+        _ref_matrices_cache_path(),
+        ref_matrix=ref_matrix,
+        ref_ci_arr=ref_ci_arr,
+        has_hardneg=has_hardneg,
+        hardneg_matrix=hardneg_matrix if has_hardneg else np.empty((0,)),
+        hardneg_idx_arr=hardneg_idx_arr if has_hardneg else np.empty((0,)),
+        hardneg_word_counts=hardneg_word_counts if has_hardneg else np.empty((0,)),
+    )
+
+
+def _get_reference_matrices(backend: "_EmbeddingBackend") -> _RefMatrices:
+    """Reference matrices for CONCEPTS, from disk cache when available.
+
+    `_encode_reference_matrices` re-encodes every canonical term + variant +
+    hard-negative in CONCEPTS through the model — content that never changes
+    between normalize() calls, so re-encoding it every session is pure waste
+    (HANDOFF's "biggest stop-to-review item" finding). The cache is content-
+    addressed (see _ref_matrices_cache_key), so it self-invalidates on any
+    CONCEPTS or MODEL_ID change rather than serving stale vectors.
+    """
+    cached = _load_ref_matrices_cache()
+    if cached is not None:
+        return cached
+    matrices = _encode_reference_matrices(backend)
+    _save_ref_matrices_cache(matrices)
+    return matrices
+
+
 _TurnSpans = tuple[
     list[tuple[str, int, int]],
     list[tuple[int, int]],
@@ -861,7 +933,7 @@ def _score_spans(
     return per_turn_matches
 
 
-def normalize(turns: list[Turn]) -> list[Turn]:
+def normalize(turns: list[Turn], *, backend: "_EmbeddingBackend | None" = None) -> list[Turn]:
     """Map lay medical terms in transcript turns to canonical clinical concepts.
 
     Uses parrotlet-e (fine-tuned bge-m3) embeddings. Candidate spans (1–3
@@ -871,10 +943,18 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     ``sugar (Type 2 Diabetes Mellitus)`` — see _score_spans for the full gate
     order and src/config.py for the tuned thresholds.
 
-    Model is loaded, used, and released in one call — memory discipline.
+    The reference matrices (every CONCEPTS term/variant/hard-negative encoded
+    through the model) never change between calls, so they are served from a
+    content-addressed disk cache (see _get_reference_matrices) rather than
+    re-encoded every time — that re-encoding was the dominant cost of this
+    stage before Wave 2 of the latency plan (see LEARNINGS.md).
 
     Args:
         turns: Speaker-attributed transcript from L3 (or earlier).
+        backend: An already-loaded _EmbeddingBackend to reuse (residency —
+            see src/model_registry.py). When None (default), a backend is
+            loaded here and released before returning, preserving the
+            original load-one-release-one behavior for the accurate/CLI path.
 
     Returns:
         Same-length list of Turns with lay terms glossed where matched.
@@ -894,9 +974,11 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     ]
 
     # Pass 2: lay-term concept glossing via parrotlet-e embeddings.
-    backend = _EmbeddingBackend()
+    owns_backend = backend is None
+    if backend is None:
+        backend = _EmbeddingBackend()
     ref_matrix, ref_ci_arr, hardneg_matrix, hardneg_idx_arr, hardneg_word_counts = (
-        _encode_reference_matrices(backend)
+        _get_reference_matrices(backend)
     )
     all_spans, turn_span_offsets, turn_words, span_matrix = _encode_turn_spans(
         backend, turns
@@ -919,5 +1001,6 @@ def normalize(turns: list[Turn]) -> list[Turn]:
     else:
         normalized = list(turns)
 
-    backend.release()
+    if owns_backend:
+        backend.release()
     return normalized
