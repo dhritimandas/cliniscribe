@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 
 import pytest
 
@@ -136,3 +137,30 @@ def test_run_asr_engine_fast_uses_fast_transcribe_windowed(stubbed_stages, monke
 def test_run_rejects_unknown_asr_engine(stubbed_stages) -> None:
     with pytest.raises(ValueError):
         pipeline.run("consult.mp3", session_id="engine-bad", asr_engine="bogus")
+
+
+# ── stop_to_note_s / stop_to_pdf_s latency instrumentation ───────────────
+
+
+def test_run_records_stop_to_note_from_explicit_stop_ts(stubbed_stages) -> None:
+    stop_ts = time.monotonic() - 5.0  # pretend "stop recording" was 5s ago
+    pipeline.run("consult.mp3", session_id="stop-ts-explicit", stop_monotonic_ts=stop_ts)
+
+    with open(os.path.join("outputs", "stop-ts-explicit", "timings.json"), encoding="utf-8") as f:
+        timings = json.load(f)
+
+    assert timings["stop_ts_source"] == "stop_event"
+    assert timings["stop_to_note_s"] >= 5.0
+    assert timings["stop_to_pdf_s"] >= timings["stop_to_note_s"]
+
+
+def test_run_falls_back_to_run_start_when_stop_ts_omitted(stubbed_stages) -> None:
+    pipeline.run("consult.mp3", session_id="stop-ts-default")
+
+    with open(os.path.join("outputs", "stop-ts-default", "timings.json"), encoding="utf-8") as f:
+        timings = json.load(f)
+
+    assert timings["stop_ts_source"] == "run_start"
+    # No 5s of pre-stop dead time injected -> should be close to total_wall_s,
+    # not wildly larger.
+    assert timings["stop_to_note_s"] < timings["total_wall_s"] + 1.0

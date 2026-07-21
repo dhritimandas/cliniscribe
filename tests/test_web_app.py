@@ -150,7 +150,7 @@ def test_live_preview_rejects_overlapping_calls_with_429(client, monkeypatch) ->
 def test_process_advances_status_through_stages_to_review(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         for stage in ("l1_preprocess", "l2_diarize", "l3_asr"):
             on_stage(stage, "start")
             on_stage(stage, "end")
@@ -178,7 +178,7 @@ def test_process_advances_status_through_stages_to_review(client, monkeypatch) -
 def test_process_records_error_state_on_pipeline_failure(client, monkeypatch) -> None:
     sid = _create_session(client)
 
-    def failing_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def failing_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         on_stage("l1_preprocess", "start")
         raise RuntimeError("boom")
 
@@ -386,7 +386,7 @@ def test_process_writes_expected_stage_seconds_scaled_by_audio_duration(
 
     captured_expected: dict = {}
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         status = app_module._read_json(app_module._status_path(session_id))
         captured_expected.update(status.get("expected_stage_seconds", {}))
         return os.path.join("outputs", session_id, "draft_rx.pdf")
@@ -415,7 +415,7 @@ def test_process_skips_expected_stage_seconds_when_duration_cannot_be_estimated(
     simply absent."""
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         return os.path.join("outputs", session_id, "draft_rx.pdf")
 
     monkeypatch.setattr(pipeline, "run", fake_run)
@@ -596,7 +596,7 @@ def test_process_precomputes_note_meta_before_review(client, monkeypatch) -> Non
     pipeline.run() succeeds, before status flips to "review"."""
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         _write_note(session_id, ClinicalNote(chief_complaint="fever", history=None))
         _write_transcript(session_id, [])
         return os.path.join("outputs", session_id, "draft_rx.pdf")
@@ -1007,7 +1007,7 @@ def test_process_accurate_engine_never_starts_verification(client, monkeypatch) 
     must never gain a "verification" key for the accurate engine."""
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         assert asr_engine == "accurate"
         on_stage("l1_preprocess", "start")
         on_stage("l1_preprocess", "end")
@@ -1040,7 +1040,7 @@ def test_process_fast_engine_starts_verification_and_mirrors_status(client, monk
     monkeypatch.setattr(app_module.config, "FAST_ASR_ENABLED", True)
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         assert asr_engine == "fast"
         return os.path.join("outputs", session_id, "draft_rx.pdf")
 
@@ -1358,7 +1358,7 @@ def test_process_warms_all_three_translation_caches_after_review(client, monkeyp
     already a cache hit instead of a cold 30-120s Ollama call."""
     sid = _create_session(client)
 
-    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate"):
+    def fake_run(in_path, session_id=None, *, on_stage=None, on_progress=None, asr_engine="accurate", stop_monotonic_ts=None):
         _write_note(session_id, ClinicalNote(chief_complaint="बुखार", history=None))
         _write_transcript(session_id, [])
         return os.path.join("outputs", session_id, "draft_rx.pdf")

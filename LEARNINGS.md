@@ -1487,3 +1487,81 @@ shrink the masked surface toward zero and remove the cross-script fuzzy
 step entirely. And the placeholder protocol doubles as an exact evaluation
 metric for any future translator swap: placeholder survival rate per model —
 a drug-name-safety bench that costs nothing beyond the runs themselves.
+
+## Latency Phase 2 — Stop-to-Note Instrumentation: the sub-10s baseline (2026-07-20)
+
+### (a) What this phase does
+This phase does not change any model or pipeline stage — it adds the measurement
+the rest of the sub-10s latency effort is gated on. `pipeline.run()` gains an
+optional `stop_monotonic_ts` (the moment "recording stopped"; the web flow's
+proxy is upload completion, since there is no live capture loop yet) and writes
+`stop_to_note_s` / `stop_to_pdf_s` into `timings.json` alongside the existing
+per-stage wall times. A new harness, `bench/stop_to_note_bench.py`, builds a
+deterministic ~2.5-minute fixture (the project's three sample clips, looped
+with 1s silence gaps, cached by content hash) and runs the real production
+pipeline (`asr_engine="fast"`) N times, reporting p50/p95 against the <10s
+acceptance target. The honest baseline this phase establishes: **p50 = 348.9s,
+p95 = 365.7s** (N=3) — a FAIL, exactly as expected, since none of the
+optimization waves (residency, incremental capture, L4 fast path) have shipped
+yet. The number this phase's harness will be re-run against as each wave lands.
+
+### (b) Hardest bugs
+
+1. **Ollama was running 100% CPU (~1 token/sec) — a root cause, not a fluke,
+   and one this project already hit once before without diagnosing it.**
+   §8e of an earlier working handoff notes "Ollama appeared CPU-only (~1 tok/s)
+   during wave-B E2E — verify the running ollama is the native arm64 build next
+   session," but that session moved on without confirming why. This time: a
+   30s smoke clip's L4 stage took 372s (should be ~13-28s), and `ollama ps`
+   showed `100% CPU`. The server log's own GPU discovery line was the proof —
+   `msg="discovering available GPUs..."` → `msg="inference compute" id=cpu
+   library=cpu` — Metal was never even detected as a candidate device, not
+   merely unused. Root cause, precisely: this machine's `ollama` was installed
+   via `brew install ollama` (the Homebrew-core formula), which packages the
+   CLI-only, CPU-only build — a long-standing Homebrew-core packaging gap, not
+   an architecture mismatch (the binary WAS native arm64; "verify arm64" in
+   the earlier note was the wrong diagnostic question). The fix is a different
+   package entirely: `brew install --cask ollama-app` installs the official
+   Ollama.app bundle (Metal-enabled `llama-server` backend), which the CLI
+   formula does not provide no matter how it's reinstalled or upgraded.
+   Verified after the fix: `ollama ps` reports `100% GPU`, and a real L4 call
+   on this fixture landed at 28.48s — matching the historical "cold 28.5s"
+   figure almost exactly. **Anyone resuming this project on a fresh machine
+   must install the `ollama-app` cask, not the `ollama` formula** — this is
+   now the second time the CLI-only formula silently produced a 40-70x latency
+   regression that looked like a model or pipeline problem until the GPU
+   discovery log was actually read.
+
+2. **A benchmark fixture built by looping identical clips manufactures its
+   own worst case, and it does so deterministically enough to look like a
+   real finding if you don't check.** The first N=3 baseline run showed L3 ASR
+   at ~241s median for a 150s clip — 25-30x the ~7-9s/window fixed cost the
+   fast engine is supposed to have. The degeneration retry ladder
+   (`src.fast_asr`) fired at exactly the same two window boundaries in all
+   three runs — `[0.03, 23.25]s` and `[118.17, 142.88]s` — both of which sit
+   at the fixture's loop-splice points (silence-gap joins between repeated
+   copies of the same three sample clips). One of the two exhausts the ladder
+   entirely (`step4_giveup`, its most expensive rung). Root cause: the
+   degeneration detector is tuned to catch the model repeating itself — and a
+   fixture built by literally repeating the same audio at fixed intervals is
+   exactly the input that heuristic is designed to flag, whether or not the
+   underlying decode would have been fine on natural, non-repeating speech at
+   that duration. This means **the L3 ASR component of this baseline is not a
+   trustworthy per-window latency number** — it is inflated by an artifact of
+   how the fixture was built, not a property of the production decode path.
+   The other stages' numbers (L2 diarize, L3.5 normalize, L4 extract, L5
+   render) do not share this defect since they don't re-trigger per-window
+   retry logic on loop boundaries the same way.
+
+### (c) Fine-tuning hook
+Not applicable in the ML sense — this phase changed no model. The forward
+hook is methodological: **do not accept this baseline's L3 ASR figure, or any
+future bench run on this same looped fixture, as the acceptance number for
+Wave 3's incremental-capture work.** The fixture needs non-repeating audio of
+target duration before it can honestly gate a latency claim — either more
+distinct EkaCare clips concatenated (no repeats), or, better, the
+deployment-mic recordings HANDOFF's open item 0b already calls out as needed
+(the frozen bench is phone-quality EkaCare audio and has previously been shown
+to diverge from clinic-mic behavior; the same domain gap likely applies to
+retry-ladder trigger rates, not just WER). Until then, treat L2/L3.5/L4/L5's
+baseline figures as load-bearing and L3's as a known-inflated placeholder.
