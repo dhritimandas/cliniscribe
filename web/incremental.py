@@ -28,6 +28,14 @@ pyannote on the WHOLE buffer each call (not incrementally) and `finalize()`
 runs one more, final full-file pass. Both use the resident pipeline
 (src/model_registry.py) rather than reloading per call.
 
+L4 KV prefix warming (latency Wave 4): `warm_l4_prefix()` fires a background
+Ollama call (src.l4_extract.warm_llm_prefix) with the turns settled so far,
+priming the model's KV cache for the eventual extract() call at finalize()
+time — never feeds L4 for real, purely a cache-priming side effect. Tracks
+`kv_warm_wasted` (an int counter) whenever `finalize()`'s actual prompt hash
+doesn't match the last warm's hash — never a correctness issue (extract()
+always sends the right prompt regardless), just a missed optimization.
+
 NOT built in this pass (see LEARNINGS.md's Wave 3 entry for why): the FastAPI
 routes and browser capture-loop wiring that would actually call feed() during
 a live recording. Today's API surface (POST /api/sessions,
@@ -92,6 +100,13 @@ class IncrementalSession:
         self._audio = np.zeros(0, dtype=np.float32)
         self._decoded_up_to_s = 0.0  # end of settled audio already decoded
         self._settled_words: list[Word] = []
+        # Latency Wave 4 (src/l4_extract.py's KV prefix warming): the hash of
+        # the last prompt this session fired a background warm() for, and how
+        # many times finalize()'s actual prompt didn't match it (the warm was
+        # wasted — never wrong, since extract() always sends the correct
+        # prompt regardless — just didn't help).
+        self._last_l4_warm_hash: str | None = None
+        self.kv_warm_wasted = 0
 
     def feed(self, wav_bytes: bytes) -> None:
         """Append a chunk of newly recorded audio; decode any newly settled span.
@@ -179,6 +194,31 @@ class IncrementalSession:
         raw_turns = _assign_words_to_turns(words, segments)
         return _build_turns_with_roles(raw_turns)
 
+    def warm_l4_prefix(self) -> str | None:
+        """Fire a background L4 KV-warm call with turns settled so far.
+
+        Reuses partial_turns() for attribution (one diarization pass, same
+        cost a UI-polling caller already pays) rather than a separate one.
+        The actual Ollama call runs on a daemon thread — this method returns
+        as soon as the prefix hash is computed, without waiting on the
+        network call, so it is cheap enough to call after every settle event.
+
+        Returns:
+            The prefix hash of what was (attempted to be) warmed, or None if
+            there is nothing settled yet to warm with.
+        """
+        from src import l4_extract
+
+        turns = self.partial_turns()
+        if not turns:
+            return None
+        prefix_hash = l4_extract.prompt_prefix_hash(turns)
+        self._last_l4_warm_hash = prefix_hash
+        threading.Thread(
+            target=l4_extract.warm_llm_prefix, args=(turns,), daemon=True
+        ).start()
+        return prefix_hash
+
     def finalize(self) -> list[Turn]:
         """Authoritative final pass: tail decode ∥ final diarize, then attribute.
 
@@ -222,4 +262,16 @@ class IncrementalSession:
         if not all_words or not segments:
             return []
         raw_turns = _assign_words_to_turns(all_words, segments)
-        return _build_turns_with_roles(raw_turns)
+        turns = _build_turns_with_roles(raw_turns)
+
+        if turns and self._last_l4_warm_hash is not None:
+            from src import l4_extract
+
+            if l4_extract.prompt_prefix_hash(turns) != self._last_l4_warm_hash:
+                self.kv_warm_wasted += 1
+                logger.info(
+                    "Session %s: kv_warm_wasted (finalize prompt != last warm)",
+                    self.session_id,
+                )
+
+        return turns

@@ -378,8 +378,14 @@ def _note_from_dict(d: dict):
     )
 
 
-def run_extraction_eval() -> None:
+def run_extraction_eval(*, compact: bool = False) -> None:
     """Evaluate L4 extraction on a frozen subset of the EkaCare clinical-note dataset.
+
+    Args:
+        compact: Score src.l4_extract's compact (omit-empty-fields) prompt
+            variant instead of the verbose default — the latency Wave 4
+            gate. Writes to a compact-suffixed results path so both runs'
+            outputs are preserved for side-by-side comparison.
 
     Scoring methodology
     -------------------
@@ -446,7 +452,10 @@ def run_extraction_eval() -> None:
         str(_project_root / "eka-clinical-note-generation-dataset/test-00001.parquet"),
     ]
     FROZEN_SET_PATH = str(_project_root / "eval/frozen_set_extraction.json")
-    RESULTS_PATH = str(_project_root / "outputs/extraction_baseline.json")
+    RESULTS_PATH = str(
+        _project_root
+        / ("outputs/extraction_baseline_compact.json" if compact else "outputs/extraction_baseline.json")
+    )
 
     # Frozen indices: 12 English + 12 Hindi/Marathi, stratified by rubric category
     # coverage and language. Selected to maximise representation of medication_name,
@@ -497,7 +506,7 @@ def run_extraction_eval() -> None:
         # Run L4 extraction (no diarization — single UNKNOWN turn, isolating L4)
         turns = [Turn(speaker_role="UNKNOWN", text=transcript, start=0.0, end=0.0)]
         try:
-            note: ClinicalNote = extract(turns)
+            note: ClinicalNote = extract(turns, compact=compact)
         except Exception as exc:
             logger.error("Extraction failed for idx=%d: %s", idx, exc)
             from src.l4_extract import _empty_note  # type: ignore[attr-defined]
@@ -612,7 +621,8 @@ def run_extraction_eval() -> None:
 
     # Print summary table
     print("\n" + "=" * 75)
-    print(f"L4 EXTRACTION EVAL — {aggregate['n_samples']} samples (frozen set)")
+    mode = "COMPACT" if compact else "VERBOSE"
+    print(f"L4 EXTRACTION EVAL [{mode}] — {aggregate['n_samples']} samples (frozen set)")
     print("=" * 75)
     print(f"{'Category':<35} {'Total':>6} {'Rep':>6} {'Match':>6} {'Recall':>7}")
     print("-" * 75)
@@ -707,6 +717,12 @@ if __name__ == "__main__":
         action="store_true",
         help="extraction only: re-score saved notes with the current matcher (no model calls)",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="extraction only: score the compact (omit-empty-fields) prompt variant "
+        "(latency Wave 4 gate) instead of the verbose default",
+    )
     args = parser.parse_args()
 
     if args.stage == "asr":
@@ -714,4 +730,4 @@ if __name__ == "__main__":
     elif args.rescore:
         rescore_extraction_eval()
     else:
-        run_extraction_eval()
+        run_extraction_eval(compact=args.compact)

@@ -80,6 +80,21 @@ drug name into a different script or a different spelling than what appears \
 in the transcript.\
 """
 
+# Compact variant (latency Wave 4): identical to _SYSTEM_PROMPT plus one rule
+# instructing omission of empty fields, so the model generates fewer tokens.
+# _build_note already treats a missing key the same as an explicit null/[]
+# via `data.get(field) or default` — no downstream change needed. Built by
+# appending to _SYSTEM_PROMPT rather than a separate literal so the two can
+# never drift out of sync on rules 1-12.
+_COMPACT_OUTPUT_RULE = """
+13. OMIT any field whose value would be null, an empty string, or an empty \
+list — do not include that key in the JSON at all. Only include keys that \
+have a real, non-empty value. This applies to every field in the schema \
+above, including nested fields inside symptoms/vitals/diagnosis/medications \
+list items.\
+"""
+_SYSTEM_PROMPT_COMPACT = _SYSTEM_PROMPT + _COMPACT_OUTPUT_RULE
+
 
 def _turns_to_text(turns: list[Turn]) -> str:
     return "\n".join(f"[{t.speaker_role}]: {t.text}" for t in turns)
@@ -892,7 +907,82 @@ def warm_llm() -> None:
         logger.warning("L4: warm-up failed (non-fatal): %s", exc)
 
 
-def extract(turns: list[Turn]) -> ClinicalNote:
+def _extract_prompt(turns: list[Turn], *, compact: bool | None = None) -> tuple[list[dict], int]:
+    """Build the (messages, num_predict) extract()/warm_llm_prefix() share.
+
+    Centralized so the two call sites can never drift apart on system prompt
+    or num_predict choice — a mismatch on num_ctx specifically restarts the
+    Ollama runner (see warm_llm's docstring); num_predict doesn't trigger a
+    restart but SHOULD still match so a warm's KV state is exactly what
+    extract() will reuse.
+    """
+    if compact is None:
+        compact = config.EXTRACT_COMPACT_OUTPUT
+    system_prompt = _SYSTEM_PROMPT_COMPACT if compact else _SYSTEM_PROMPT
+    num_predict = config.EXTRACT_COMPACT_NUM_PREDICT if compact else config.EXTRACT_NUM_PREDICT
+    transcript_text = _turns_to_text(turns)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Transcript:\n{transcript_text}"},
+    ]
+    return messages, num_predict
+
+
+def prompt_prefix_hash(turns: list[Turn], *, compact: bool | None = None) -> str:
+    """Deterministic hash of the exact prompt extract() would send for `turns`.
+
+    Used by web/incremental.py's KV-warm tracking: comparing the hash of the
+    last warm() call against the hash at finalize() time tells the caller
+    whether the warm's KV state was actually reused (a settled-turn text
+    change between the two — which the frozen-window design should prevent —
+    would show up here as a mismatch) or wasted (never wrong, since
+    extract() always sends the correct prompt regardless of what was warmed).
+    """
+    import hashlib
+
+    messages, _ = _extract_prompt(turns, compact=compact)
+    payload = "".join(m["content"] for m in messages)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def warm_llm_prefix(turns: list[Turn], *, compact: bool | None = None) -> str:
+    """Prime Ollama's KV cache with the settled transcript so far (non-fatal).
+
+    Fires the exact system+transcript prompt extract() will eventually send,
+    with minimal generation (config.KV_WARM_NUM_PREDICT) — only the prompt
+    PREFILL matters here, not the output. Called from
+    web/incremental.py.IncrementalSession.warm_l4_prefix() after new audio
+    settles, so that by finalize() time the bulk of the prefix is already in
+    Ollama's KV cache and only the short tail needs prefilling.
+
+    Returns:
+        The prefix hash (see prompt_prefix_hash) actually sent, so the
+        caller can track whether a later finalize() call's prompt matches
+        (kv_warm_wasted telemetry).
+    """
+    import ollama
+
+    messages, _ = _extract_prompt(turns, compact=compact)
+    prefix_hash = prompt_prefix_hash(turns, compact=compact)
+    try:
+        ollama.chat(
+            model=config.EXTRACT_MODEL,
+            messages=messages,
+            format="json",
+            keep_alive=config.EXTRACT_KEEP_ALIVE,
+            options={
+                "temperature": 0,
+                "num_ctx": config.EXTRACT_NUM_CTX,
+                "num_predict": config.KV_WARM_NUM_PREDICT,
+            },
+        )
+        logger.info("L4: KV prefix warmed (%d turns, hash=%s)", len(turns), prefix_hash)
+    except Exception as exc:
+        logger.warning("L4: KV prefix warm failed (non-fatal): %s", exc)
+    return prefix_hash
+
+
+def extract(turns: list[Turn], *, compact: bool | None = None) -> ClinicalNote:
     """Extract a structured ClinicalNote from normalized transcript turns.
 
     Calls qwen2.5:3b-instruct via Ollama at temperature=0 with a JSON format
@@ -904,6 +994,9 @@ def extract(turns: list[Turn]) -> ClinicalNote:
 
     Args:
         turns: Normalised, speaker-attributed turns from L3.5.
+        compact: Use the compact (omit-empty-fields) prompt variant — see
+            _SYSTEM_PROMPT_COMPACT. When None (default), reads
+            config.EXTRACT_COMPACT_OUTPUT.
 
     Returns:
         ClinicalNote with validated medications and populated
@@ -912,10 +1005,7 @@ def extract(turns: list[Turn]) -> ClinicalNote:
     import ollama
 
     transcript_text = _turns_to_text(turns)
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": f"Transcript:\n{transcript_text}"},
-    ]
+    messages, num_predict = _extract_prompt(turns, compact=compact)
 
     for attempt in range(1, 3):
         try:
@@ -929,7 +1019,7 @@ def extract(turns: list[Turn]) -> ClinicalNote:
                     # Without num_ctx, Ollama's default truncates long HI/MR
                     # transcripts → empty {} notes (see config.EXTRACT_NUM_CTX).
                     "num_ctx": config.EXTRACT_NUM_CTX,
-                    "num_predict": config.EXTRACT_NUM_PREDICT,
+                    "num_predict": num_predict,
                 },
             )
             raw = (

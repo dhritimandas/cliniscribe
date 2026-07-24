@@ -933,3 +933,117 @@ def test_drug_lexicon_precedence_wins_over_condition_set(monkeypatch) -> None:
     key = l4._fold_drug("Hypertension").replace(" ", "")
     monkeypatch.setattr(l4, "_DRUG_LEXICON_FOLDS", frozenset({key}))
     assert l4._is_condition_term("Hypertension") is False
+
+
+# ── Wave 4: compact output + KV prefix warming ─────────────────────────────
+
+
+def test_compact_prompt_is_verbose_prompt_plus_one_rule() -> None:
+    from src.l4_extract import _SYSTEM_PROMPT, _SYSTEM_PROMPT_COMPACT
+
+    assert _SYSTEM_PROMPT_COMPACT.startswith(_SYSTEM_PROMPT)
+    assert "OMIT" in _SYSTEM_PROMPT_COMPACT
+    assert "OMIT" not in _SYSTEM_PROMPT
+
+
+def test_extract_prompt_defaults_to_config_compact_flag(monkeypatch) -> None:
+    import src.l4_extract as l4
+
+    monkeypatch.setattr(l4.config, "EXTRACT_COMPACT_OUTPUT", True)
+    messages, num_predict = l4._extract_prompt([_turn("DOCTOR", "hello")])
+
+    assert messages[0]["content"] == l4._SYSTEM_PROMPT_COMPACT
+    assert num_predict == l4.config.EXTRACT_COMPACT_NUM_PREDICT
+
+
+def test_extract_prompt_explicit_compact_overrides_config(monkeypatch) -> None:
+    import src.l4_extract as l4
+
+    monkeypatch.setattr(l4.config, "EXTRACT_COMPACT_OUTPUT", True)
+    messages, num_predict = l4._extract_prompt([_turn("DOCTOR", "hello")], compact=False)
+
+    assert messages[0]["content"] == l4._SYSTEM_PROMPT
+    assert num_predict == l4.config.EXTRACT_NUM_PREDICT
+
+
+def test_extract_uses_compact_prompt_and_num_predict_when_requested() -> None:
+    from src.l4_extract import extract
+
+    turns = [_turn("DOCTOR", "fever")]
+    with patch("ollama.chat", return_value=_mock_ollama(_EMPTY_RESPONSE)) as mock_chat:
+        extract(turns, compact=True)
+
+    import src.l4_extract as l4
+
+    sent = mock_chat.call_args.kwargs
+    assert sent["messages"][0]["content"] == l4._SYSTEM_PROMPT_COMPACT
+    assert sent["options"]["num_predict"] == l4.config.EXTRACT_COMPACT_NUM_PREDICT
+
+
+def test_extract_uses_verbose_prompt_by_default() -> None:
+    from src.l4_extract import extract
+
+    turns = [_turn("DOCTOR", "fever")]
+    with patch("ollama.chat", return_value=_mock_ollama(_EMPTY_RESPONSE)) as mock_chat:
+        extract(turns)
+
+    import src.l4_extract as l4
+
+    sent = mock_chat.call_args.kwargs
+    assert sent["messages"][0]["content"] == l4._SYSTEM_PROMPT
+    assert sent["options"]["num_predict"] == l4.config.EXTRACT_NUM_PREDICT
+
+
+def test_prompt_prefix_hash_is_deterministic_and_content_sensitive() -> None:
+    from src.l4_extract import prompt_prefix_hash
+
+    turns_a = [_turn("DOCTOR", "fever since Monday")]
+    turns_b = [_turn("DOCTOR", "fever since Tuesday")]
+
+    assert prompt_prefix_hash(turns_a) == prompt_prefix_hash(turns_a)
+    assert prompt_prefix_hash(turns_a) != prompt_prefix_hash(turns_b)
+    assert prompt_prefix_hash(turns_a, compact=True) != prompt_prefix_hash(turns_a, compact=False)
+
+
+def test_prompt_prefix_hash_matches_what_extract_actually_sends() -> None:
+    """The hash a caller tracks for kv_warm_wasted must correspond exactly to
+    the prompt extract() will send for the same turns/compact — otherwise the
+    comparison is meaningless."""
+    import hashlib
+
+    from src.l4_extract import extract, prompt_prefix_hash
+
+    turns = [_turn("DOCTOR", "fever since Monday")]
+    with patch("ollama.chat", return_value=_mock_ollama(_EMPTY_RESPONSE)) as mock_chat:
+        extract(turns, compact=True)
+
+    sent_messages = mock_chat.call_args.kwargs["messages"]
+    expected_hash = hashlib.sha256(
+        "".join(m["content"] for m in sent_messages).encode()
+    ).hexdigest()[:16]
+    assert prompt_prefix_hash(turns, compact=True) == expected_hash
+
+
+def test_warm_llm_prefix_sends_minimal_generation_and_returns_hash() -> None:
+    from src.l4_extract import prompt_prefix_hash, warm_llm_prefix
+
+    turns = [_turn("DOCTOR", "fever since Monday")]
+    with patch("ollama.chat", return_value=_mock_ollama(_EMPTY_RESPONSE)) as mock_chat:
+        returned_hash = warm_llm_prefix(turns)
+
+    import src.l4_extract as l4
+
+    sent = mock_chat.call_args.kwargs
+    assert sent["options"]["num_predict"] == l4.config.KV_WARM_NUM_PREDICT
+    assert sent["options"]["num_ctx"] == l4.config.EXTRACT_NUM_CTX
+    assert returned_hash == prompt_prefix_hash(turns)
+
+
+def test_warm_llm_prefix_is_non_fatal_on_ollama_error() -> None:
+    from src.l4_extract import warm_llm_prefix
+
+    turns = [_turn("DOCTOR", "fever")]
+    with patch("ollama.chat", side_effect=ConnectionError("no ollama")):
+        result = warm_llm_prefix(turns)  # must not raise
+
+    assert isinstance(result, str) and len(result) > 0
