@@ -229,3 +229,22 @@ RESIDENT_PEAK_RSS_BUDGET_MB = 14000
 # budget table; tune once real capture-loop timing data exists (docs/
 # incremental_capture_design.md's precondition 2).
 INCREMENTAL_SETTLE_MARGIN_S = 10.0
+
+# ── Latency Wave 4: L4 compact output + KV prefix warming ───────────────────
+# Verbose JSON emits explicit null/[] for every unpopulated field; the
+# compact prompt variant (src.l4_extract._SYSTEM_PROMPT_COMPACT) instructs
+# the model to OMIT them instead — _build_note already treats a missing key
+# identically to an explicit null via `data.get(field) or default`, so no
+# downstream code changes. OFF by default until validated on the frozen
+# extraction eval (`python -m eval.run_eval extraction --compact`, compared
+# against the verbose baseline); flip only after a passing gate run, per the
+# "measure before tune" discipline. See LEARNINGS.md for the gate result.
+EXTRACT_COMPACT_OUTPUT = False
+EXTRACT_COMPACT_NUM_PREDICT = 1024  # tighter bound than EXTRACT_NUM_PREDICT
+
+# KV prefix warming (web/incremental.py's warm_l4_prefix): the prompt sent to
+# Ollama during a warm call must match extract()'s prompt options exactly
+# (num_ctx especially — a mismatch restarts the model runner, wasting the
+# warm). num_predict is intentionally tiny here (only the prefill matters,
+# not the generation) — see src.l4_extract.warm_llm_prefix.
+KV_WARM_NUM_PREDICT = 1

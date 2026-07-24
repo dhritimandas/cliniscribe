@@ -1744,3 +1744,75 @@ tests for logic, one marked-slow real-audio test for the assembly — is the
 template worth reusing for Wave 5/6's ASR-adjacent changes, which carry the
 same class of risk (a fake decoder cannot see a pathological windowing
 decision, only a real one can).
+
+## Latency Phase 5 — L4 Compact Output: a real gate result, and why it stays off (2026-07-21)
+
+### (a) What this phase does
+Adds a compact prompt variant (`_SYSTEM_PROMPT_COMPACT` — `_SYSTEM_PROMPT`
+plus one rule instructing the model to omit any null/empty field rather than
+emit it explicitly) and `config.EXTRACT_COMPACT_OUTPUT` to switch `extract()`
+between them; `_build_note` needs no change since it already treats a
+missing key the same as an explicit null via `data.get(field) or default`.
+Also adds L4 KV-prefix warming: `src.l4_extract.warm_llm_prefix()` fires the
+exact system+transcript prompt `extract()` will eventually send, with
+minimal generation, so Ollama's KV cache is primed before the real call;
+`web/incremental.py`'s `IncrementalSession.warm_l4_prefix()` calls it with
+turns settled so far (reusing `partial_turns()`'s diarization pass, not a
+second one) and tracks `kv_warm_wasted` — incremented whenever `finalize()`'s
+actual prompt hash doesn't match the last warm's (never a correctness bug,
+since `extract()` always sends the right prompt regardless — just a missed
+optimization). `prompt_prefix_hash()` is shared by both extract() and the
+warm path so the two can never silently drift on prompt construction.
+
+**Gate result on the frozen extraction eval (`eval/frozen_set_extraction.json`,
+24 samples, 630 representable rubric criteria) — real, and not a clean pass:**
+
+| | Verbose (baseline) | Compact |
+|---|---|---|
+| Aggregate recall | 0.481 (303/630) | 0.479 (302/630) |
+| medication_name | 66/104 | 70/104 |
+| medication_frequency | 55/86 | 51/86 |
+| prescribed_test_name | 13/37 | 18/37 |
+| symptom_name | 55/87 | 46/87 |
+
+The aggregate is a wash (630 criteria, a 1-criterion difference). Per-category,
+`symptom_name` drops 9 points (10.3% relative) while `medication_name` and
+`prescribed_test_name` each gain — not uniform non-regression. Inspecting the
+actual extracted symptom strings per sample shows this is mostly generic
+3B-instruct prompt-sensitivity (case changes, "Upper abdominal pain" →
+"Abdominal pain", extra symptoms caught in some rows, one real semantic miss
+at idx=140 — "pain in the back" → "Pain in the chest") rather than a
+mechanism specific to omitting empty fields; there is no design reason field
+omission would selectively hurt symptom extraction. **Decision: ship the
+capability, fully built and tested, with `EXTRACT_COMPACT_OUTPUT = False` by
+default.** At N=24 this evidence cannot distinguish "compact output is
+accuracy-neutral" from "compact output trades some symptom recall for some
+medication/test recall" — and flipping a default that touches symptom
+extraction, a clinically load-bearing field, on evidence this ambiguous is
+not a call to make unilaterally. This is the same "measure before tune"
+discipline the project has applied to every other latency lever — a mixed
+gate result is a real finding, documented like a win, not quietly rounded up
+to a pass.
+
+### (b) Hardest bugs
+No implementation bugs this phase — the gate machinery (compact prompt,
+`prompt_prefix_hash`, `warm_llm_prefix`, the `--compact` eval CLI flag) all
+worked correctly on the first real run. The "bug," such as it is, was almost
+reaching for the aggregate number alone and calling it a pass — 0.481 vs
+0.479 looks like textbook non-regression until the per-category breakdown is
+read, which is where the real signal (and the real question about whether to
+ship) actually lives. Worth recording as a process note: an aggregate gate
+number over a small, heterogeneous category mix can hide exactly the kind of
+per-field tradeoff that matters most in a clinical-safety context.
+
+### (c) Fine-tuning hook
+Not applicable to model weights. The forward hook: if compact output is
+revisited, the right next step is a LARGER frozen sample (N=24 is too small
+to separate "real effect" from "3B-model noise" on any single category with
+~40-90 criteria) or a repeated-run variance study (same prompt, multiple
+temperature=0 calls, to establish how much category-level recall naturally
+wobbles run-to-run before attributing a shift to the prompt change at all).
+Until then, the compact prompt and `EXTRACT_COMPACT_NUM_PREDICT` stay
+available behind the flag for anyone who wants to trade the ambiguity for
+the latency win in a specific deployment, but production defaults to the
+verbose prompt this project's existing eval baselines were measured against.

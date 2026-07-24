@@ -199,6 +199,81 @@ def test_finalize_with_no_audio_returns_empty_list(session, monkeypatch):
     assert session.finalize() == []
 
 
+# ── Wave 4: L4 KV prefix warming ───────────────────────────────────────────
+
+
+def _stub_decode_and_diarize(monkeypatch, label="settled"):
+    monkeypatch.setattr(
+        incremental,
+        "decode_windows_words",
+        lambda audio, sr, windows: [w for start, end in windows for w in _fake_words(start, end, label)],
+    )
+    monkeypatch.setattr(
+        incremental.IncrementalSession,
+        "_diarize_current_buffer",
+        lambda self, audio: [Segment(start=0.0, end=100.0, speaker="S0")],
+    )
+
+
+def test_warm_l4_prefix_returns_none_when_nothing_settled(session, monkeypatch):
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: [])
+    monkeypatch.setattr(
+        incremental.IncrementalSession, "_diarize_current_buffer", lambda self, audio: []
+    )
+
+    assert session.warm_l4_prefix() is None
+    assert session._last_l4_warm_hash is None
+
+
+def test_warm_l4_prefix_records_hash_and_fires_background_warm(session, monkeypatch):
+    _stub_decode_and_diarize(monkeypatch)
+    warm_calls = []
+    monkeypatch.setattr(
+        "src.l4_extract.warm_llm_prefix", lambda turns: warm_calls.append(turns) or "unused"
+    )
+
+    session.feed(_silence_bytes(12.0))  # settles [0, 5.0)
+    returned_hash = session.warm_l4_prefix()
+
+    assert returned_hash is not None
+    assert session._last_l4_warm_hash == returned_hash
+    # Background thread — give it a moment to run.
+    import time
+
+    for _ in range(50):
+        if warm_calls:
+            break
+        time.sleep(0.02)
+    assert len(warm_calls) == 1
+    assert len(warm_calls[0]) >= 1  # the turns passed through
+
+
+def test_finalize_increments_kv_warm_wasted_on_prefix_mismatch(session, monkeypatch):
+    _stub_decode_and_diarize(monkeypatch)
+    monkeypatch.setattr("src.l4_extract.warm_llm_prefix", lambda turns: "unused")
+
+    session.feed(_silence_bytes(12.0))
+    session.warm_l4_prefix()
+    session._last_l4_warm_hash = "deliberately-wrong-hash"
+
+    session.finalize()
+
+    assert session.kv_warm_wasted == 1
+
+
+def test_finalize_does_not_increment_kv_warm_wasted_when_never_warmed(session, monkeypatch):
+    _stub_decode_and_diarize(monkeypatch)
+
+    session.feed(_silence_bytes(12.0))
+    session.finalize()
+
+    assert session.kv_warm_wasted == 0
+
+
+def test_kv_warm_wasted_starts_at_zero(session):
+    assert session.kv_warm_wasted == 0
+
+
 def test_partial_turns_never_touches_l4_or_note_json(session, monkeypatch):
     """Clinical-safety contract, checked structurally: partial_turns()'s
     return type is exactly list[Turn] — the same shape L3 produces before L3.5/
