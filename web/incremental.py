@@ -36,6 +36,15 @@ time — never feeds L4 for real, purely a cache-priming side effect. Tracks
 doesn't match the last warm's hash — never a correctness issue (extract()
 always sends the right prompt regardless), just a missed optimization.
 
+Script-conditional drug hotword biasing (latency Wave 5,
+config.INCREMENTAL_LATIN_HOTWORDS_ENABLED, off by default): settled-window
+decodes pass allow_hotwords=True to src.fast_asr.decode_windows_words,
+permitting a script-conditional re-decode attempt on Latin-dominant windows
+with a drug-like near-miss — see that module's module-docstring section for
+the full mechanism and the failed-global-prompt history that constrains it.
+finalize()'s tail decode NEVER passes allow_hotwords — hotwording only ever
+hides inside idle recording-time ticks, never the stop-time critical path.
+
 NOT built in this pass (see LEARNINGS.md's Wave 3 entry for why): the FastAPI
 routes and browser capture-loop wiring that would actually call feed() during
 a live recording. Today's API surface (POST /api/sessions,
@@ -148,7 +157,10 @@ class IncrementalSession:
             )
             for i in range(n_full_windows)
         ]
-        new_words = decode_windows_words(self._audio, TARGET_SR, windows)
+        # allow_hotwords=True: this is a settled-window decode during live
+        # recording, hiding inside idle tick time (latency Wave 5) — never
+        # pass True for finalize()'s stop-time tail decode below.
+        new_words = decode_windows_words(self._audio, TARGET_SR, windows, allow_hotwords=True)
         self._settled_words.extend(new_words)
         self._decoded_up_to_s = windows[-1][1]
         logger.info(

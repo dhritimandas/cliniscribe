@@ -1878,3 +1878,94 @@ Until then, the `.transliterated_unresolved` flag is a free, precise counter
 for how often that fallback fires — i.e. a direct measure of the recognition
 gap's size, per session, at no extra cost.
 
+## Hotword-Biasing Phase — built, guarded, and shipped OFF on purpose (2026-07-24)
+
+### (a) What this phase does
+Implements script-conditional drug-name hotword biasing at the two placements
+the latency plan identified, and ships **both disabled by default**.
+
+- **`web/verification.py`** (the zero-added-latency placement): the background
+  re-listen already re-decodes safety-critical spans, so a hotword changes only
+  what an already-scheduled call is biased toward — no new decode. Prompt is
+  built from drug fields whose current value is already Latin-dominant.
+- **`src/fast_asr.py`** (settled-window decodes during live recording): one
+  extra biased re-decode of a clean window, hidden in idle tick time.
+  Structurally prevented from touching the stop-time critical path —
+  `allow_hotwords` defaults to False and `finalize()`'s tail decode never
+  passes it (asserted by test).
+
+Supporting machinery: `src.drug_lexicon.nearest_drug_candidates` (returns
+several plausible names, unlike `canonicalize_drug_span`, which refuses on
+ambiguity — a hotword nudges token probabilities, it never substitutes a final
+answer, so the harm model differs), and `prompt_leaked_into_hypothesis` as the
+safety backstop, which is **not** flag-gated: any biased decode that echoes
+its prompt is discarded in favor of the unbiased one regardless of flags.
+
+**Why OFF:** both placements are fully implemented and unit-tested, but NOT
+validated on a real-audio drug-recovery gate in this session. The existing
+`eval/drug_bench.py` targets the accurate/CPU engine (faster-whisper), not the
+fast/mlx paths these flags touch — so a passing run there would not have been
+evidence about this code. The earlier global-`initial_prompt` experiment failed
+precisely because biasing was adopted on reasoning rather than a matching
+gate; enabling these without an mlx-native bench would repeat that mistake
+with better ergonomics.
+
+### (b) Hardest bugs
+
+1. **A threshold I justified by reasoning was measurably unsafe — and it was
+   the exact false-positive class this project already rejected once.** I set
+   `DRUG_HOTWORD_TRIGGER_MAX_DISTANCE = 3` on the argument that a loose trigger
+   net is harmless because it only decides whether to ATTEMPT a re-decode,
+   never what the final answer is. The argument is true as far as it goes — but
+   a test over ordinary clinic vocabulary showed the net was absurd: at
+   distance 3, **13 of 17 common English words false-triggered** against the
+   546-entry lexicon ("doctor"→dytor, "please"→limcee, "check"→aten, plus
+   "tablet", "patient", "stomach", "allergy", "tomorrow"...). That is the same
+   finding `_distance_bound`'s own docstring records for the rejected
+   length-5–8/distance-1 tier: "the combinatorial space of short, unrelated
+   Hindi/English words and names is large enough that a single edit is not a
+   safe signal." Root cause: I reasoned about the *consequence* of a false
+   trigger (one wasted decode) and never measured its *rate* — and at a 76%
+   trigger rate the mechanism isn't "occasionally wasteful," it fires on
+   essentially every window, so the biased path runs constantly instead of
+   surgically. Fixed by measurement: distance 2 cut it to 1 of 17 ("doctor"),
+   and that one is already covered by `src.concepts.EVERYDAY_WORDS` — the
+   107-word guard this project built for exactly this class in the concept
+   matcher — so the trigger now consults it. Final measured config: **0 of 17
+   common words trigger, 4 real distortions still do.**
+
+2. **The leakage guard could not see the leak it most needed to catch.** It was
+   written as "≥3 contiguous tokens copied from the prompt" — sensible for a
+   model regurgitating a candidate list. But a hotword prompt is frequently ONE
+   drug name, so the highest-risk case (prompt `"augmentin"` → hypothesis
+   `"augmentin"`, the model echoing instead of transcribing a quiet span) is
+   one token long and sailed straight through. A test asserting the discard
+   behavior failed and exposed it. The naive fix is worse than the bug:
+   flagging any hypothesis *containing* a prompt drug name would reject every
+   SUCCESSFUL recovery, since emitting the drug name is the entire point. Root
+   cause: "overlaps the prompt" is not the discriminating signal — **"has no
+   content of its own"** is. Fixed with a second independent signal: leak if
+   every folded hypothesis token also appears in the prompt. Catches bare
+   echoes at any length, while `"augmentin 625 mg for the fever"` passes
+   (625/mg/fever are not prompt tokens). Accepted, documented false positive: a
+   window whose genuine content really is only the drug name — costing one
+   discarded biased decode and falling back to the unbiased one, the
+   conservative direction.
+
+3. (Same family as #1, smaller.) The trigger first scanned single tokens only,
+   which structurally could not fire on this project's own canonical example:
+   `"gmenti"` is 6 characters and never reaches the fold-key length floor,
+   whereas `"aur gmenti"` — the documented `→ augmentin` recovery — does.
+   Widened to 1–2 word windows.
+
+### (c) Fine-tuning hook
+The precise prerequisite for turning either flag on, stated so it can't drift:
+an **mlx-native** drug-recovery bench (the current one is faster-whisper/CPU),
+scored with the accept/kill protocol the earlier prompt experiment
+established — strict recovery improvement, `missed_after ⊆ missed_before` per
+clip (zero new misses), and zero prompt leakage. Absent that, these flags stay
+off no matter how reasonable the mechanism looks. Longer term the same
+fine-tune hook applies as for display: an ASR model that emits Latin-script
+drug names natively makes this machinery unnecessary rather than merely
+gated — hotwording is compensation for a recognition gap, not a fix for it.
+

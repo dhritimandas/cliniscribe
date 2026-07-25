@@ -248,3 +248,35 @@ EXTRACT_COMPACT_NUM_PREDICT = 1024  # tighter bound than EXTRACT_NUM_PREDICT
 # warm). num_predict is intentionally tiny here (only the prefill matters,
 # not the generation) — see src.l4_extract.warm_llm_prefix.
 KV_WARM_NUM_PREDICT = 1
+
+# ── Latency Wave 5: script-conditional drug-name hotword biasing ───────────
+# A GLOBAL initial_prompt seeding faster-whisper with a drug list was tried
+# and REJECTED (LEARNINGS.md: recovered 1/8 misses, caused 3 new Devanagari
+# regressions by biasing the decoder toward Latin script on pure-Hindi
+# audio). Both placements below are script-CONDITIONAL — hotwords attach
+# only when the hypothesis/field value under consideration is already
+# Latin-dominant (src.fast_asr._is_latin_dominant) — the binding constraint
+# LEARNINGS.md derived from that failure. Both OFF by default: shipped as
+# fully tested capabilities, not yet validated on a real-audio drug-recovery
+# gate in this session (see LEARNINGS.md's Wave 5 entry for why — the
+# existing eval/drug_bench.py targets the accurate/CPU engine, not the
+# fast/mlx paths these flags touch; a proper mlx-native gate is follow-up
+# work). A prompt-leakage guard (src.fast_asr.prompt_leaked_into_hypothesis)
+# is the safety backstop for both: any hypothesis that echoes prompt content
+# verbatim is discarded in favor of the unbiased decode, regardless of flag
+# state — leakage detection is NOT itself flag-gated.
+VERIFY_LATIN_HOTWORDS_ENABLED = False
+INCREMENTAL_LATIN_HOTWORDS_ENABLED = False
+DRUG_HOTWORD_TOP_K = 5  # max lexicon candidates offered per biased decode
+PROMPT_LEAKAGE_MIN_NGRAM = 3  # tokens; a shorter run is too likely a coincidence
+# Measured, not guessed (see LEARNINGS.md's Wave 5 entry): distance=3
+# false-triggered on 13/17 common English clinic-conversation words tested
+# ("doctor", "please", "check", "tablet", "patient", "stomach", "allergy",
+# "tomorrow", ...) — the same failure class LEARNINGS.md already rejected
+# once for a different tier. distance=2 (matching src.drug_lexicon.
+# _distance_bound's own validated value, just without that function's
+# key-length>=9 gate) cut false positives to one word ("doctor") out of the
+# same 17, which src.fast_asr._find_drug_like_token additionally excludes
+# via src.concepts.EVERYDAY_WORDS (the existing, validated common-word guard
+# built for this exact false-positive class in L3.5's concept matcher).
+DRUG_HOTWORD_TRIGGER_MAX_DISTANCE = 2

@@ -1104,7 +1104,7 @@ def _fake_decode_factory(canned: list[tuple[float, float, str]]):
     regardless of how the caller padded/merged/packed it.
     """
 
-    def fake_decode(audio, sr, start, end, repo, decode_kwargs):
+    def fake_decode(audio, sr, start, end, repo, decode_kwargs, *, initial_prompt=None):
         words: list[tuple[float, float, str]] = []
         for span_start, span_end, text in canned:
             if span_start >= start and span_end <= end:
