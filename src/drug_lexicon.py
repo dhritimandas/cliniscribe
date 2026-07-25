@@ -440,3 +440,62 @@ def canonicalize_drug_span(text: str) -> tuple[str, float] | None:
 
     (canonical, dist), = best_dist.items()
     return canonical, round(1 - dist / len(key), 4)
+
+
+def nearest_drug_candidates(
+    text: str, k: int = 5, *, max_distance: int | None = None
+) -> list[str]:
+    """Return up to `k` canonical drug names nearest to `text` by fold-distance.
+
+    NOT a drug-identification decision (see canonicalize_drug_span for that,
+    including its ambiguity guard). This is for decoder hotword biasing
+    (latency Wave 5, src.fast_asr / web.verification): a hotword only nudges
+    token probabilities during decoding, it never substitutes a final
+    answer, so returning several plausible candidates on an ambiguous query
+    is the intended behavior here — the harm model is different from
+    canonicalize_drug_span's, where a wrong single answer is a patient-
+    safety incident.
+
+    Args:
+        text: A drug-name-ish span (Devanagari, Latin, or mixed script).
+        k: Maximum number of candidates to return.
+        max_distance: Override the edit-distance bound. None (default) uses
+            _distance_bound — the SAME gate-derived bound
+            canonicalize_drug_span uses. An explicit wider value is for
+            callers deciding whether a hotword-biased re-decode is worth
+            ATTEMPTING (src.fast_asr._find_drug_like_token) — a looser net
+            there costs at most one extra decode call, never a wrong final
+            answer, since the candidates it returns are still just prompt
+            text, not a substitution.
+
+    Returns:
+        Up to `k` canonical drug names, nearest first (exact match, then
+        ascending edit distance, alphabetical tiebreak). Empty if `text`
+        folds to nothing or no candidate is within the distance bound.
+    """
+    tokens = [t for t in text.split() if not _DIGIT_TOKEN_RE.match(t)]
+    if not tokens:
+        return []
+    key = _fold(" ".join(tokens)).replace(" ", "")
+    if not key:
+        return []
+
+    exact = _FOLD_INDEX.get(key)
+    if exact:
+        return sorted(exact)[:k]
+
+    bound = max_distance if max_distance is not None else _distance_bound(len(key))
+    if bound is None:
+        return []
+
+    dist_by_canonical: dict[str, int] = {}
+    for cand_key, canonicals in _FOLD_INDEX.items():
+        dist = _levenshtein(key, cand_key, bound)
+        if dist > bound:
+            continue
+        for canonical in canonicals:
+            if canonical not in dist_by_canonical or dist < dist_by_canonical[canonical]:
+                dist_by_canonical[canonical] = dist
+
+    ranked = sorted(dist_by_canonical.items(), key=lambda kv: (kv[1], kv[0]))
+    return [name for name, _ in ranked[:k]]

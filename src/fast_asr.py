@@ -649,8 +649,14 @@ def _decode_window_words(
     *,
     language: str | None,
     decode_kwargs: dict,
+    initial_prompt: str | None = None,
 ) -> tuple[str, str | None, list[Word]]:
     """Like _decode_window, but with word_timestamps=True.
+
+    Args:
+        initial_prompt: Optional decoder hotword/context string (latency
+            Wave 5 — see _maybe_apply_latin_drug_hotwords). None (default)
+            reproduces the exact pre-Wave-5 call, unchanged.
 
     Returns:
         (text, detected_language, words). `words` start/end are shifted from
@@ -669,6 +675,7 @@ def _decode_window_words(
         language=language,
         task="transcribe",
         word_timestamps=True,
+        initial_prompt=initial_prompt,
         **decode_kwargs,
     )
     words: list[Word] = [
@@ -681,17 +688,29 @@ def _decode_window_words(
 
 
 def _decode_window_words_with_guards(
-    audio: np.ndarray, sr: int, start: float, end: float, repo: str, decode_kwargs: dict
+    audio: np.ndarray,
+    sr: int,
+    start: float,
+    end: float,
+    repo: str,
+    decode_kwargs: dict,
+    *,
+    initial_prompt: str | None = None,
 ) -> tuple[str, list[Word]]:
     """Word-timestamp-carrying counterpart of _decode_with_script_guard.
 
     Applies the same two guards (Arabic-script, then language-allowlist —
     see that function's docstring) to the SAME initial decode; whichever one
     fires re-decodes with language="hi" and its words replace the original
-    decode's words.
+    decode's words. `initial_prompt` (latency Wave 5 hotword biasing, if the
+    caller supplies one) rides along on the FIRST decode only — a guard
+    re-decode already means the window's script/language was misdetected,
+    so it re-decodes clean/unbiased rather than compounding uncertainty with
+    a possibly-irrelevant prompt.
     """
     text, detected_language, words = _decode_window_words(
-        audio, sr, start, end, repo, language=None, decode_kwargs=decode_kwargs
+        audio, sr, start, end, repo, language=None, decode_kwargs=decode_kwargs,
+        initial_prompt=initial_prompt,
     )
     if config.ASR_SCRIPT_GUARD and _contains_arabic_script(text):
         logger.warning(
@@ -720,6 +739,182 @@ def _decode_window_words_with_guards(
             audio, sr, start, end, repo, language="hi", decode_kwargs=decode_kwargs
         )
     return text, words
+
+
+# ── Script-conditional drug hotword biasing (latency Wave 5) ────────────────
+# A GLOBAL initial_prompt seeding the decoder with a drug list was tried and
+# REJECTED (LEARNINGS.md): it recovered 1/8 distorted misses but caused 3 new
+# Devanagari regressions by biasing the decoder toward Latin script on
+# pure-Hindi audio. Both use sites below (this module's settled-window
+# decode, web/verification.py's re-listen) are script-CONDITIONAL — a prompt
+# only ever attaches when the window/field text under consideration is
+# ALREADY Latin-dominant — the binding constraint that failure derived.
+_HOTWORD_TRIGGER_MIN_TOKEN_LEN = 5
+
+
+def prompt_leaked_into_hypothesis(
+    prompt: str, hypothesis: str, *, min_ngram: int | None = None
+) -> bool:
+    """True if `hypothesis` looks like an echo of `prompt` rather than a
+    transcription of audio — a known Whisper failure mode on quiet/uncertain
+    spans. Comparison is on folded tokens (src.drug_lexicon._fold) so a
+    script-transliterated echo still counts as a leak, not just an exact
+    string copy.
+
+    Two independent signals, either of which is a leak:
+
+    1. **List echo** — a contiguous run of >= min_ngram tokens copied from
+       the prompt. Catches the model regurgitating the candidate list
+       ("augmentin azithromycin naxdom").
+    2. **No content of its own** — EVERY folded token in the hypothesis also
+       appears in the prompt. This is the signal a bare single-word echo
+       needs: a hotword prompt is often just one or two drug names, far
+       below any n-gram threshold, so signal 1 alone would miss
+       prompt="augmentin" -> hypothesis="augmentin" entirely.
+
+    Signal 2 deliberately does NOT fire merely because the hypothesis
+    CONTAINS a prompt drug name — that is what a successful recovery looks
+    like ("augmentin 625 mg for the fever" keeps "625"/"mg"/"fever", none of
+    them prompt tokens, so it passes). It fires only when the decode
+    contributed nothing beyond the prompt. Known, accepted false-positive
+    case: a window whose genuine content really is nothing but the drug name.
+    That costs one discarded biased decode and falls back to the unbiased
+    one — the conservative direction — and is implausible for the ~28s
+    settled windows this guards in practice.
+
+    Used as the safety backstop for BOTH hotword-biasing use sites: any
+    leaked decode is discarded in favor of the unbiased original, regardless
+    of which flag enabled the biasing attempt in the first place.
+    """
+    from src.drug_lexicon import _fold
+
+    if min_ngram is None:
+        min_ngram = config.PROMPT_LEAKAGE_MIN_NGRAM
+    prompt_tokens = [_fold(t) for t in _tokens(prompt) if _fold(t)]
+    hyp_tokens = [_fold(t) for t in _tokens(hypothesis) if _fold(t)]
+    if not prompt_tokens or not hyp_tokens:
+        return False
+
+    # Signal 2: the decode carries no token the prompt didn't already supply.
+    if set(hyp_tokens) <= set(prompt_tokens):
+        return True
+
+    # Signal 1: a verbatim multi-token run copied from the prompt.
+    if len(prompt_tokens) < min_ngram or len(hyp_tokens) < min_ngram:
+        return False
+    prompt_ngrams = {
+        tuple(prompt_tokens[i : i + min_ngram])
+        for i in range(len(prompt_tokens) - min_ngram + 1)
+    }
+    hyp_ngrams = (
+        tuple(hyp_tokens[i : i + min_ngram]) for i in range(len(hyp_tokens) - min_ngram + 1)
+    )
+    return any(ng in prompt_ngrams for ng in hyp_ngrams)
+
+
+_HOTWORD_TRIGGER_WINDOW_SIZES: tuple[int, ...] = (1, 2)
+
+
+def _find_drug_like_token(text: str) -> str | None:
+    """First 1-2 word alphabetic span in `text` that fold-nears a lexicon
+    entry closely enough to be worth a hotword-biased re-decode attempt —
+    deliberately a LOOSER net (config.DRUG_HOTWORD_TRIGGER_MAX_DISTANCE)
+    than src.drug_lexicon.canonicalize_drug_span's gate-derived accept
+    bound. This only decides whether to ATTEMPT a re-decode;
+    prompt_leaked_into_hypothesis and L3.5's own strict canonicalization
+    afterward are what validate the result — a wider trigger net costs at
+    most one extra idle-time decode call, never a wrong final answer. None
+    if nothing qualifies.
+
+    Two-word windows exist because the recoverable distortion class needs
+    them: a single distorted word like "gmenti" (6 chars) never reaches
+    src.drug_lexicon._distance_bound's length->=9 floor even loosened, but
+    "aur gmenti" (the surrounding filler word included, matching this
+    project's own documented "aur gmenti" -> augmentin recovery) does.
+
+    Common English clinic-conversation words ("doctor", "please", "tablet",
+    "patient", ...) are excluded via src.concepts.EVERYDAY_WORDS — the same
+    validated common-word guard L3.5's concept matcher uses for the
+    identical false-positive class (measured: config.DRUG_HOTWORD_TRIGGER_MAX_DISTANCE
+    was tightened from 3 to 2 specifically because distance=3 false-triggered
+    on 13/17 tested common words; see LEARNINGS.md's Wave 5 entry).
+    """
+    from src.concepts import EVERYDAY_WORDS
+    from src.drug_lexicon import nearest_drug_candidates
+
+    words = [w for w in _tokens(text) if w.isalpha()]
+    for n in _HOTWORD_TRIGGER_WINDOW_SIZES:
+        for i in range(len(words) - n + 1):
+            window = words[i : i + n]
+            if any(w.lower() in EVERYDAY_WORDS for w in window):
+                continue
+            span = " ".join(window)
+            if len(span.replace(" ", "")) < _HOTWORD_TRIGGER_MIN_TOKEN_LEN:
+                continue
+            if nearest_drug_candidates(
+                span, k=1, max_distance=config.DRUG_HOTWORD_TRIGGER_MAX_DISTANCE
+            ):
+                return span
+    return None
+
+
+def _maybe_apply_latin_drug_hotwords(
+    audio: np.ndarray,
+    sr: int,
+    start: float,
+    end: float,
+    repo: str,
+    text: str,
+    words: list[Word],
+) -> tuple[str, list[Word]]:
+    """Attempt one hotword-biased re-decode of a clean (non-degenerate)
+    window, gated by config.INCREMENTAL_LATIN_HOTWORDS_ENABLED.
+
+    Fires only when: the flag is on, `text` is already Latin-dominant
+    (_is_latin_dominant — the script-conditional constraint), and `text`
+    contains a drug-like near-miss (_find_drug_like_token). Discards the
+    biased result and keeps the original on prompt leakage. Returns
+    `(text, words)` unchanged in every other case.
+    """
+    if not config.INCREMENTAL_LATIN_HOTWORDS_ENABLED:
+        return text, words
+    if not _is_latin_dominant(text):
+        return text, words
+
+    from src.drug_lexicon import nearest_drug_candidates
+
+    drug_token = _find_drug_like_token(text)
+    if drug_token is None:
+        return text, words
+    candidates = nearest_drug_candidates(
+        drug_token,
+        k=config.DRUG_HOTWORD_TOP_K,
+        max_distance=config.DRUG_HOTWORD_TRIGGER_MAX_DISTANCE,
+    )
+    if not candidates:
+        return text, words
+
+    prompt = ", ".join(candidates)
+    biased_text, _, biased_words = _decode_window_words(
+        audio, sr, start, end, repo, language=None, decode_kwargs=config.FAST_ASR_DECODE_KWARGS,
+        initial_prompt=prompt,
+    )
+    if prompt_leaked_into_hypothesis(prompt, biased_text):
+        logger.warning(
+            "fast_asr hotword biasing: prompt leakage at [%.2f, %.2f]s "
+            "(candidates=%s) — discarding biased decode",
+            start,
+            end,
+            candidates,
+        )
+        return text, words
+    logger.info(
+        "fast_asr hotword biasing: re-decoded [%.2f, %.2f]s with candidates %s",
+        start,
+        end,
+        candidates,
+    )
+    return biased_text, biased_words
 
 
 # Progress-reporting granularity fix: window-packing (Fix 2) cut on_progress
@@ -1005,6 +1200,7 @@ def _decode_one_window_with_ladder(
     on_progress: Callable[[float, float], None] | None = None,
     done_seconds_before_window: float = 0.0,
     total_seconds: float = 0.0,
+    allow_hotwords: bool = False,
 ) -> list[Word]:
     """Decode one window (guards + degeneration ladder), return its words.
 
@@ -1012,6 +1208,16 @@ def _decode_one_window_with_ladder(
     decode_windows_words (segment-free, latency Wave 3's incremental capture)
     can share the exact same guard/ladder behavior per window without
     depending on diarized segments — this function never touches Segment.
+
+    Args:
+        allow_hotwords: Permit a script-conditional drug-hotword re-decode
+            attempt (latency Wave 5 — _maybe_apply_latin_drug_hotwords) on a
+            CLEAN (non-degenerate) decode only. Default False reproduces
+            pre-Wave-5 behavior exactly. Callers must never pass True for a
+            stop-time tail window — hotwording is an idle-recording-time
+            optimization, not something to add to the critical path
+            (fast_transcribe_windowed's batch callers never pass True;
+            web/incremental.py passes True only for settled-window ticks).
     """
     text, words = _decode_window_words_with_guards(
         audio,
@@ -1040,11 +1246,19 @@ def _decode_one_window_with_ladder(
             window_end,
             step,
         )
+    elif allow_hotwords:
+        text, words = _maybe_apply_latin_drug_hotwords(
+            audio, sr, window_start, window_end, config.FAST_ASR_MODEL, text, words
+        )
     return words
 
 
 def decode_windows_words(
-    audio: np.ndarray, sr: int, windows: list[tuple[float, float]]
+    audio: np.ndarray,
+    sr: int,
+    windows: list[tuple[float, float]],
+    *,
+    allow_hotwords: bool = False,
 ) -> list[Word]:
     """Decode a list of (start, end) windows (see pack_duration_into_windows),
     guards + ladder applied per window, and return all words concatenated in
@@ -1055,11 +1269,19 @@ def decode_windows_words(
     segments (only a provisional, still-changing diarization exists during
     live capture). No progress callback: incremental capture reports its own
     progress via partial_turns(), not this per-window mechanism.
+
+    Args:
+        allow_hotwords: See _decode_one_window_with_ladder — passed through
+            unchanged to every window in this call. web/incremental.py must
+            pass True only for settled-window decodes during feed(), never
+            for finalize()'s stop-time tail.
     """
     total_duration = len(audio) / sr
     all_words: list[Word] = []
     for window_start, window_end in windows:
         all_words.extend(
-            _decode_one_window_with_ladder(audio, sr, window_start, window_end, total_duration)
+            _decode_one_window_with_ladder(
+                audio, sr, window_start, window_end, total_duration, allow_hotwords=allow_hotwords
+            )
         )
     return all_words

@@ -211,7 +211,7 @@ def _patch_decode_window(
     calls: list[dict] = []
     it = iter(responses)
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append(
             {
                 "start": start,
@@ -356,7 +356,7 @@ def test_decode_with_script_guard_forces_hi_on_non_allowlist_language(
     )
     calls: list[dict] = []
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append({"language": language})
         return next(responses)
 
@@ -380,7 +380,7 @@ def test_decode_with_script_guard_does_not_fire_on_allowlisted_language(
 ) -> None:
     calls: list[dict] = []
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append({"language": language})
         return "how long have you had fever", "en"
 
@@ -406,7 +406,7 @@ def test_decode_with_script_guard_does_not_double_retry_when_both_guards_would_f
     responses = iter([("نیکس ڈوم فائیو ہنڈریڈ", "ur"), ("नैक्सडॉम 500", "hi")])
     calls: list[dict] = []
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append({"language": language})
         return next(responses)
 
@@ -635,6 +635,258 @@ def test_pack_windows_invariants_on_a_longer_synthetic_session() -> None:
         assert group[-1].end - group[0].start <= 10.0
 
 
+# ── Script-conditional drug hotword biasing (latency Wave 5) ────────────────
+
+
+def test_prompt_leaked_detects_verbatim_copy() -> None:
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    prompt = "augmentin, azithromycin, naxdom"
+    hypothesis = "doctor said augmentin azithromycin naxdom for the infection"
+    assert prompt_leaked_into_hypothesis(prompt, hypothesis) is True
+
+
+def test_prompt_leaked_false_on_unrelated_hypothesis() -> None:
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    prompt = "augmentin, azithromycin, naxdom"
+    hypothesis = "मुझे बुखार है और सर दर्द हो रहा है"
+    assert prompt_leaked_into_hypothesis(prompt, hypothesis) is False
+
+
+def test_prompt_leaked_detects_bare_single_word_echo() -> None:
+    """A hotword prompt is often ONE drug name, far below any n-gram
+    threshold — the "no content of its own" signal is what catches it."""
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    assert prompt_leaked_into_hypothesis("augmentin", "augmentin") is True
+    assert prompt_leaked_into_hypothesis("augmentin, azithromycin", "azithromycin") is True
+
+
+def test_prompt_leaked_false_when_hypothesis_has_own_content() -> None:
+    """A SUCCESSFUL recovery also contains the prompt's drug name — that must
+    not be mistaken for leakage. The distinguishing signal is whether the
+    decode contributed anything beyond the prompt."""
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    assert prompt_leaked_into_hypothesis("augmentin", "augmentin 625 mg for the fever") is False
+
+
+def test_prompt_leaked_false_below_min_ngram() -> None:
+    """A single shared token (below the 3-gram default) is not evidence of
+    leakage — real speech can coincidentally share one word with the prompt."""
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    prompt = "augmentin, azithromycin, naxdom"
+    hypothesis = "the augmentin brand is common in India"
+    assert prompt_leaked_into_hypothesis(prompt, hypothesis) is False
+
+
+def test_prompt_leaked_respects_custom_min_ngram() -> None:
+    from src.fast_asr import prompt_leaked_into_hypothesis
+
+    prompt = "augmentin azithromycin"
+    hypothesis = "augmentin azithromycin was prescribed"
+    assert prompt_leaked_into_hypothesis(prompt, hypothesis, min_ngram=2) is True
+    assert prompt_leaked_into_hypothesis(prompt, hypothesis, min_ngram=5) is False
+
+
+def test_find_drug_like_token_finds_distorted_candidate() -> None:
+    """"aur gmenti" (a 2-word window) recovers augmentin — the project's own
+    documented distortion example — even though "gmenti" alone (6 chars)
+    never reaches the length floor a wider single-token search would need."""
+    from src.fast_asr import _find_drug_like_token
+
+    assert _find_drug_like_token("doctor said aur gmenti for the fever") == "aur gmenti"
+
+
+def test_find_drug_like_token_none_on_clean_text() -> None:
+    from src.fast_asr import _find_drug_like_token
+
+    assert _find_drug_like_token("doctor please check my fever and cough") is None
+
+
+def test_find_drug_like_token_none_on_short_tokens() -> None:
+    from src.fast_asr import _find_drug_like_token
+
+    assert _find_drug_like_token("ok go do it now") is None
+
+
+def test_maybe_apply_hotwords_noop_when_flag_disabled(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", False)
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    text, words = fast_asr_module._maybe_apply_latin_drug_hotwords(
+        audio, 16000, 0.0, 5.0, "repo", "aur gmenti for fever", [(0.0, 1.0, "aur")]
+    )
+    assert text == "aur gmenti for fever"
+    assert words == [(0.0, 1.0, "aur")]
+
+
+def test_maybe_apply_hotwords_noop_on_devanagari_dominant_text(monkeypatch) -> None:
+    """Script-conditional constraint (LEARNINGS.md): must never bias a window
+    whose hypothesis is already Devanagari-dominant, flag or not."""
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", True)
+    called = []
+    monkeypatch.setattr(
+        fast_asr_module, "_decode_window_words", lambda *a, **kw: called.append(1) or ("", None, [])
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    text, words = fast_asr_module._maybe_apply_latin_drug_hotwords(
+        audio, 16000, 0.0, 5.0, "repo", "मुझे बुखार है aur gmenti", [(0.0, 1.0, "x")]
+    )
+    assert called == []  # never re-decoded
+    assert text == "मुझे बुखार है aur gmenti"
+
+
+def test_maybe_apply_hotwords_fires_and_returns_biased_result(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", True)
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_decode_window_words",
+        lambda *a, **kw: ("augmentin 625 mg", None, [(0.0, 1.0, "augmentin")]),
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    text, words = fast_asr_module._maybe_apply_latin_drug_hotwords(
+        audio, 16000, 0.0, 5.0, "repo", "aur gmenti 625 mg", [(0.0, 1.0, "aur")]
+    )
+    assert text == "augmentin 625 mg"
+    assert words == [(0.0, 1.0, "augmentin")]
+
+
+def test_maybe_apply_hotwords_discards_on_prompt_leakage(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", True)
+    # Simulate the model echoing the hotword prompt verbatim instead of
+    # transcribing real audio (a known Whisper failure mode on quiet spans).
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_decode_window_words",
+        lambda *a, **kw: (kw.get("initial_prompt") or "", None, []),
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    original = ("aur gmenti 625 mg", [(0.0, 1.0, "aur")])
+    text, words = fast_asr_module._maybe_apply_latin_drug_hotwords(
+        audio, 16000, 0.0, 5.0, "repo", original[0], original[1]
+    )
+    assert text == original[0]  # discarded the leaked biased decode
+    assert words == original[1]
+
+
+def test_maybe_apply_hotwords_noop_when_no_drug_like_token(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", True)
+    called = []
+    monkeypatch.setattr(
+        fast_asr_module, "_decode_window_words", lambda *a, **kw: called.append(1) or ("", None, [])
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    text, words = fast_asr_module._maybe_apply_latin_drug_hotwords(
+        audio, 16000, 0.0, 5.0, "repo", "please come back next week", [(0.0, 1.0, "x")]
+    )
+    assert called == []
+    assert text == "please come back next week"
+
+
+def test_decode_one_window_never_hotwords_when_allow_hotwords_false(monkeypatch) -> None:
+    """Default allow_hotwords=False (fast_transcribe_windowed's batch path,
+    and web/incremental.py's finalize() tail) must never attempt biasing,
+    even with the flag on and a drug-like token present."""
+    import src.fast_asr as fast_asr_module
+
+    monkeypatch.setattr(fast_asr_module.config, "INCREMENTAL_LATIN_HOTWORDS_ENABLED", True)
+    called = []
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_maybe_apply_latin_drug_hotwords",
+        lambda *a, **kw: called.append(1) or (a[5], a[6]),
+    )
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_decode_window_words_with_guards",
+        lambda *a, **kw: ("aur gmenti 625 mg", [(0.0, 1.0, "aur")]),
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    fast_asr_module._decode_one_window_with_ladder(audio, 16000, 0.0, 5.0, 30.0)  # allow_hotwords not passed
+    assert called == []
+
+
+def test_decode_one_window_applies_hotwords_when_allowed(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    called = []
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_maybe_apply_latin_drug_hotwords",
+        lambda *a, **kw: called.append(1) or ("augmentin 625 mg", [(0.0, 1.0, "augmentin")]),
+    )
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_decode_window_words_with_guards",
+        lambda *a, **kw: ("aur gmenti 625 mg", [(0.0, 1.0, "aur")]),
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    words = fast_asr_module._decode_one_window_with_ladder(
+        audio, 16000, 0.0, 5.0, 30.0, allow_hotwords=True
+    )
+    assert called == [1]
+    assert words == [(0.0, 1.0, "augmentin")]
+
+
+def test_decode_one_window_skips_hotwords_on_degenerate_decode(monkeypatch) -> None:
+    """A degenerate decode goes through the retry ladder, never the hotword
+    path — the ladder's own remediation takes priority."""
+    import src.fast_asr as fast_asr_module
+
+    hotword_called = []
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_maybe_apply_latin_drug_hotwords",
+        lambda *a, **kw: hotword_called.append(1) or (a[5], a[6]),
+    )
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_decode_window_words_with_guards",
+        lambda *a, **kw: (COLLEGE_LOOP, []),
+    )
+    monkeypatch.setattr(
+        fast_asr_module,
+        "_retry_ladder_windowed",
+        lambda *a, **kw: ("recovered", [(0.0, 1.0, "recovered")], "step1_boundary_shift"),
+    )
+    audio = np.zeros(16000 * 5, dtype=np.float32)
+    words = fast_asr_module._decode_one_window_with_ladder(
+        audio, 16000, 0.0, 5.0, 30.0, allow_hotwords=True
+    )
+    assert hotword_called == []
+    assert words == [(0.0, 1.0, "recovered")]
+
+
+def test_decode_windows_words_passes_allow_hotwords_through(monkeypatch) -> None:
+    import src.fast_asr as fast_asr_module
+
+    received = []
+
+    def fake_one_window(audio, sr, start, end, total_duration, **kwargs):
+        received.append(kwargs.get("allow_hotwords", False))
+        return []
+
+    monkeypatch.setattr(fast_asr_module, "_decode_one_window_with_ladder", fake_one_window)
+    audio = np.zeros(16000 * 10, dtype=np.float32)
+
+    decode_windows_words(audio, 16000, [(0.0, 5.0)], allow_hotwords=True)
+    decode_windows_words(audio, 16000, [(5.0, 10.0)])  # default
+
+    assert received == [True, False]
+
+
 # ── Segment-free window partitioner (latency Wave 3, incremental capture) ───
 
 
@@ -762,7 +1014,7 @@ def test_decode_window_words_with_guards_forces_hi_on_non_allowlist_language(
     )
     calls: list[dict] = []
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append({"language": language})
         return next(responses)
 
@@ -790,7 +1042,7 @@ def _patch_decode_window_words(
     calls: list[dict] = []
     it = iter(responses)
 
-    def fake(audio, sr, start, end, repo, *, language, decode_kwargs):
+    def fake(audio, sr, start, end, repo, *, language, decode_kwargs, initial_prompt=None):
         calls.append({"start": start, "end": end, "repo": repo, "language": language})
         text, words = next(it)
         return text, "hi", words

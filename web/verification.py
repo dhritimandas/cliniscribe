@@ -43,6 +43,17 @@ the L4 call that just finished, but this module never calls Ollama (no L4
 re-extraction here), so it is not double-loaded — only one model (this
 module's own VERIFY_MODEL, on the Metal GPU) plus the already-idle, already-
 warm Ollama server are resident at once.
+
+Script-conditional drug hotword biasing (latency Wave 5,
+config.VERIFY_LATIN_HOTWORDS_ENABLED, off by default): step 4's re-decode is
+the "zero extra latency cost" hotword placement — the span is ALREADY being
+re-decoded for accuracy-checking, so a hotword only changes what that one
+call is biased toward, no new call added. Fires only for drug fields whose
+current value is already Latin-dominant (_hotword_prompt_for_window), never
+for Devanagari drug fields — the same script-conditional constraint
+src/fast_asr.py's module docstring explains in full, including why a global
+prompt was already tried and rejected. A leaked-prompt hypothesis
+(prompt_leaked_into_hypothesis) triggers one clean unbiased re-decode.
 """
 
 import difflib
@@ -58,12 +69,15 @@ from typing import Any
 import soundfile as sf
 
 from src import config
+from src.drug_lexicon import nearest_drug_candidates
 from src.fast_asr import (
     Word,
     _decode_window_words_with_guards,
+    _is_latin_dominant,
     _pack_segments_into_windows,
     _retry_ladder_windowed,
     looks_degenerate,
+    prompt_leaked_into_hypothesis,
 )
 from src.pipeline import OUTPUTS_ROOT
 from src.types import ClinicalNote, Diagnosis, Medication, Segment, Symptom, Turn, Vital
@@ -357,6 +371,34 @@ def _words_in_span(words: list[Word], start: float, end: float) -> str:
     return " ".join(text for w_start, w_end, text in words if start <= (w_start + w_end) / 2 < end)
 
 
+# ── Script-conditional drug hotword biasing (latency Wave 5) ────────────────
+# See src/fast_asr.py's module-docstring section for the mechanism and the
+# failed-global-prompt history this stays constrained by. Placement here is
+# the "primary, zero extra latency cost" one from the plan: this module
+# already re-decodes the span for accuracy-checking purposes, so a hotword
+# adds no new decode call, only changes what one already-scheduled call is
+# biased toward — and gated behind config.VERIFY_LATIN_HOTWORDS_ENABLED
+# (off by default) for the same reason as the fast_asr placement: not yet
+# validated on a real-audio drug-recovery gate in this session.
+def _hotword_prompt_for_window(window_start: float, window_end: float, selected: list[_MergedSpan]) -> str | None:
+    """Build an initial_prompt from Latin-dominant DRUG field values whose
+    merged span falls inside [window_start, window_end), or None if no such
+    field exists in this window. Only drug fields (not dose/vital/diagnosis)
+    contribute hotwords — those categories have no drug lexicon to match
+    against.
+    """
+    candidates: list[str] = []
+    for merged_span in selected:
+        if merged_span.start < window_end and merged_span.end > window_start:
+            for f in merged_span.fields:
+                if f.priority != _DRUG_PRIORITY or not _is_latin_dominant(f.value):
+                    continue
+                for c in nearest_drug_candidates(f.value, k=config.DRUG_HOTWORD_TOP_K):
+                    if c not in candidates:
+                        candidates.append(c)
+    return ", ".join(candidates) if candidates else None
+
+
 # ── orchestration ────────────────────────────────────────────────────────────
 
 
@@ -404,9 +446,31 @@ def _run_verification_inner(session_dir: str) -> dict[str, Any]:
 
     for group in window_groups:
         window_start, window_end = group[0].start, group[-1].end
-        text, words = _decode_window_words_with_guards(
-            audio, sr, window_start, window_end, config.VERIFY_MODEL, config.FAST_ASR_DECODE_KWARGS
+        hotword_prompt = (
+            _hotword_prompt_for_window(window_start, window_end, selected)
+            if config.VERIFY_LATIN_HOTWORDS_ENABLED
+            else None
         )
+        text, words = _decode_window_words_with_guards(
+            audio,
+            sr,
+            window_start,
+            window_end,
+            config.VERIFY_MODEL,
+            config.FAST_ASR_DECODE_KWARGS,
+            initial_prompt=hotword_prompt,
+        )
+        if hotword_prompt is not None and prompt_leaked_into_hypothesis(hotword_prompt, text):
+            logger.warning(
+                "verification hotword biasing: prompt leakage at [%.2f, %.2f]s "
+                "(prompt=%r) — re-decoding unbiased",
+                window_start,
+                window_end,
+                hotword_prompt,
+            )
+            text, words = _decode_window_words_with_guards(
+                audio, sr, window_start, window_end, config.VERIFY_MODEL, config.FAST_ASR_DECODE_KWARGS
+            )
         if looks_degenerate(text, window_end - window_start):
             text, words, step = _retry_ladder_windowed(
                 audio,

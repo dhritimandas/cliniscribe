@@ -41,7 +41,7 @@ def _silence_bytes(seconds: float, sr: int = 16000) -> bytes:
 
 def test_feed_below_settle_margin_decodes_nothing(session, monkeypatch):
     calls = []
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: (calls.append(windows), [])[1])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: (calls.append(windows), [])[1])
 
     session.feed(_silence_bytes(3.0))  # 3s < 5s settle margin
 
@@ -54,7 +54,7 @@ def test_feed_below_max_window_backlog_decodes_nothing_even_past_settle_margin(s
     a decode call only fires once a FULL window's worth has backed up — a
     settled-but-sub-window backlog must wait, not trigger a small decode."""
     calls = []
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: (calls.append(windows), [])[1])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: (calls.append(windows), [])[1])
 
     session.feed(_silence_bytes(8.0))  # settled_end = 8 - 5 = 3.0s < max_window_s=5.0
 
@@ -65,7 +65,7 @@ def test_feed_below_max_window_backlog_decodes_nothing_even_past_settle_margin(s
 def test_feed_past_settle_margin_decodes_one_full_window(session, monkeypatch):
     calls = []
 
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         calls.append(windows)
         return [w for start, end in windows for w in _fake_words(start, end, "settled")]
 
@@ -81,7 +81,7 @@ def test_feed_past_settle_margin_decodes_one_full_window(session, monkeypatch):
 def test_feed_does_not_redecode_already_settled_audio(session, monkeypatch):
     calls = []
 
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         calls.append(windows)
         return [w for start, end in windows for w in _fake_words(start, end, "settled")]
 
@@ -101,7 +101,7 @@ def test_feed_decodes_multiple_full_windows_in_one_call_when_backlog_is_large(se
     call per chunk — matches src.fast_asr's own windowed-decode contract."""
     calls = []
 
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         calls.append(windows)
         return []
 
@@ -114,7 +114,7 @@ def test_feed_decodes_multiple_full_windows_in_one_call_when_backlog_is_large(se
 
 
 def test_partial_turns_empty_before_anything_settles(session, monkeypatch):
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: [])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: [])
 
     session.feed(_silence_bytes(3.0))
 
@@ -122,7 +122,7 @@ def test_partial_turns_empty_before_anything_settles(session, monkeypatch):
 
 
 def test_partial_turns_diarizes_whole_buffer_and_attributes_settled_words(session, monkeypatch):
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         return [w for start, end in windows for w in _fake_words(start, end, "settled")]
 
     diarize_calls = []
@@ -146,7 +146,7 @@ def test_partial_turns_diarizes_whole_buffer_and_attributes_settled_words(sessio
 
 
 def test_finalize_combines_settled_and_tail_words(session, monkeypatch):
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         return [w for start, end in windows for w in _fake_words(start, end, "decoded")]
 
     def fake_diarize_buffer(self, audio):
@@ -170,7 +170,7 @@ def test_finalize_runs_tail_decode_and_diarize_both(session, monkeypatch):
     decode_called = []
     diarize_called = []
 
-    def fake_decode(audio, sr, windows):
+    def fake_decode(audio, sr, windows, **kwargs):
         decode_called.append(windows)
         return []
 
@@ -191,7 +191,7 @@ def test_finalize_runs_tail_decode_and_diarize_both(session, monkeypatch):
 
 
 def test_finalize_with_no_audio_returns_empty_list(session, monkeypatch):
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: [])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: [])
     monkeypatch.setattr(
         incremental.IncrementalSession, "_diarize_current_buffer", lambda self, audio: []
     )
@@ -206,7 +206,7 @@ def _stub_decode_and_diarize(monkeypatch, label="settled"):
     monkeypatch.setattr(
         incremental,
         "decode_windows_words",
-        lambda audio, sr, windows: [w for start, end in windows for w in _fake_words(start, end, label)],
+        lambda audio, sr, windows, **kwargs: [w for start, end in windows for w in _fake_words(start, end, label)],
     )
     monkeypatch.setattr(
         incremental.IncrementalSession,
@@ -216,7 +216,7 @@ def _stub_decode_and_diarize(monkeypatch, label="settled"):
 
 
 def test_warm_l4_prefix_returns_none_when_nothing_settled(session, monkeypatch):
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: [])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: [])
     monkeypatch.setattr(
         incremental.IncrementalSession, "_diarize_current_buffer", lambda self, audio: []
     )
@@ -279,7 +279,7 @@ def test_partial_turns_never_touches_l4_or_note_json(session, monkeypatch):
     return type is exactly list[Turn] — the same shape L3 produces before L3.5/
     L4 ever run — so nothing about this call path can reach extract() or a
     note.json write without a caller deliberately doing so elsewhere."""
-    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows: [(0.0, 1.0, "hi")])
+    monkeypatch.setattr(incremental, "decode_windows_words", lambda audio, sr, windows, **kwargs: [(0.0, 1.0, "hi")])
     monkeypatch.setattr(
         incremental.IncrementalSession,
         "_diarize_current_buffer",

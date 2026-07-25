@@ -231,3 +231,56 @@ def test_digit_tokens_excluded_from_key_but_drug_still_resolves() -> None:
     result = canonicalize_drug_span("naxdom 500")
     assert result is not None
     assert result[0] == "naxdom"
+
+
+# ── nearest_drug_candidates (latency Wave 5: hotword biasing) ──────────────
+
+
+def test_nearest_candidates_exact_match_returns_single_item() -> None:
+    from src.drug_lexicon import nearest_drug_candidates
+
+    assert nearest_drug_candidates("augmentin") == ["augmentin"]
+
+
+def test_nearest_candidates_recovers_documented_distortion() -> None:
+    """Same 'aur gmenti' -> augmentin case _distance_bound's own docstring
+    cites as a real gate-passing recovery."""
+    from src.drug_lexicon import nearest_drug_candidates
+
+    assert "augmentin" in nearest_drug_candidates("aur gmenti")
+
+
+def test_nearest_candidates_empty_for_unrelated_short_word() -> None:
+    from src.drug_lexicon import nearest_drug_candidates
+
+    assert nearest_drug_candidates("gmenti") == []  # too short for the strict bound
+
+
+def test_nearest_candidates_respects_k() -> None:
+    from src.drug_lexicon import nearest_drug_candidates
+
+    result = nearest_drug_candidates("aur gmenti", k=1)
+    assert len(result) <= 1
+
+
+def test_nearest_candidates_never_refuses_on_ambiguity_unlike_canonicalize() -> None:
+    """Unlike canonicalize_drug_span (which returns None on ambiguity),
+    nearest_drug_candidates is allowed to return multiple plausible names —
+    hotwords nudge, they don't substitute a final answer."""
+    from src.drug_lexicon import _FOLD_INDEX, nearest_drug_candidates
+
+    ambiguous_keys = [k for k, v in _FOLD_INDEX.items() if len(v) > 1]
+    if not ambiguous_keys:
+        pytest.skip("no ambiguous fold key in the current lexicon to test against")
+    key = ambiguous_keys[0]
+    assert canonicalize_drug_span(key) is None  # confirms the ambiguity guard fires
+    assert len(nearest_drug_candidates(key)) >= 1  # but hotword candidates still return
+
+
+def test_nearest_candidates_max_distance_override_widens_the_net() -> None:
+    from src.drug_lexicon import nearest_drug_candidates
+
+    strict = nearest_drug_candidates("gmenti")  # too short for the strict bound
+    loosened = nearest_drug_candidates("gmenti", max_distance=3)
+    assert strict == []
+    assert loosened != []
