@@ -399,6 +399,69 @@ def _canonical_drug_display(drug: str) -> tuple[str, bool] | None:
     return display, is_fuzzy
 
 
+# ── Latin-script display fallback (latency Wave 5: "English always") ────────
+# _canonical_drug_display above renders every RESOLVABLE drug in canonical
+# Latin. A drug that survives all guards but resolves to nothing still
+# displayed verbatim — which for a Devanagari transcript means a Devanagari
+# drug name on the printed Rx, unreadable to a pharmacist reading off CDSCO
+# (the exact class of the एजित्रोमाइसिन/नौरफलोक्स incident, for the residual
+# names canonicalization cannot reach). This fallback closes that gap:
+# deterministic script conversion, ALWAYS flagged low-confidence.
+#
+# Why this is safe where fuzzy drug matching is not: transliteration converts
+# SCRIPT, it does not identify a drug. It cannot substitute a different drug
+# — the failure mode the ambiguity guard exists to prevent — because it never
+# consults the lexicon at all. The worst case is an awkward romanization of
+# what was actually said, which a reviewing physician can read and correct;
+# a wrong-drug substitution is not reachable from here.
+_DEVANAGARI_DISPLAY_RE = re.compile(r"[ऀ-ॿ]")
+
+
+def _has_devanagari(text: str) -> bool:
+    return bool(_DEVANAGARI_DISPLAY_RE.search(text))
+
+
+def _romanize_for_display(text: str) -> str:
+    """Romanize Devanagari `text` for display, preserving non-Devanagari runs.
+
+    Uses plain ITRANS with no match-oriented post-processing — deliberately
+    NOT src.l3_5_normalize._itrans_romanize, whose ph->f / ai->a / trailing-a
+    stripping is tuned for CDSCO LOOKUP and produces worse READING output.
+    Digits and already-Latin tokens pass through untouched. Returns `text`
+    unchanged if the transliteration library is unavailable (the fallback's
+    absence is a display regression, never an extraction failure).
+    """
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+    except Exception:  # pragma: no cover - library is a hard dependency in practice
+        logger.warning("L4: indic_transliteration unavailable — leaving %r as-is", text)
+        return text
+
+    out: list[str] = []
+    for token in text.split():
+        if _has_devanagari(token):
+            romanized = transliterate(token, sanscript.DEVANAGARI, sanscript.ITRANS)
+            # ITRANS emits capitals/punctuation for long vowels and nasals
+            # (A, I, ~n, .n) — fine for round-tripping, noisy to read on a
+            # prescription. Lowercase and drop the diacritic markers.
+            romanized = re.sub(r"[~.\^]", "", romanized).lower()
+            # Two readability conventions (NOT the match-tuning in
+            # _itrans_romanize — that also does ai->a, which would turn
+            # "ejitromaisina" into "ejitromasina" and lose information a
+            # physician needs to recognize the word):
+            #   1. Hindi word-final schwa deletion — the inherent vowel is
+            #      not pronounced word-finally ("naksadama" -> "naksadam").
+            #   2. ph -> f: फ carries /f/ in these English loanwords
+            #      ("nauraphaloksa" -> "naurafaloks", i.e. norflox).
+            romanized = romanized.replace("ph", "f")
+            romanized = re.sub(r"a$", "", romanized)
+            out.append(romanized)
+        else:
+            out.append(token)
+    return " ".join(out)
+
+
 # ── Condition guard (spurious medication-row backstop) ─────────────────────
 # Real incident (outputs/20260712-124506-715247, 2026-07-12): the patient
 # said "मेरा BP (Hypertension) भी हाई है" — L3.5's concept-glosser correctly
@@ -764,6 +827,23 @@ def _build_note(data: dict, transcript: str = "") -> ClinicalNote:
                 flag = f"medications.{drug}.canonicalized_fuzzy"
                 if flag not in low_conf:
                     low_conf.append(flag)
+            # Latin-script display fallback ("English always" — see that
+            # section above). Last step in the chain: everything resolvable
+            # is already canonical Latin by now, so anything still carrying
+            # Devanagari resolved to NOTHING and would otherwise print in
+            # Devanagari on the Rx. Script conversion only, always flagged.
+            if _has_devanagari(drug):
+                romanized = _romanize_for_display(drug)
+                if romanized != drug:
+                    logger.info(
+                        "L4: transliterated unresolved drug %r -> %r for display",
+                        drug,
+                        romanized,
+                    )
+                    flag = f"medications.{romanized}.transliterated_unresolved"
+                    if flag not in low_conf:
+                        low_conf.append(flag)
+                    drug = romanized
         medications.append(
             Medication(
                 drug=drug,

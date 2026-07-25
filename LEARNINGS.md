@@ -1816,3 +1816,65 @@ Until then, the compact prompt and `EXTRACT_COMPACT_NUM_PREDICT` stay
 available behind the flag for anyone who wants to trade the ambiguity for
 the latency win in a specific deployment, but production defaults to the
 verbose prompt this project's existing eval baselines were measured against.
+
+## Drug-Name Display Phase — "English always", by script conversion not identification (2026-07-24)
+
+### (a) What this phase does
+Closes the last gap in the "drug names must render in English" requirement. A
+drug name that survives every L4 guard but resolves to no known drug used to
+display verbatim — which for a Hindi transcript means a **Devanagari drug name
+on the printed prescription**, unreadable to a pharmacist reading off CDSCO.
+That is the residual tail of the एजित्रोमाइसिन/नौरफलोक्स incident class:
+canonicalization (the earlier drug-canon phase) fixed every RESOLVABLE name;
+this fixes the rest. `_romanize_for_display` + `_has_devanagari` in
+`src/l4_extract.py` transliterate any still-Devanagari drug string to Latin at
+the END of the medications chain — after canonicalization has had its chance,
+so a real canonical name always wins — always adding a
+`.transliterated_unresolved` low-confidence flag alongside the existing
+`validated=false`. Measured output on the real incident strings:
+`एजित्रोमाइसिन 500` → `ejitromaisin 500`, `नौरफलोक्स` → `naurafaloks`,
+`पैरासिटामोल` → `pairasitamol` — legible, recognizable, correctable.
+
+**Why this ships ON when the drug-matching machinery around it is so heavily
+guarded:** transliteration converts SCRIPT, it does not identify a drug. It
+never consults the lexicon, so it structurally cannot substitute a *different*
+drug — the failure mode the ambiguity guard exists to prevent, and the reason
+every fuzzy-matching tier in this project is gated so tightly. The worst case
+here is an awkward romanization of what was actually said, which a reviewing
+physician can read and correct; a wrong-drug substitution is not reachable
+from this code path at all. That asymmetry is what makes an always-on default
+appropriate here and inappropriate for lexicon-based recovery.
+
+A note-level test asserts the invariant end to end rather than per-helper: no
+`medications[].drug` in a built note may contain Devanagari, exercised across
+resolvable, unresolvable, generic ("unnamed medication N"), and already-Latin
+inputs in one note.
+
+### (b) Hardest bugs
+1. **The obvious implementation would have reused the wrong romanizer.**
+   `src/l3_5_normalize.py` already has `_itrans_romanize`, and reaching for it
+   would have been the natural move — but its post-processing (`ph`→`f`,
+   `ai`→`a`, trailing-`a` strip) is tuned for **CDSCO lookup**, where
+   collapsing variants is the goal. For DISPLAY, `ai`→`a` actively destroys
+   information: `एजित्रोमाइसिन` becomes `ejitromasina` instead of
+   `ejitromaisin`, dropping the vowel a physician needs to recognize the word
+   as azithromycin. Root cause: the same string transformation serves two
+   different purposes (matching vs reading) with genuinely conflicting
+   requirements, and a shared helper would have quietly optimized for the
+   wrong one. Kept as a separate function with the divergence documented in
+   both directions; the two readability rules it DOES apply (Hindi word-final
+   schwa deletion, `ph`→`f` for these English loanwords) are justified inline.
+
+### (c) Fine-tuning hook
+The honest state after this phase: **display is solved, recognition is not.**
+Every drug now prints in Latin script, but a transliterated name
+(`ejitromaisin`) is a legible placeholder, not an identification — it stays
+`validated=false`, stays flagged, and a physician still has to correct it.
+Closing that gap is an ASR-recognition problem, which is exactly what this
+project's standing fine-tune hook already says: an ASR model that learns to
+emit Latin-script drug names at transcription time (they ARE Latin-script
+brands being read aloud) would shrink this fallback's surface toward zero.
+Until then, the `.transliterated_unresolved` flag is a free, precise counter
+for how often that fallback fires — i.e. a direct measure of the recognition
+gap's size, per session, at no extra cost.
+

@@ -169,13 +169,34 @@ def test_filler_glued_dolo_isolates_cleanly() -> None:
 
 
 def test_unmatched_garbled_drug_name_is_never_truncated() -> None:
-    """Conservative guard: no inner match exists, so the whole string stays —
-    trimming an unmatched name would silently discard information."""
+    """Conservative guard: no inner match exists, so NOTHING is trimmed —
+    trimming an unmatched name would silently discard information.
+
+    Expectation updated (2026-07-24, drug-name display phase): the value is
+    now romanized for display, because a Devanagari drug name must never
+    reach a printed prescription (src/l4_extract.py's Latin-script display
+    fallback). That is a SCRIPT conversion, not a truncation — this test's
+    actual invariant — so the assertions below check the anti-truncation
+    property directly (every token survives, dose included) instead of
+    pinning the original Devanagari string, which would now conflict with
+    the "drug names always in English" requirement. If a future change
+    starts DROPPING tokens here, these assertions still fail.
+    """
     data = {"medications": [{"drug": "एक झिनझिनझान 500 एक", "dose": None}]}
     note = _build_note(
         data, transcript="[UNKNOWN]: एक झिनझिनझान 500 एक खा लो"
     )
-    assert note.medications[0].drug == "एक झिनझिनझान 500 एक"
+    drug = note.medications[0].drug
+
+    # Anti-truncation: same token count as the input, dose digits intact, and
+    # the garbled core still present (not silently shortened to a "cleaner"
+    # substring).
+    assert len(drug.split()) == len("एक झिनझिनझान 500 एक".split())
+    assert "500" in drug
+    assert "jhinajhinajhan" in drug
+    # And the display guarantee that changed it: Latin script, flagged.
+    assert drug.isascii()
+    assert any("transliterated_unresolved" in f for f in note.low_confidence_fields)
 
 
 # ── (8) हफते/Shortness-of-Breath near-collision, outputs/<session>,
