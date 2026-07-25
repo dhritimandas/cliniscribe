@@ -1047,3 +1047,84 @@ def test_warm_llm_prefix_is_non_fatal_on_ollama_error() -> None:
         result = warm_llm_prefix(turns)  # must not raise
 
     assert isinstance(result, str) and len(result) > 0
+
+
+# ── Wave 5: Latin-script display fallback ("English always") ───────────────
+
+
+def test_romanize_for_display_converts_devanagari_readably() -> None:
+    from src.l4_extract import _romanize_for_display
+
+    # Real incident drugs (outputs/20260712-194649-763e13): azithromycin and
+    # norflox, which stayed Devanagari on the printed Rx.
+    assert _romanize_for_display("एजित्रोमाइसिन 500") == "ejitromaisin 500"
+    assert _romanize_for_display("नौरफलोक्स") == "naurafaloks"
+
+
+def test_romanize_for_display_leaves_latin_and_digits_untouched() -> None:
+    from src.l4_extract import _romanize_for_display
+
+    assert _romanize_for_display("augmentin 625") == "augmentin 625"
+
+
+def test_romanize_for_display_preserves_dose_digits() -> None:
+    from src.l4_extract import _romanize_for_display
+
+    assert "500" in _romanize_for_display("नक्सडम 500")
+
+
+def test_unresolved_devanagari_drug_is_transliterated_and_flagged() -> None:
+    """The 'English always' guarantee: a drug that resolves to nothing must
+    still render in Latin script at note-generation time, flagged."""
+    from src.l4_extract import _build_note
+
+    # A Devanagari string that is NOT a real drug, so nothing resolves it.
+    data = {
+        **_EMPTY_RESPONSE,
+        "medications": [{"drug": "झबरगोल", "dose": None}],
+    }
+    note = _build_note(data, transcript="[DOCTOR]: झबरगोल लेना")
+
+    assert len(note.medications) == 1
+    drug = note.medications[0].drug
+    assert drug.isascii(), f"expected Latin-script display, got {drug!r}"
+    assert any("transliterated_unresolved" in f for f in note.low_confidence_fields)
+
+
+def test_resolvable_devanagari_drug_uses_canonical_not_transliteration() -> None:
+    """Canonicalization takes precedence — transliteration is only the
+    LAST-resort fallback, never a replacement for a real canonical name."""
+    from src.l4_extract import _build_note
+
+    data = {**_EMPTY_RESPONSE, "medications": [{"drug": "नौरफलोक्स", "dose": None}]}
+    note = _build_note(data, transcript="[DOCTOR]: नौरफलोक्स लेना")
+
+    assert len(note.medications) == 1
+    drug = note.medications[0].drug
+    assert drug == "norflox", f"expected canonical name, got {drug!r}"
+    assert not any("transliterated_unresolved" in f for f in note.low_confidence_fields)
+
+
+def test_no_medication_in_a_built_note_ever_displays_devanagari() -> None:
+    """Note-level invariant for the 'drug names in English' requirement,
+    across resolvable, unresolvable, and generic drug strings at once."""
+    import re
+
+    from src.l4_extract import _build_note
+
+    deva_re = re.compile(r"[ऀ-ॿ]")
+    data = {
+        **_EMPTY_RESPONSE,
+        "medications": [
+            {"drug": "नौरफलोक्स", "dose": None},       # resolvable -> canonical Latin
+            {"drug": "झबरगोल", "dose": None},          # unresolvable -> transliterated
+            {"drug": "दवाई", "dose": "5 ml"},          # generic -> "unnamed medication N"
+            {"drug": "augmentin 625", "dose": None},   # already Latin
+        ],
+    }
+    note = _build_note(
+        data, transcript="[DOCTOR]: नौरफलोक्स झबरगोल दवाई augmentin 625 लेना"
+    )
+
+    for med in note.medications:
+        assert not deva_re.search(med.drug), f"Devanagari leaked into Rx: {med.drug!r}"
